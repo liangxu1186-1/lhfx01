@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -80,6 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["none", "buy_and_hold"],
         default="buy_and_hold",
     )
+
+    ui = subparsers.add_parser("ui", help="Launch the Phase 1 read-only Streamlit UI.")
+    ui.add_argument("--repository-root", default=".")
+    ui.add_argument("--data-dir")
+    ui.add_argument("--host", default="127.0.0.1")
+    ui.add_argument("--port", type=int, default=8501)
     return parser
 
 
@@ -141,6 +149,9 @@ def main() -> int:
     if args.command == "run-ema":
         return _run_command(_handle_run_ema, args)
 
+    if args.command == "ui":
+        return _run_command(_handle_ui, args)
+
     parser.print_help()
     return 0
 
@@ -180,8 +191,12 @@ def _handle_ingest(args: argparse.Namespace) -> int:
 
 
 def _handle_run_ema(args: argparse.Namespace) -> int:
-    from crypto_backtest_workbench.app.workflows import RunBacktestWorkflowRequest, run_backtest_workflow
+    from crypto_backtest_workbench.app.workflows import (
+        RunBacktestWorkflowRequest,
+        run_backtest_task_workflow,
+    )
     from crypto_backtest_workbench.engine.execution import ExecutionConstraints
+    from crypto_backtest_workbench.jobs import LocalTaskRunner
     from crypto_backtest_workbench.storage.repositories import (
         FileDatasetRepository,
         FileFeatureRepository,
@@ -192,11 +207,14 @@ def _handle_run_ema(args: argparse.Namespace) -> int:
     dataset_repository = FileDatasetRepository(data_dir)
     feature_repository = FileFeatureRepository(data_dir)
     run_repository = FileRunRepository(data_dir)
+    runner = LocalTaskRunner()
     snapshot = _load_snapshot(data_dir, args.snapshot_id)
     validation_split = _build_validation_split(args=args, snapshot=snapshot)
-    workflow_result = run_backtest_workflow(
+    task_result = run_backtest_task_workflow(
+        runner=runner,
         dataset_repository=dataset_repository,
         feature_repository=feature_repository,
+        run_repository=run_repository,
         request=RunBacktestWorkflowRequest(
             run_id=args.run_id,
             snapshot=snapshot,
@@ -217,22 +235,59 @@ def _handle_run_ema(args: argparse.Namespace) -> int:
             enable_buy_and_hold_benchmark=args.benchmark == "buy_and_hold",
         ),
     )
-    persisted = run_repository.save_single_run_result(workflow_result.single_run_result)
+    task = task_result.task
+    if task_result.output is None:
+        _print_json(
+            {
+                "task_id": task.task_id,
+                "task_status": task.status.value,
+                "run_id": args.run_id,
+                "dataset_snapshot_id": snapshot.dataset_snapshot_id,
+                "failure_code": task.failure_code.value if task.failure_code is not None else None,
+                "failure_stage": task.failure_stage,
+                "failure_message": task.failure_message,
+            }
+        )
+        return 1
+
+    workflow_result = task_result.output.workflow_result
+    execution = workflow_result.single_run_result.execution
     metrics = workflow_result.single_run_result.metrics.as_dict()
     _print_json(
         {
+            "task_id": task.task_id,
+            "task_status": task.status.value,
             "run_id": workflow_result.single_run_result.run.run_id,
             "dataset_snapshot_id": snapshot.dataset_snapshot_id,
             "feature_artifact_id": workflow_result.feature_artifact.feature_artifact_id,
             "signal_count": len(workflow_result.signals),
+            "order_count": len(execution.orders),
+            "fill_count": len(execution.fills),
+            "warning_count": len(execution.warnings),
             "trade_count": metrics.get("trade_count"),
             "benchmark_enabled": workflow_result.single_run_result.benchmark_output is not None,
             "validation_split_id": workflow_result.single_run_result.run.validation_split_id,
             "metrics": metrics,
-            "persisted": _json_ready(persisted),
+            "persisted": _json_ready(task_result.output.persisted_paths),
         }
     )
     return 0
+
+
+def _handle_ui(args: argparse.Namespace) -> int:
+    command = _build_ui_launch_command(
+        python_executable=sys.executable,
+        app_path=_streamlit_app_path(),
+        repository_root=args.repository_root,
+        data_dir=args.data_dir,
+        host=args.host,
+        port=args.port,
+    )
+    try:
+        completed = subprocess.run(command, check=False)
+    except KeyboardInterrupt:
+        return 130
+    return completed.returncode
 
 
 def _run_command(handler, args: argparse.Namespace) -> int:
@@ -254,6 +309,42 @@ def _resolve_data_dir(*, repository_root: str | Path, data_dir: str | Path | Non
     if data_dir is not None:
         return Path(data_dir)
     return Path(repository_root) / "data"
+
+
+def _streamlit_app_path() -> Path:
+    from crypto_backtest_workbench.app import streamlit_app
+
+    return Path(streamlit_app.__file__).resolve()
+
+
+def _build_ui_launch_command(
+    *,
+    python_executable: str,
+    app_path: Path,
+    repository_root: str | Path,
+    data_dir: str | Path | None,
+    host: str,
+    port: int,
+) -> list[str]:
+    command = [
+        python_executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(app_path),
+        "--server.headless",
+        "true",
+        "--server.address",
+        host,
+        "--server.port",
+        str(port),
+        "--",
+        "--repository-root",
+        str(repository_root),
+    ]
+    if data_dir is not None:
+        command.extend(["--data-dir", str(data_dir)])
+    return command
 
 
 def _load_snapshot(data_dir: Path, snapshot_id: str) -> DatasetSnapshot:

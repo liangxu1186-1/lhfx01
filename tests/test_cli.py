@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -143,9 +144,15 @@ def test_build_validation_split_requires_full_boundary_set() -> None:
 
 def test_handle_run_ema_passes_validation_split(monkeypatch, tmp_path) -> None:
     recorded: dict[str, object] = {}
+    captured_payload: dict[str, object] = {}
 
     class _FeatureArtifact:
         feature_artifact_id = "feature-001"
+
+    class _Execution:
+        orders = [object(), object()]
+        fills = [object()]
+        warnings = [object()]
 
     class _Metrics:
         def as_dict(self):
@@ -159,33 +166,36 @@ def test_handle_run_ema_passes_validation_split(monkeypatch, tmp_path) -> None:
         run = _Run()
         metrics = _Metrics()
         benchmark_output = None
+        execution = _Execution()
 
     class _WorkflowResult:
         feature_artifact = _FeatureArtifact()
         signals = [object()]
         single_run_result = _SingleRunResult()
 
-    class _PathDict(dict):
-        pass
+    class _Task:
+        task_id = "single-run:run-001"
+        status = type("_Status", (), {"value": "success"})()
+        failure_code = None
+        failure_stage = None
+        failure_message = None
 
-    def fake_run_backtest_workflow(**kwargs):
-        recorded.update(kwargs)
-        return _WorkflowResult()
+    class _TaskOutput:
+        workflow_result = _WorkflowResult()
+        persisted_paths = {"run": "/tmp/run.json"}
 
-    class _FakeRunRepository:
-        def __init__(self, _base_dir):
-            pass
+    class _TaskWorkflowResult:
+        task = _Task()
+        output = _TaskOutput()
 
-        def save_single_run_result(self, _result):
-            return _PathDict({"run": "/tmp/run.json"})
+    def fake_run_backtest_task_workflow(**kwargs):
+        captured_payload.update(kwargs)
+        recorded["request"] = kwargs["request"]
+        return _TaskWorkflowResult()
 
     monkeypatch.setattr(
-        "crypto_backtest_workbench.app.workflows.run_backtest_workflow",
-        fake_run_backtest_workflow,
-    )
-    monkeypatch.setattr(
-        "crypto_backtest_workbench.storage.repositories.FileRunRepository",
-        _FakeRunRepository,
+        "crypto_backtest_workbench.app.workflows.run_backtest_task_workflow",
+        fake_run_backtest_task_workflow,
     )
 
     data_dir = tmp_path / "data"
@@ -246,6 +256,142 @@ def test_handle_run_ema_passes_validation_split(monkeypatch, tmp_path) -> None:
     assert request.validation_split.target_type is ValidationTargetType.DATASET_SNAPSHOT
     assert request.validation_split.target_id == "snapshot-001"
     assert request.validation_split.warmup_bars == 5
+    assert captured_payload["runner"] is not None
+
+
+def test_build_ui_launch_command_includes_streamlit_args() -> None:
+    command = cli._build_ui_launch_command(
+        python_executable="/tmp/python",
+        app_path=Path("/tmp/streamlit_app.py"),
+        repository_root="/repo",
+        data_dir="/repo/data",
+        host="0.0.0.0",
+        port=8502,
+    )
+
+    assert command == [
+        "/tmp/python",
+        "-m",
+        "streamlit",
+        "run",
+        "/tmp/streamlit_app.py",
+        "--server.headless",
+        "true",
+        "--server.address",
+        "0.0.0.0",
+        "--server.port",
+        "8502",
+        "--",
+        "--repository-root",
+        "/repo",
+        "--data-dir",
+        "/repo/data",
+    ]
+
+
+def test_handle_ui_returns_130_on_keyboard_interrupt(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_streamlit_app_path",
+        lambda: Path("/tmp/streamlit_app.py"),
+    )
+
+    def interrupting_run(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.subprocess, "run", interrupting_run)
+
+    exit_code = cli._handle_ui(
+        argparse.Namespace(
+            repository_root=".",
+            data_dir=None,
+            host="127.0.0.1",
+            port=8501,
+        )
+    )
+
+    assert exit_code == 130
+
+
+def test_handle_run_ema_returns_task_failure_payload(monkeypatch, tmp_path, capsys) -> None:
+    class _FailureCode:
+        value = "CONFIG_INVALID"
+
+    class _Task:
+        task_id = "single-run:run-002"
+        status = type("_Status", (), {"value": "failed"})()
+        failure_code = _FailureCode()
+        failure_stage = "run_backtest_task_executor"
+        failure_message = "invalid config"
+
+    class _TaskWorkflowResult:
+        task = _Task()
+        output = None
+
+    def fake_run_backtest_task_workflow(**kwargs):
+        return _TaskWorkflowResult()
+
+    monkeypatch.setattr(
+        "crypto_backtest_workbench.app.workflows.run_backtest_task_workflow",
+        fake_run_backtest_task_workflow,
+    )
+
+    data_dir = tmp_path / "data"
+    snapshot_dir = data_dir / "datasets" / "snapshot-001"
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "snapshot.json").write_text(
+        """
+        {
+          "dataset_snapshot_id": "snapshot-001",
+          "source": "binance",
+          "exchange": "binance",
+          "market_type": "linear_usdt_perpetual",
+          "symbol": "BTC/USDT:USDT",
+          "timeframe": "1h",
+          "time_range_start": "2024-01-01T00:00:00+00:00",
+          "time_range_end": "2024-01-20T00:00:00+00:00",
+          "row_count": 100,
+          "schema_version": "v1",
+          "feature_version": "pending",
+          "storage_uri": "datasets/snapshot-001",
+          "created_at": "2024-01-20T00:00:00+00:00",
+          "data_source": "fixture",
+          "price_type": "last"
+        }
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    args = argparse.Namespace(
+        snapshot_id="snapshot-001",
+        run_id="run-002",
+        repository_root=".",
+        data_dir=str(data_dir),
+        fast_period=4,
+        slow_period=4,
+        qty_policy_ref="fixed_1",
+        qty=1.0,
+        initial_cash=1000.0,
+        leverage=1.0,
+        fee_rate=0.0,
+        slippage_bps=0.0,
+        min_notional=0.0,
+        validation_split_id="validation:cli",
+        warmup_bars=0,
+        is_start=None,
+        is_end=None,
+        oos_start=None,
+        oos_end=None,
+        benchmark="none",
+    )
+
+    exit_code = cli._handle_run_ema(args)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert '"task_status": "failed"' in captured.out
+    assert '"failure_code": "CONFIG_INVALID"' in captured.out
+    assert '"failure_stage": "run_backtest_task_executor"' in captured.out
 
 
 def _snapshot() -> DatasetSnapshot:

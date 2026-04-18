@@ -46,6 +46,7 @@ CLI 故意保持极简，它的作用是：
 - `cbw scaffold`
 - `cbw ingest`
 - `cbw run-ema`
+- `cbw ui`
 
 其中：
 
@@ -53,12 +54,17 @@ CLI 故意保持极简，它的作用是：
 - `cbw ingest` 已支持 `--exchange-options-json` 与 `--extra-params-json`
 - `cbw run-ema` 已能基于本地 snapshot 执行完整 Phase 1 闭环
 - `cbw run-ema` 已支持最小 `validation split` 时间边界输入
+- `cbw run-ema` 已输出 `task_status / order_count / fill_count / warning_count`，失败时返回 `failure_code / failure_stage`
+- `cbw ui` 已能启动最小只读 Streamlit 页面
 
 ## 当前代码结构
 
 ```text
 src/crypto_backtest_workbench/
   app/
+    readmodels/
+    workflows/
+    streamlit_app.py
   domain/
     models/
   engine/
@@ -80,7 +86,7 @@ src/crypto_backtest_workbench/
 - `engine`：纯回测机制
 - `jobs`：任务编排与生命周期状态
 - `storage`：产物路径与持久化辅助
-- `app`：面向 UI 的占位包
+- `app`：面向 CLI / UI 的应用层入口与只读视图组装
 
 ## 当前已落地文件清单
 
@@ -145,9 +151,13 @@ src/crypto_backtest_workbench/
 - [features.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/repositories/features.py)
 - [runs.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/repositories/runs.py)
 - [app/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/__init__.py)
+- [readmodels/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/readmodels/__init__.py)
+- [readmodels/runs.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/readmodels/runs.py)
+- [streamlit_app.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/streamlit_app.py)
 - [workflows/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/__init__.py)
 - [ingest_dataset.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/ingest_dataset.py)
 - [run_backtest.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/run_backtest.py)
+- [run_backtest_task.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/run_backtest_task.py)
 
 说明：
 
@@ -422,6 +432,7 @@ src/crypto_backtest_workbench/
 - 保存 `RunManifest`
 - 保存 `BacktestRun`
 - 保存 execution / metrics / benchmark 结果
+- 提供最小 `list_run_ids` 查询接口，供 CLI / UI 读取 run 列表
 
 ## 已实现的应用层工作流
 
@@ -444,6 +455,18 @@ src/crypto_backtest_workbench/
 - 把“读取 snapshot -> 物化特征 -> 生成信号 -> 执行回测 -> 结果落盘”封装成应用层主线
 - 把“提交任务 -> 执行回测 -> 结果落盘 -> 返回 task 状态”封装成进程内任务闭环
 - 让 CLI 和未来页面层不直接拼接底层 engine 细节
+
+另外已新增：
+
+- [readmodels/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/readmodels/__init__.py)
+- [readmodels/runs.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/readmodels/runs.py)
+- [streamlit_app.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/streamlit_app.py)
+
+当前作用：
+
+- 把 `RunRepository` 产物组装成只读 `summary/detail` 视图
+- 让 Streamlit 页面不直接拼接 storage 细节
+- 提供最小只读页面：`run summary / equity / trade table / warnings`
 
 ## 当前骨架的完成定义
 
@@ -483,7 +506,6 @@ src/crypto_backtest_workbench/
 当前代码 **还没有** 实现：
 
 - DuckDB repository
-- Streamlit 页面
 - 多 symbol 组合执行
 - 后台 worker / 队列化执行
 - WebSocket 增量数据路径
@@ -681,9 +703,9 @@ src/crypto_backtest_workbench/
 
 开始只读页面：
 
-- run summary
-- trade table
-- equity / drawdown
+- 已新增最小只读 Streamlit 页面
+- 当前覆盖 `run summary / equity / trade table / warnings`
+- 启动方式为 `cbw ui --repository-root <repo>`
 
 ### 第五步
 

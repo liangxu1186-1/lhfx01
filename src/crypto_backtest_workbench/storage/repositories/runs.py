@@ -42,6 +42,9 @@ class RunRepository(Protocol):
     def save_single_run_result(self, result: SingleRunResult) -> dict[str, object]:
         """Persist manifest, summary, execution outputs, metrics and benchmark artifacts."""
 
+    def list_run_ids(self) -> list[str]:
+        """List persisted run identifiers."""
+
     def load_manifest(self, run_id: str) -> RunManifest:
         """Load a persisted run manifest."""
 
@@ -77,6 +80,18 @@ class FileRunRepository:
             "metrics": self.save_metrics(run_id=run_id, metrics=result.metrics),
             "benchmark": benchmark_paths,
         }
+
+    def list_run_ids(self) -> list[str]:
+        runs_dir = self.base_dir / "runs"
+        if not runs_dir.exists():
+            return []
+
+        run_ids = [
+            path.name
+            for path in runs_dir.iterdir()
+            if path.is_dir() and (path / "run.json").exists()
+        ]
+        return sorted(run_ids)
 
     def save_manifest(self, manifest: RunManifest) -> Path:
         directory = self._run_dir(manifest.run_id)
