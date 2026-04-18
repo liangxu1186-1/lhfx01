@@ -1,12 +1,14 @@
-"""Minimal CLI for scaffold introspection."""
+"""CLI entry points for Phase 1 workflows."""
 
 from __future__ import annotations
 
 import argparse
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 from crypto_backtest_workbench import __version__
+from crypto_backtest_workbench.domain.models import DatasetSnapshot, MarketType, PriceType
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -20,6 +22,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Print scaffold layout as JSON.",
+    )
+
+    ingest = subparsers.add_parser("ingest", help="Fetch candles and persist a dataset snapshot.")
+    ingest.add_argument("--exchange", required=True)
+    ingest.add_argument("--symbol", required=True)
+    ingest.add_argument("--timeframe", required=True)
+    ingest.add_argument("--since", required=True, help="ISO8601 timestamp.")
+    ingest.add_argument("--until", help="ISO8601 timestamp.")
+    ingest.add_argument("--repository-root", default=".")
+    ingest.add_argument("--data-dir")
+    ingest.add_argument("--market-type", default=MarketType.LINEAR_USDT_PERPETUAL.value)
+    ingest.add_argument("--price-type", default=PriceType.LAST.value)
+    ingest.add_argument("--limit", type=int, default=1000)
+    ingest.add_argument(
+        "--keep-open-last-candle",
+        action="store_true",
+        help="Keep the last still-open candle instead of dropping it.",
+    )
+
+    run_ema = subparsers.add_parser("run-ema", help="Run the Phase 1 EMA strategy on a stored snapshot.")
+    run_ema.add_argument("--snapshot-id", required=True)
+    run_ema.add_argument("--run-id", required=True)
+    run_ema.add_argument("--repository-root", default=".")
+    run_ema.add_argument("--data-dir")
+    run_ema.add_argument("--fast-period", type=int, required=True)
+    run_ema.add_argument("--slow-period", type=int, required=True)
+    run_ema.add_argument("--qty-policy-ref", default="fixed_notional_v1")
+    run_ema.add_argument("--qty", type=float, required=True)
+    run_ema.add_argument("--initial-cash", type=float, default=10_000.0)
+    run_ema.add_argument("--leverage", type=float, default=1.0)
+    run_ema.add_argument("--fee-rate", type=float, default=0.0)
+    run_ema.add_argument("--slippage-bps", type=float, default=0.0)
+    run_ema.add_argument("--min-notional", type=float, default=0.0)
+    run_ema.add_argument(
+        "--benchmark",
+        choices=["none", "buy_and_hold"],
+        default="buy_and_hold",
     )
     return parser
 
@@ -76,8 +115,148 @@ def main() -> int:
                     print(f"  - {item}")
         return 0
 
+    if args.command == "ingest":
+        return _handle_ingest(args)
+
+    if args.command == "run-ema":
+        return _handle_run_ema(args)
+
     parser.print_help()
     return 0
+
+
+def _handle_ingest(args: argparse.Namespace) -> int:
+    from crypto_backtest_workbench.app.workflows import ingest_dataset_workflow
+
+    result = ingest_dataset_workflow(
+        exchange=args.exchange,
+        symbol=args.symbol,
+        timeframe=args.timeframe,
+        since=_parse_datetime(args.since),
+        until=_parse_datetime(args.until) if args.until else None,
+        market_type=MarketType(args.market_type),
+        price_type=PriceType(args.price_type),
+        repository_root=args.repository_root,
+        data_dir=args.data_dir,
+        limit=args.limit,
+        drop_unclosed_last_candle=not args.keep_open_last_candle,
+    )
+    _print_json(
+        {
+            "dataset_snapshot_id": result.snapshot.dataset_snapshot_id,
+            "row_count": result.snapshot.row_count,
+            "snapshot_path": str(result.snapshot_path),
+            "candles_path": str(result.candles_path),
+            "integrity_report_path": str(result.integrity_report_path),
+            "dropped_open_candle": result.dropped_open_candle,
+        }
+    )
+    return 0
+
+
+def _handle_run_ema(args: argparse.Namespace) -> int:
+    from crypto_backtest_workbench.app.workflows import RunBacktestWorkflowRequest, run_backtest_workflow
+    from crypto_backtest_workbench.engine.execution import ExecutionConstraints
+    from crypto_backtest_workbench.storage.repositories import (
+        FileDatasetRepository,
+        FileFeatureRepository,
+        FileRunRepository,
+    )
+
+    data_dir = _resolve_data_dir(repository_root=args.repository_root, data_dir=args.data_dir)
+    dataset_repository = FileDatasetRepository(data_dir)
+    feature_repository = FileFeatureRepository(data_dir)
+    run_repository = FileRunRepository(data_dir)
+    snapshot = _load_snapshot(data_dir, args.snapshot_id)
+    workflow_result = run_backtest_workflow(
+        dataset_repository=dataset_repository,
+        feature_repository=feature_repository,
+        request=RunBacktestWorkflowRequest(
+            run_id=args.run_id,
+            snapshot=snapshot,
+            strategy_params={
+                "fast_period": args.fast_period,
+                "slow_period": args.slow_period,
+                "qty_policy_ref": args.qty_policy_ref,
+            },
+            constraints=ExecutionConstraints(
+                initial_cash=args.initial_cash,
+                leverage=args.leverage,
+                fee_rate=args.fee_rate,
+                slippage_bps=args.slippage_bps,
+                min_notional=args.min_notional,
+                qty_by_policy={args.qty_policy_ref: args.qty},
+            ),
+            enable_buy_and_hold_benchmark=args.benchmark == "buy_and_hold",
+        ),
+    )
+    persisted = run_repository.save_single_run_result(workflow_result.single_run_result)
+    _print_json(
+        {
+            "run_id": workflow_result.single_run_result.run.run_id,
+            "dataset_snapshot_id": snapshot.dataset_snapshot_id,
+            "feature_artifact_id": workflow_result.feature_artifact.feature_artifact_id,
+            "signal_count": len(workflow_result.signals),
+            "trade_count": workflow_result.single_run_result.metrics.trade_count,
+            "benchmark_enabled": workflow_result.single_run_result.benchmark_output is not None,
+            "metrics": workflow_result.single_run_result.metrics.as_dict(),
+            "persisted": _json_ready(persisted),
+        }
+    )
+    return 0
+
+
+def _resolve_data_dir(*, repository_root: str | Path, data_dir: str | Path | None) -> Path:
+    if data_dir is not None:
+        return Path(data_dir)
+    return Path(repository_root) / "data"
+
+
+def _load_snapshot(data_dir: Path, snapshot_id: str) -> DatasetSnapshot:
+    path = data_dir / "datasets" / snapshot_id / "snapshot.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return DatasetSnapshot(
+        dataset_snapshot_id=payload["dataset_snapshot_id"],
+        source=payload["source"],
+        exchange=payload["exchange"],
+        market_type=MarketType(payload["market_type"]),
+        symbol=payload["symbol"],
+        timeframe=payload["timeframe"],
+        time_range_start=_parse_datetime(payload["time_range_start"]),
+        time_range_end=_parse_datetime(payload["time_range_end"]),
+        row_count=int(payload["row_count"]),
+        schema_version=payload["schema_version"],
+        feature_version=payload["feature_version"],
+        storage_uri=payload["storage_uri"],
+        created_at=_parse_datetime(payload["created_at"]),
+        data_source=payload["data_source"],
+        price_type=PriceType(payload.get("price_type", PriceType.LAST.value)),
+    )
+
+
+def _parse_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _json_ready(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: _json_ready(inner) for key, inner in value.items()}
+    if isinstance(value, list):
+        return [_json_ready(inner) for inner in value]
+    if isinstance(value, tuple):
+        return [_json_ready(inner) for inner in value]
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
+
+
+def _print_json(payload: dict[str, object]) -> None:
+    print(json.dumps(_json_ready(payload), indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

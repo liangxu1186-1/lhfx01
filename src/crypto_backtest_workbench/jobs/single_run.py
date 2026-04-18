@@ -4,22 +4,26 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from crypto_backtest_workbench.domain.models import (
     BacktestRun,
+    BenchmarkConfig,
     CanonicalCandle,
     FailureCode,
     RunManifest,
     SignalIntent,
     TaskStatus,
+    ValidationSplit,
 )
+from crypto_backtest_workbench.engine.analytics import BuyAndHoldBenchmarkOutput, compute_buy_and_hold_benchmark
 from crypto_backtest_workbench.engine.analytics.metrics import RunMetrics, compute_run_metrics
 from crypto_backtest_workbench.engine.execution.simulator import (
     ExecutionConstraints,
     ExecutionResult,
     simulate_signals,
 )
+from crypto_backtest_workbench.engine.validation import ValidationView, build_validation_view
 
 
 @dataclass(slots=True)
@@ -51,6 +55,8 @@ class SingleRunResult:
     run: BacktestRun
     execution: ExecutionResult
     metrics: RunMetrics
+    validation_view: ValidationView | None = None
+    benchmark_output: BuyAndHoldBenchmarkOutput | None = None
 
 
 class SingleRunOrchestrator:
@@ -63,6 +69,7 @@ class SingleRunOrchestrator:
         candles: list[CanonicalCandle],
         signals: list[SignalIntent],
         constraints: ExecutionConstraints,
+        validation_split: ValidationSplit | None = None,
     ) -> SingleRunResult:
         manifest = RunManifest(
             run_id=request.run_id,
@@ -83,11 +90,28 @@ class SingleRunOrchestrator:
         )
         manifest.validate_required_fields()
 
-        execution = simulate_signals(candles=candles, signals=signals, constraints=constraints)
+        validation_view = None
+        execution_candles = candles
+        execution_signals = signals
+        if validation_split is not None:
+            validation_view = build_validation_view(candles=candles, split=validation_split)
+            execution_candles = list(validation_view.is_segment.analysis_candles)
+            execution_signals = _filter_signals_for_segment(signals, validation_view)
+
+        execution = simulate_signals(
+            candles=execution_candles,
+            signals=execution_signals,
+            constraints=constraints,
+        )
         metrics = compute_run_metrics(
             initial_equity=constraints.initial_cash,
             final_equity=execution.account.equity,
             trades=execution.trades,
+        )
+        benchmark_output = _compute_benchmark_output(
+            request=request,
+            candles=execution_candles,
+            initial_equity=constraints.initial_cash,
         )
         run = BacktestRun(
             run_id=request.run_id,
@@ -115,6 +139,8 @@ class SingleRunOrchestrator:
             run=run,
             execution=execution,
             metrics=metrics,
+            validation_view=validation_view,
+            benchmark_output=benchmark_output,
         )
 
     def fail_run(
@@ -154,3 +180,32 @@ class SingleRunOrchestrator:
 def _config_hash(payload: dict[str, object]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _filter_signals_for_segment(
+    signals: list[SignalIntent],
+    validation_view: ValidationView,
+) -> list[SignalIntent]:
+    allowed_timestamps = {candle.timestamp for candle in validation_view.is_segment.analysis_candles}
+    return [signal for signal in signals if signal.timestamp in allowed_timestamps]
+
+
+def _compute_benchmark_output(
+    *,
+    request: SingleRunRequest,
+    candles: list[CanonicalCandle],
+    initial_equity: float,
+) -> BuyAndHoldBenchmarkOutput | None:
+    benchmark_type = request.benchmark_config_json.get("benchmark_type")
+    if benchmark_type != "buy_and_hold" or not candles:
+        return None
+
+    config = BenchmarkConfig(benchmark_type="buy_and_hold")
+    return compute_buy_and_hold_benchmark(
+        run_id=request.run_id,
+        candles=candles,
+        config=config,
+        initial_equity=initial_equity,
+        equity_uri=f"memory://benchmarks/{request.run_id}/buy_and_hold/equity.json",
+        daily_returns_uri=f"memory://benchmarks/{request.run_id}/buy_and_hold/daily_returns.json",
+    )

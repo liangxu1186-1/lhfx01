@@ -41,6 +41,12 @@ CLI 故意保持极简，它的作用是：
 - 验证包结构和入口 wiring 正常
 - 给后续任务提供稳定入口
 
+当前 CLI 已提供的最小命令：
+
+- `cbw scaffold`
+- `cbw ingest`
+- `cbw run-ema`
+
 ## 当前代码结构
 
 ```text
@@ -113,12 +119,16 @@ src/crypto_backtest_workbench/
 - [engine/strategy/ema_crossover.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/strategy/ema_crossover.py)
 - [engine/strategy/reader.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/strategy/reader.py)
 - [engine/validation/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/validation/__init__.py)
+- [engine/validation/splits.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/validation/splits.py)
 - [engine/analytics/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/analytics/__init__.py)
+- [engine/analytics/benchmark.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/analytics/benchmark.py)
 - [engine/analytics/metrics.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/analytics/metrics.py)
 
 ### Jobs / Storage / App
 
 - [jobs/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/jobs/__init__.py)
+- [executors.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/jobs/executors.py)
+- [runner.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/jobs/runner.py)
 - [single_run.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/jobs/single_run.py)
 - [task_models.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/jobs/task_models.py)
 - [storage/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/__init__.py)
@@ -126,7 +136,11 @@ src/crypto_backtest_workbench/
 - [repositories/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/repositories/__init__.py)
 - [datasets.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/repositories/datasets.py)
 - [features.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/repositories/features.py)
+- [runs.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/repositories/runs.py)
 - [app/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/__init__.py)
+- [workflows/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/__init__.py)
+- [ingest_dataset.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/ingest_dataset.py)
+- [run_backtest.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/run_backtest.py)
 
 说明：
 
@@ -335,11 +349,13 @@ src/crypto_backtest_workbench/
 - `EquityPoint`
 - `RunMetrics`
 - `compute_run_metrics`
+- `compute_buy_and_hold_benchmark`
 
 当前作用：
 
 - 为单次运行提供最小资金曲线点和基础统计
 - 支撑 `BacktestRun` 装配前的结果汇总
+- 为第一版提供最小 benchmark 对照实现
 
 ## 已实现的 Job 骨架
 
@@ -362,6 +378,8 @@ src/crypto_backtest_workbench/
 另外已新增：
 
 - [single_run.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/jobs/single_run.py)
+- [executors.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/jobs/executors.py)
+- [runner.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/jobs/runner.py)
 
 当前作用：
 
@@ -369,6 +387,8 @@ src/crypto_backtest_workbench/
 - 调用执行模拟器
 - 计算基础 metrics
 - 生成 `BacktestRun`
+- 提供最小本地 `task runner`
+- 为后续 UI / jobs 层保留执行入口
 
 ## 已实现的 Storage 辅助
 
@@ -385,12 +405,35 @@ src/crypto_backtest_workbench/
 另外已新增：
 
 - [features.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/repositories/features.py)
+- [runs.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/repositories/runs.py)
 
 当前作用：
 
 - 保存 `FeatureArtifact`
 - 保存 `feature_rows.csv`
 - 维护 `feature_cache_key -> feature_artifact_id` 索引
+- 保存 `RunManifest`
+- 保存 `BacktestRun`
+- 保存 execution / metrics / benchmark 结果
+
+## 已实现的应用层工作流
+
+定义位置：
+
+- [workflows/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/__init__.py)
+- [ingest_dataset.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/ingest_dataset.py)
+- [run_backtest.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/run_backtest.py)
+
+当前包括：
+
+- `ingest_dataset_workflow`
+- `run_backtest_workflow`
+
+当前作用：
+
+- 把“抓取并落盘数据集”封装成应用层入口
+- 把“读取 snapshot -> 物化特征 -> 生成信号 -> 执行回测 -> 结果落盘”封装成应用层主线
+- 让 CLI 和未来页面层不直接拼接底层 engine 细节
 
 ## 当前骨架的完成定义
 
@@ -429,13 +472,12 @@ src/crypto_backtest_workbench/
 
 当前代码 **还没有** 实现：
 
-- 完整的 `ccxt` 分页拉取流程
 - DuckDB repository
 - Streamlit 页面
-- benchmark 计算
-- validation 执行
 - 多 symbol 组合执行
-- 任务执行器与后台 worker
+- 后台 worker / 队列化执行
+- WebSocket 增量数据路径
+- 更丰富的指标与策略库
 
 这是有意为之。
 
@@ -474,7 +516,8 @@ src/crypto_backtest_workbench/
 当前边界：
 
 - 已支持最小 `ccxt` 调用适配
-- 尚未实现完整分页拉取与批处理编排
+- 已支持基础分页拉取与去重
+- 尚未实现批处理调度、补洞与 WebSocket 增量路径
 
 ### 数据编排服务
 
@@ -606,44 +649,37 @@ src/crypto_backtest_workbench/
 
 ### 第一步
 
-实现数据落盘与 repository 接口：
+把现有工作流接到真实环境：
 
-- raw ohlcv 落盘
-- canonical candle 存储
-- dataset snapshot 注册
-- data integrity report 持久化
+- 安装并接入真实 `ccxt`
+- 把 `cbw ingest` 用到实际交易所数据抓取
 
 ### 第二步
 
-补全数据抓取能力：
+把 jobs 与工作流串起来：
 
-- `ccxt` 分页拉取
-- since/until 边界处理
-- 去重与补洞策略
+- 用 `LocalTaskRunner` 驱动 `run_backtest_workflow`
+- 把 `FileRunRepository` 接到任务结果落盘
 
 ### 第三步
 
-补 benchmark 与 validation：
+补完整 CLI 配置与错误呈现：
 
-- buy & hold 基准
-- 基础 split 执行
-- OOS 结果汇总
+- validation split 输入
+- benchmark 开关与参数
+- 失败码和 warning 输出
 
 ### 第四步
 
-补任务执行器：
+开始只读页面：
 
-- `SingleRunTaskPayload` 真正落地
-- 本地 worker
-- task 状态流转
+- run summary
+- trade table
+- equity / drawdown
 
 ### 第五步
 
-开始页面层最小闭环：
-
-- Dashboard 最小版
-- Run Detail 最小版
-- 只读结果展示
+进入 Parameter Lab 和 experiment 层
 
 ## 供后续 AI 评估的问题
 
