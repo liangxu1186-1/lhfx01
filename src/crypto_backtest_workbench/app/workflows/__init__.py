@@ -6,10 +6,18 @@ from crypto_backtest_workbench.app.workflows.run_backtest import (
     RunBacktestWorkflowResult,
     run_backtest_workflow,
 )
+from crypto_backtest_workbench.app.workflows.run_backtest_task import (
+    RunBacktestTaskOutput,
+    RunBacktestTaskWorkflowResult,
+    run_backtest_task_workflow,
+)
 
 __all__ = [
+    "RunBacktestTaskOutput",
+    "RunBacktestTaskWorkflowResult",
     "RunBacktestWorkflowRequest",
     "RunBacktestWorkflowResult",
     "ingest_dataset_workflow",
+    "run_backtest_task_workflow",
     "run_backtest_workflow",
 ]

@@ -8,7 +8,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from crypto_backtest_workbench import __version__
-from crypto_backtest_workbench.domain.models import DatasetSnapshot, MarketType, PriceType
+from crypto_backtest_workbench.domain.models import (
+    DatasetSnapshot,
+    MarketType,
+    PriceType,
+    ValidationSplit,
+    ValidationTargetType,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,6 +42,14 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--price-type", default=PriceType.LAST.value)
     ingest.add_argument("--limit", type=int, default=1000)
     ingest.add_argument(
+        "--exchange-options-json",
+        help="JSON object passed to the ccxt exchange constructor.",
+    )
+    ingest.add_argument(
+        "--extra-params-json",
+        help="JSON object forwarded to fetch_ohlcv params.",
+    )
+    ingest.add_argument(
         "--keep-open-last-candle",
         action="store_true",
         help="Keep the last still-open candle instead of dropping it.",
@@ -55,6 +69,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_ema.add_argument("--fee-rate", type=float, default=0.0)
     run_ema.add_argument("--slippage-bps", type=float, default=0.0)
     run_ema.add_argument("--min-notional", type=float, default=0.0)
+    run_ema.add_argument("--validation-split-id", default="validation:cli")
+    run_ema.add_argument("--warmup-bars", type=int, default=0)
+    run_ema.add_argument("--is-start", help="ISO8601 timestamp for in-sample start.")
+    run_ema.add_argument("--is-end", help="ISO8601 timestamp for in-sample end.")
+    run_ema.add_argument("--oos-start", help="ISO8601 timestamp for out-of-sample start.")
+    run_ema.add_argument("--oos-end", help="ISO8601 timestamp for out-of-sample end.")
     run_ema.add_argument(
         "--benchmark",
         choices=["none", "buy_and_hold"],
@@ -116,10 +136,10 @@ def main() -> int:
         return 0
 
     if args.command == "ingest":
-        return _handle_ingest(args)
+        return _run_command(_handle_ingest, args)
 
     if args.command == "run-ema":
-        return _handle_run_ema(args)
+        return _run_command(_handle_run_ema, args)
 
     parser.print_help()
     return 0
@@ -140,6 +160,11 @@ def _handle_ingest(args: argparse.Namespace) -> int:
         data_dir=args.data_dir,
         limit=args.limit,
         drop_unclosed_last_candle=not args.keep_open_last_candle,
+        extra_params=_parse_json_object_arg(args.extra_params_json, field_name="--extra-params-json"),
+        exchange_options=_parse_json_object_arg(
+            args.exchange_options_json,
+            field_name="--exchange-options-json",
+        ),
     )
     _print_json(
         {
@@ -168,6 +193,7 @@ def _handle_run_ema(args: argparse.Namespace) -> int:
     feature_repository = FileFeatureRepository(data_dir)
     run_repository = FileRunRepository(data_dir)
     snapshot = _load_snapshot(data_dir, args.snapshot_id)
+    validation_split = _build_validation_split(args=args, snapshot=snapshot)
     workflow_result = run_backtest_workflow(
         dataset_repository=dataset_repository,
         feature_repository=feature_repository,
@@ -187,23 +213,41 @@ def _handle_run_ema(args: argparse.Namespace) -> int:
                 min_notional=args.min_notional,
                 qty_by_policy={args.qty_policy_ref: args.qty},
             ),
+            validation_split=validation_split,
             enable_buy_and_hold_benchmark=args.benchmark == "buy_and_hold",
         ),
     )
     persisted = run_repository.save_single_run_result(workflow_result.single_run_result)
+    metrics = workflow_result.single_run_result.metrics.as_dict()
     _print_json(
         {
             "run_id": workflow_result.single_run_result.run.run_id,
             "dataset_snapshot_id": snapshot.dataset_snapshot_id,
             "feature_artifact_id": workflow_result.feature_artifact.feature_artifact_id,
             "signal_count": len(workflow_result.signals),
-            "trade_count": workflow_result.single_run_result.metrics.trade_count,
+            "trade_count": metrics.get("trade_count"),
             "benchmark_enabled": workflow_result.single_run_result.benchmark_output is not None,
-            "metrics": workflow_result.single_run_result.metrics.as_dict(),
+            "validation_split_id": workflow_result.single_run_result.run.validation_split_id,
+            "metrics": metrics,
             "persisted": _json_ready(persisted),
         }
     )
     return 0
+
+
+def _run_command(handler, args: argparse.Namespace) -> int:
+    try:
+        return handler(args)
+    except Exception as exc:
+        _print_json(
+            {
+                "error": {
+                    "type": exc.__class__.__name__,
+                    "message": str(exc),
+                }
+            }
+        )
+        return 1
 
 
 def _resolve_data_dir(*, repository_root: str | Path, data_dir: str | Path | None) -> Path:
@@ -239,6 +283,49 @@ def _parse_datetime(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed
+
+
+def _parse_json_object_arg(value: str | None, *, field_name: str) -> dict[str, object] | None:
+    if value is None:
+        return None
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{field_name} must be a JSON object")
+    return parsed
+
+
+def _build_validation_split(
+    *,
+    args: argparse.Namespace,
+    snapshot: DatasetSnapshot,
+) -> ValidationSplit | None:
+    boundaries = {
+        "is_start": args.is_start,
+        "is_end": args.is_end,
+        "oos_start": args.oos_start,
+        "oos_end": args.oos_end,
+    }
+    provided = [name for name, value in boundaries.items() if value is not None]
+    if not provided:
+        return None
+
+    if len(provided) != len(boundaries):
+        joined = ", ".join(sorted(boundaries))
+        raise ValueError(f"Validation split requires all of: {joined}")
+
+    if args.warmup_bars < 0:
+        raise ValueError("--warmup-bars must be >= 0")
+
+    return ValidationSplit(
+        validation_split_id=args.validation_split_id,
+        target_type=ValidationTargetType.DATASET_SNAPSHOT,
+        target_id=snapshot.dataset_snapshot_id,
+        warmup_bars=args.warmup_bars,
+        is_start=_parse_datetime(args.is_start),
+        is_end=_parse_datetime(args.is_end),
+        oos_start=_parse_datetime(args.oos_start),
+        oos_end=_parse_datetime(args.oos_end),
+    )
 
 
 def _json_ready(value: object) -> object:

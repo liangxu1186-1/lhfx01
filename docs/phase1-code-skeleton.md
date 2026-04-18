@@ -47,6 +47,13 @@ CLI 故意保持极简，它的作用是：
 - `cbw ingest`
 - `cbw run-ema`
 
+其中：
+
+- `cbw ingest` 已支持真实 `ccxt` 依赖
+- `cbw ingest` 已支持 `--exchange-options-json` 与 `--extra-params-json`
+- `cbw run-ema` 已能基于本地 snapshot 执行完整 Phase 1 闭环
+- `cbw run-ema` 已支持最小 `validation split` 时间边界输入
+
 ## 当前代码结构
 
 ```text
@@ -423,16 +430,19 @@ src/crypto_backtest_workbench/
 - [workflows/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/__init__.py)
 - [ingest_dataset.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/ingest_dataset.py)
 - [run_backtest.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/run_backtest.py)
+- [run_backtest_task.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/run_backtest_task.py)
 
 当前包括：
 
 - `ingest_dataset_workflow`
 - `run_backtest_workflow`
+- `run_backtest_task_workflow`
 
 当前作用：
 
 - 把“抓取并落盘数据集”封装成应用层入口
 - 把“读取 snapshot -> 物化特征 -> 生成信号 -> 执行回测 -> 结果落盘”封装成应用层主线
+- 把“提交任务 -> 执行回测 -> 结果落盘 -> 返回 task 状态”封装成进程内任务闭环
 - 让 CLI 和未来页面层不直接拼接底层 engine 细节
 
 ## 当前骨架的完成定义
@@ -518,6 +528,11 @@ src/crypto_backtest_workbench/
 - 已支持最小 `ccxt` 调用适配
 - 已支持基础分页拉取与去重
 - 尚未实现批处理调度、补洞与 WebSocket 增量路径
+
+当前补充：
+
+- 项目依赖已显式加入 `ccxt`
+- CLI 已可把交易所构造参数和 `fetch_ohlcv` 参数以 JSON 对象形式传入
 
 ### 数据编排服务
 
@@ -649,27 +664,20 @@ src/crypto_backtest_workbench/
 
 ### 第一步
 
-把现有工作流接到真实环境：
-
-- 安装并接入真实 `ccxt`
-- 把 `cbw ingest` 用到实际交易所数据抓取
-
-### 第二步
-
-把 jobs 与工作流串起来：
-
-- 用 `LocalTaskRunner` 驱动 `run_backtest_workflow`
-- 把 `FileRunRepository` 接到任务结果落盘
-
-### 第三步
-
 补完整 CLI 配置与错误呈现：
 
 - validation split 输入
-- benchmark 开关与参数
-- 失败码和 warning 输出
+- benchmark 开关细化
+- warning / failure code 更完整展示
 
-### 第四步
+### 第二步
+
+把任务执行从进程内推进到可复用服务：
+
+- 为 `LocalTaskRunner` 增加更稳定的任务注册与查询接口
+- 为 future UI 保留任务列表和任务结果读取入口
+
+### 第三步
 
 开始只读页面：
 
