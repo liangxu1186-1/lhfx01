@@ -121,6 +121,15 @@ references/
 - `StructuredWarning`
 - `signal_on_bar_close_fill_on_next_bar_open`
 
+同时必须遵守跨层依赖约束：
+
+- `engine/strategy` 不直接依赖 `storage`
+- `engine/execution` 不直接依赖 `app`
+- `app` 不直接依赖 `ccxt`
+- `domain/models` 不依赖 repository、UI、交易所客户端或具体持久化实现
+
+这几条不是建议，而是分层约束。若需要跨层协作，必须通过显式接口或中间对象完成。
+
 ## 7. 推荐参考方式
 
 推荐按以下方式使用参考仓库：
@@ -178,11 +187,23 @@ references/REFERENCE_NOTES.md
 - 哪个参考仓库值得借鉴什么
 - 哪个实现思路不适合本项目
 - 哪些命名和分层可以吸收
+- 固定到哪个 tag 或 commit
+- 明确参考范围和排除范围
 
 不记录：
 
 - 大段源码摘抄
 - 临时复制的实现草稿
+
+建议记录格式：
+
+```text
+仓库名
+- 路径：
+- 版本：
+- 参考范围：
+- 排除范围：
+```
 
 ## 9. 当前执行建议
 

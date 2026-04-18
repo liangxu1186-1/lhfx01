@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crypto-backtest-workbench"
+version = "0.1.0"
+description = "Phase 1 scaffold for a crypto backtest research workbench."
+readme = "docs/crypto-backtest-workbench-v1-implementation-design.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "liangxu" }
+]
+dependencies = []
+
+[project.scripts]
+cbw = "crypto_backtest_workbench.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
