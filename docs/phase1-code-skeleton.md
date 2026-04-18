@@ -99,24 +99,33 @@ src/crypto_backtest_workbench/
 - [engine/data/service.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/data/service.py)
 - [engine/execution/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/execution/__init__.py)
 - [engine/execution/policies.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/execution/policies.py)
+- [engine/execution/simulator.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/execution/simulator.py)
 - [engine/experiments/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/experiments/__init__.py)
 - [engine/features/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/features/__init__.py)
 - [engine/features/cache.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/features/cache.py)
+- [engine/features/indicators.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/features/indicators.py)
+- [engine/features/pipeline.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/features/pipeline.py)
+- [engine/features/records.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/features/records.py)
 - [engine/portfolio/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/portfolio/__init__.py)
 - [engine/portfolio/account.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/portfolio/account.py)
 - [engine/strategy/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/strategy/__init__.py)
 - [engine/strategy/base.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/strategy/base.py)
+- [engine/strategy/ema_crossover.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/strategy/ema_crossover.py)
+- [engine/strategy/reader.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/strategy/reader.py)
 - [engine/validation/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/validation/__init__.py)
 - [engine/analytics/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/analytics/__init__.py)
+- [engine/analytics/metrics.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/analytics/metrics.py)
 
 ### Jobs / Storage / App
 
 - [jobs/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/jobs/__init__.py)
+- [single_run.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/jobs/single_run.py)
 - [task_models.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/jobs/task_models.py)
 - [storage/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/__init__.py)
 - [paths.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/paths.py)
 - [repositories/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/repositories/__init__.py)
 - [datasets.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/repositories/datasets.py)
+- [features.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/repositories/features.py)
 - [app/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/__init__.py)
 
 说明：
@@ -226,6 +235,22 @@ src/crypto_backtest_workbench/
 - 策略基于已预计算的特征生成信号
 - 策略不负责特征计算
 
+### 参考策略
+
+- [engine/strategy/ema_crossover.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/strategy/ema_crossover.py)
+- [engine/strategy/reader.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/strategy/reader.py)
+
+当前已实现：
+
+- `EMACrossoverStrategy`
+- 本地 CSV 特征读取器
+
+当前作用：
+
+- 提供一个真正可运行的参考策略，而不是只停留在接口层
+- 明确策略层只消费预计算特征，不直接计算指标
+- 固定第一版策略与 `FeaturePipeline` 的接口契约：`ema_close_{window}`
+
 ### 特征缓存注册器
 
 - [engine/features/cache.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/features/cache.py)
@@ -240,6 +265,25 @@ src/crypto_backtest_workbench/
 - 把缓存模型做成具体代码，而不是停留在文档
 - 后续可以替换成 DuckDB / 索引化持久层，而不改对象语义
 
+### 特征管线
+
+- [engine/features/indicators.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/features/indicators.py)
+- [engine/features/pipeline.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/features/pipeline.py)
+- [engine/features/records.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/features/records.py)
+
+当前已实现：
+
+- `compute_ema`
+- `compute_rsi`
+- `FeaturePipeline`
+- `FeatureRow`
+
+当前作用：
+
+- 从 canonical candles 生成可复用的 `FeatureArtifact`
+- 先查内存缓存，再查持久化仓储，避免重复计算
+- 不依赖 `pandas`，保持第一版轻量与可控
+
 ### 默认执行语义
 
 - [engine/execution/policies.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/execution/policies.py)
@@ -247,6 +291,24 @@ src/crypto_backtest_workbench/
 当前已经钉死默认策略：
 
 - `signal_on_bar_close_fill_on_next_bar_open`
+
+### 执行模拟器
+
+- [engine/execution/simulator.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/execution/simulator.py)
+
+当前已实现：
+
+- 单仓位执行循环
+- `open / close / reverse / hold`
+- next-open 成交
+- 基础拒单约束
+- 简单资金与保证金更新
+
+当前边界：
+
+- 不支持 stop/tp
+- 不支持 limit order
+- 不支持多仓位竞争
 
 ### 账户快照
 
@@ -263,6 +325,21 @@ src/crypto_backtest_workbench/
 - `maintenance_margin`
 - `equity`
 - `unrealized_pnl`
+
+### 指标与权益曲线
+
+- [engine/analytics/metrics.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/engine/analytics/metrics.py)
+
+当前已实现：
+
+- `EquityPoint`
+- `RunMetrics`
+- `compute_run_metrics`
+
+当前作用：
+
+- 为单次运行提供最小资金曲线点和基础统计
+- 支撑 `BacktestRun` 装配前的结果汇总
 
 ## 已实现的 Job 骨架
 
@@ -282,6 +359,17 @@ src/crypto_backtest_workbench/
 - job 编排
 - 执行结果
 
+另外已新增：
+
+- [single_run.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/jobs/single_run.py)
+
+当前作用：
+
+- 组装 `RunManifest`
+- 调用执行模拟器
+- 计算基础 metrics
+- 生成 `BacktestRun`
+
 ## 已实现的 Storage 辅助
 
 定义位置：
@@ -293,6 +381,16 @@ src/crypto_backtest_workbench/
 - 只有产物 URI / 路径生成辅助函数
 
 这对于 `Phase 1` 骨架已经足够，同时避免过早把持久化实现写死。
+
+另外已新增：
+
+- [features.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/repositories/features.py)
+
+当前作用：
+
+- 保存 `FeatureArtifact`
+- 保存 `feature_rows.csv`
+- 维护 `feature_cache_key -> feature_artifact_id` 索引
 
 ## 当前骨架的完成定义
 
@@ -332,14 +430,12 @@ src/crypto_backtest_workbench/
 当前代码 **还没有** 实现：
 
 - 完整的 `ccxt` 分页拉取流程
-- feature 计算 pipeline
-- 策略具体实现
-- fill engine 逻辑
-- trade 生命周期组装
 - DuckDB repository
 - Streamlit 页面
 - benchmark 计算
 - validation 执行
+- 多 symbol 组合执行
+- 任务执行器与后台 worker
 
 这是有意为之。
 
@@ -519,36 +615,35 @@ src/crypto_backtest_workbench/
 
 ### 第二步
 
-实现 feature pipeline：
+补全数据抓取能力：
 
-- feature 参数哈希
-- feature cache 查询
-- feature artifact 生成
-- 第一批指标：EMA、RSI
+- `ccxt` 分页拉取
+- since/until 边界处理
+- 去重与补洞策略
 
 ### 第三步
 
-实现策略注册和一个参考策略：
+补 benchmark 与 validation：
 
-- 均线交叉
-  或
-- RSI 阈值策略
+- buy & hold 基准
+- 基础 split 执行
+- OOS 结果汇总
 
 ### 第四步
 
-实现执行循环：
+补任务执行器：
 
-- `SignalIntent -> OrderRequest -> FillEvent -> TradeRecord`
-- 不支持 stop/tp
-- 先只做单 symbol
+- `SingleRunTaskPayload` 真正落地
+- 本地 worker
+- task 状态流转
 
 ### 第五步
 
-实现 run 组装：
+开始页面层最小闭环：
 
-- 创建 `RunManifest`
-- 写入 `BacktestRun`
-- 产出 warnings
+- Dashboard 最小版
+- Run Detail 最小版
+- 只读结果展示
 
 ## 供后续 AI 评估的问题
 
