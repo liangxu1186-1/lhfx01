@@ -4,8 +4,14 @@ from datetime import UTC, datetime, timedelta
 
 from crypto_backtest_workbench.app.readmodels import (
     build_equity_chart_rows,
+    build_multi_run_equity_rows,
+    build_run_comparison_views,
+    build_trade_explorer_rows,
     build_trade_rows,
     build_warning_rows,
+    TradeFilter,
+    filter_trade_rows,
+    filter_run_summary_views,
     list_run_summary_views,
     load_run_detail_view,
 )
@@ -44,6 +50,86 @@ def test_run_readmodels_build_summary_and_detail(tmp_path) -> None:
     assert equity_rows[0]["benchmark_equity"] is not None
     assert trade_rows[0]["trade_id"] == detail.execution.trades[0].trade_id
     assert warning_rows[0]["warning_code"] == detail.execution.warnings[0].warning_code
+
+
+def test_run_readmodels_filter_summary_views(tmp_path) -> None:
+    repository = FileRunRepository(tmp_path)
+    repository.save_single_run_result(_build_single_run_result(run_id="run-001"))
+    repository.save_single_run_result(_build_single_run_result(run_id="alpha-002"))
+
+    summaries = list_run_summary_views(repository)
+    filtered = filter_run_summary_views(
+        summaries,
+        strategy_names={"manual-signals"},
+        statuses={"success"},
+        dataset_query="alpha",
+    )
+
+    assert [summary.run_id for summary in filtered] == ["alpha-002"]
+
+
+def test_run_readmodels_build_comparison_views_and_multi_run_equity(tmp_path) -> None:
+    repository = FileRunRepository(tmp_path)
+    repository.save_single_run_result(_build_single_run_result(run_id="run-001"))
+    repository.save_single_run_result(_build_single_run_result(run_id="run-002"))
+
+    details = [
+        load_run_detail_view(repository, "run-001"),
+        load_run_detail_view(repository, "run-002"),
+    ]
+
+    comparison_views = build_run_comparison_views(details)
+    equity_rows = build_multi_run_equity_rows(details)
+
+    assert [row.run_id for row in comparison_views] == ["run-001", "run-002"]
+    assert comparison_views[0].excess_return is not None
+    assert f"{details[0].run.run_id}_equity" in equity_rows[0]
+    assert f"{details[1].run.run_id}_equity" in equity_rows[0]
+
+
+def test_run_readmodels_build_trade_explorer_rows(tmp_path) -> None:
+    repository = FileRunRepository(tmp_path)
+    repository.save_single_run_result(_build_single_run_result(run_id="run-001"))
+    repository.save_single_run_result(_build_single_run_result(run_id="run-002"))
+
+    details = [
+        load_run_detail_view(repository, "run-001"),
+        load_run_detail_view(repository, "run-002"),
+    ]
+    rows = build_trade_explorer_rows(details)
+
+    assert len(rows) == 2
+    assert rows[0]["run_id"] == "run-001"
+    assert rows[1]["run_id"] == "run-002"
+    assert rows[0]["strategy_name"] == "manual-signals"
+
+
+def test_run_readmodels_filter_trade_rows(tmp_path) -> None:
+    repository = FileRunRepository(tmp_path)
+    repository.save_single_run_result(_build_single_run_result(run_id="run-001"))
+    repository.save_single_run_result(_build_single_run_result(run_id="run-002"))
+
+    details = [
+        load_run_detail_view(repository, "run-001"),
+        load_run_detail_view(repository, "run-002"),
+    ]
+    trade_rows = build_trade_explorer_rows(details)
+
+    filtered = filter_trade_rows(
+        trade_rows,
+        trade_filter=TradeFilter(
+            run_ids=("run-002",),
+            outcome="winner",
+            sides=("long",),
+            min_holding_bars=0,
+            max_holding_bars=10,
+            reason_query="open-long",
+        ),
+    )
+
+    assert len(filtered) == 1
+    assert filtered[0]["run_id"] == "run-002"
+    assert filtered[0]["side"] == "long"
 
 
 def _build_single_run_result(*, run_id: str):

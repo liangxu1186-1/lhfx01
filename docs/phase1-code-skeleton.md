@@ -465,8 +465,9 @@ src/crypto_backtest_workbench/
 当前作用：
 
 - 把 `RunRepository` 产物组装成只读 `summary/detail` 视图
+- 提供交易聚合与交易筛选视图，供最小 `Trade Explorer` 使用
 - 让 Streamlit 页面不直接拼接 storage 细节
-- 提供最小只读页面：`run summary / equity / trade table / warnings`
+- 提供最小只读页面：`run summary / compare / trade explorer / equity / trade table / warnings`
 
 ## 当前骨架的完成定义
 
@@ -704,7 +705,9 @@ src/crypto_backtest_workbench/
 开始只读页面：
 
 - 已新增最小只读 Streamlit 页面
-- 当前覆盖 `run summary / equity / trade table / warnings`
+- 当前覆盖 `run summary / filter / compare / trade explorer / equity / trade table / warnings`
+- 当前页面文案已改为中文，并隐藏默认 Streamlit 顶栏 / 菜单 / Deploy 入口
+- 当前布局已收成双栏研究工作台：左侧研究主面板，右侧当前 run inspector，下方用 tabs 查看单 run 详情
 - 启动方式为 `cbw ui --repository-root <repo>`
 
 ### 第五步
