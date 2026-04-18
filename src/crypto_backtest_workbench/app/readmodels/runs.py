@@ -23,12 +23,21 @@ class RunSummaryView:
     run_id: str
     strategy_name: str
     dataset_snapshot_id: str
+    symbol: str
+    timeframe: str
     status: str
     created_at: datetime
+    validation_split_id: str
     total_return: float
     final_equity: float
     trade_count: int
+    win_rate: float
+    profit_factor: float | None
     benchmark_return: float | None
+    excess_return: float | None
+    warning_count: int
+    order_count: int
+    fill_count: int
 
     def as_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -74,20 +83,35 @@ class TradeFilter:
 def list_run_summary_views(run_repository: RunRepository) -> list[RunSummaryView]:
     summaries: list[RunSummaryView] = []
     for run_id in run_repository.list_run_ids():
+        manifest = run_repository.load_manifest(run_id)
         run = run_repository.load_run(run_id)
         metrics = run_repository.load_metrics(run_id)
         benchmark = run_repository.load_benchmark(run_id)
+        execution = run_repository.load_execution(run_id)
+        benchmark_return = benchmark.result.return_pct if benchmark is not None else None
+        excess_return = None
+        if benchmark_return is not None:
+            excess_return = metrics.total_return - benchmark_return
         summaries.append(
             RunSummaryView(
                 run_id=run.run_id,
                 strategy_name=run.strategy_name,
                 dataset_snapshot_id=run.dataset_snapshot_id,
+                symbol=str(manifest.resolved_config_json.get("symbol") or ""),
+                timeframe=str(manifest.resolved_config_json.get("timeframe") or ""),
                 status=run.status.value,
                 created_at=run.created_at,
+                validation_split_id=run.validation_split_id,
                 total_return=metrics.total_return,
                 final_equity=metrics.final_equity,
                 trade_count=metrics.trade_count,
-                benchmark_return=benchmark.result.return_pct if benchmark is not None else None,
+                win_rate=metrics.win_rate,
+                profit_factor=_normalize_float(metrics.profit_factor),
+                benchmark_return=benchmark_return,
+                excess_return=excess_return,
+                warning_count=len(execution.warnings),
+                order_count=len(execution.orders),
+                fill_count=len(execution.fills),
             )
         )
     return sorted(summaries, key=lambda item: item.created_at, reverse=True)
@@ -108,7 +132,14 @@ def filter_run_summary_views(
     *,
     strategy_names: set[str] | None = None,
     statuses: set[str] | None = None,
+    symbols: set[str] | None = None,
+    validation_split_ids: set[str] | None = None,
     dataset_query: str | None = None,
+    min_total_return: float | None = None,
+    max_total_return: float | None = None,
+    min_trade_count: int | None = None,
+    max_trade_count: int | None = None,
+    benchmark_mode: str = "all",
 ) -> list[RunSummaryView]:
     query = (dataset_query or "").strip().lower()
     filtered: list[RunSummaryView] = []
@@ -117,7 +148,23 @@ def filter_run_summary_views(
             continue
         if statuses and summary.status not in statuses:
             continue
-        if query and query not in summary.dataset_snapshot_id.lower() and query not in summary.run_id.lower():
+        if symbols and summary.symbol not in symbols:
+            continue
+        if validation_split_ids and summary.validation_split_id not in validation_split_ids:
+            continue
+        if min_total_return is not None and summary.total_return < min_total_return:
+            continue
+        if max_total_return is not None and summary.total_return > max_total_return:
+            continue
+        if min_trade_count is not None and summary.trade_count < min_trade_count:
+            continue
+        if max_trade_count is not None and summary.trade_count > max_trade_count:
+            continue
+        if benchmark_mode == "with" and summary.benchmark_return is None:
+            continue
+        if benchmark_mode == "without" and summary.benchmark_return is not None:
+            continue
+        if query and query not in summary.dataset_snapshot_id.lower() and query not in summary.run_id.lower() and query not in summary.symbol.lower():
             continue
         filtered.append(summary)
     return filtered

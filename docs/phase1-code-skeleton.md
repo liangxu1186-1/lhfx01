@@ -152,6 +152,7 @@ src/crypto_backtest_workbench/
 - [runs.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/storage/repositories/runs.py)
 - [app/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/__init__.py)
 - [readmodels/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/readmodels/__init__.py)
+- [readmodels/parameters.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/readmodels/parameters.py)
 - [readmodels/runs.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/readmodels/runs.py)
 - [streamlit_app.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/streamlit_app.py)
 - [workflows/__init__.py](/Users/liangxu/code/lhfx01/src/crypto_backtest_workbench/app/workflows/__init__.py)
@@ -708,6 +709,10 @@ src/crypto_backtest_workbench/
 - 当前覆盖 `run summary / filter / compare / trade explorer / equity / trade table / warnings`
 - 当前页面文案已改为中文，并隐藏默认 Streamlit 顶栏 / 菜单 / Deploy 入口
 - 当前布局已收成双栏研究工作台：左侧研究主面板，右侧当前 run inspector，下方用 tabs 查看单 run 详情
+- 当前筛选已补到研究型粒度：策略 / 状态 / 标的 / 样本切分 / 收益率范围 / 交易数范围 / 基准有无 / 排序
+- 当前 inspector 已能直接查看基准 / 超额、订单 / 成交、交易 / 告警，以及参数快照
+- 当前已新增 Parameter Lab 只读骨架：从已落盘 run 提取参数组合、参数热区和单参数敏感性，不直接提交 experiment 任务
+- 当前页面已新增执行面板：可直接在 UI 里发起 `历史数据导入` 与 `EMA 回测运行`，不再必须先回到终端执行 `cbw ingest` / `cbw run-ema`
 - 启动方式为 `cbw ui --repository-root <repo>`
 
 ### 第五步

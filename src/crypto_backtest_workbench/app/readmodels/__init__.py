@@ -1,5 +1,13 @@
 """Read-only view models for app consumers."""
 
+from crypto_backtest_workbench.app.readmodels.parameters import (
+    ParameterLabFilter,
+    ParameterLabRow,
+    build_parameter_lab_rows,
+    build_parameter_sensitivity_rows,
+    filter_parameter_lab_rows,
+    parameter_metric_value,
+)
 from crypto_backtest_workbench.app.readmodels.runs import (
     RunComparisonView,
     RunDetailView,
@@ -18,18 +26,24 @@ from crypto_backtest_workbench.app.readmodels.runs import (
 )
 
 __all__ = [
+    "ParameterLabFilter",
+    "ParameterLabRow",
     "RunComparisonView",
     "RunDetailView",
     "RunSummaryView",
     "TradeFilter",
     "build_equity_chart_rows",
+    "build_parameter_lab_rows",
+    "build_parameter_sensitivity_rows",
     "build_multi_run_equity_rows",
     "build_run_comparison_views",
     "build_trade_explorer_rows",
     "build_trade_rows",
     "build_warning_rows",
+    "filter_parameter_lab_rows",
     "filter_trade_rows",
     "filter_run_summary_views",
     "list_run_summary_views",
     "load_run_detail_view",
+    "parameter_metric_value",
 ]
