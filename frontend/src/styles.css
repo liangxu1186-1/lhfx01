@@ -170,6 +170,20 @@ body {
   flex-wrap: wrap;
 }
 
+.cbw-summary-card.ant-card .ant-card-body {
+  padding: 12px 14px;
+}
+
+.cbw-summary-stat .ant-statistic-title {
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+
+.cbw-summary-stat .ant-statistic-content {
+  font-size: 22px;
+  line-height: 1.2;
+}
+
 @media (min-width: 1600px) {
   .cbw-content {
     max-width: 1600px;

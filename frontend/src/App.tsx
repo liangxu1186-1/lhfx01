@@ -1,5 +1,6 @@
 import { useDeferredValue, useEffect, useMemo, useState } from 'react';
 import type { ColumnDef } from '@tanstack/react-table';
+import dayjs from 'dayjs';
 import {
   Alert,
   App as AntdApp,
@@ -7,6 +8,7 @@ import {
   Card,
   Col,
   ConfigProvider,
+  DatePicker,
   Descriptions,
   Flex,
   Form,
@@ -80,6 +82,25 @@ const ANALYSIS_FIELD_LABELS: Record<string, string> = {
   qty_by_policy: '按策略下单数量',
 };
 
+const ANALYSIS_VALUE_LABELS: Record<string, Record<string, string>> = {
+  execution_policy_id: {
+    signal_on_bar_close_fill_on_next_bar_open: '信号在当前 K 线收盘确认，下一根 K 线开盘成交',
+  },
+  metric_policy_id: {
+    metrics_daily_365_v1: '日频指标口径（按 365 天年化）',
+  },
+  benchmark_type: {
+    buy_and_hold: '买入并持有',
+    none: '无基准',
+  },
+  name: {
+    ema_crossover: 'EMA 均线交叉',
+  },
+  qty_policy_ref: {
+    fixed_1: '固定数量 fixed_1',
+  },
+};
+
 function isTabId(value: string | null): value is TabId {
   return value === 'execution' || value === 'overview' || value === 'analysis' || value === 'parameters';
 }
@@ -92,12 +113,28 @@ function labelAnalysisField(key: string): string {
   return ANALYSIS_FIELD_LABELS[key] ?? key;
 }
 
-function formatAnalysisFieldValue(value: unknown): string {
+function formatAnalysisFieldValue(key: string, value: unknown): string {
+  if (typeof value === 'string') {
+    return ANALYSIS_VALUE_LABELS[key]?.[value] ?? value;
+  }
   if (typeof value === 'number') {
     return Number.isInteger(value) ? String(value) : formatNumber(value);
   }
   if (typeof value === 'object' && value !== null) {
     return JSON.stringify(value);
+  }
+  return String(value);
+}
+
+function normalizeDateValue(value: unknown): string | undefined {
+  if (value === null || value === undefined || value === '') {
+    return undefined;
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (typeof value === 'object' && value !== null && 'toISOString' in value && typeof value.toISOString === 'function') {
+    return value.toISOString();
   }
   return String(value);
 }
@@ -327,7 +364,11 @@ function WorkspaceShell() {
   async function handleIngest(values: Record<string, unknown>) {
     setSubmitting('ingest');
     try {
-      const result = await postIngest(values);
+      const result = await postIngest({
+        ...values,
+        since: normalizeDateValue(values.since),
+        until: normalizeDateValue(values.until),
+      });
       const snapshotId = String(result.dataset_snapshot_id ?? '');
       setLastActionResult(`导入完成：${snapshotId}`);
       message.success(`导入完成：${snapshotId}`);
@@ -414,7 +455,7 @@ function WorkspaceShell() {
       return rows;
     }
     return rows.filter((row) => (
-      [row.run_id, row.dataset_snapshot_id, row.symbol, row.strategy_name].join(' ').toLowerCase().includes(query)
+      [row.run_id, row.dataset_snapshot_id, row.symbol, row.strategy_name, row.timeframe].join(' ').toLowerCase().includes(query)
     ));
   }, [overview, deferredOverviewQuery]);
 
@@ -569,10 +610,6 @@ function ExecutionView({
       : datasets,
     [datasets, selectedRunTimeframe],
   );
-  const datasetById = useMemo(
-    () => new Map(datasets.map((snapshot) => [snapshot.dataset_snapshot_id, snapshot] as const)),
-    [datasets],
-  );
   const datasetTableTimeframeOptions = useMemo(
     () => timeframeOptions.map((option) => ({ label: option.label, value: option.value })),
     [timeframeOptions],
@@ -686,17 +723,8 @@ function ExecutionView({
   }, [filteredDatasets, runForm, selectedSnapshotId]);
 
   function handleRunTimeframeChange(value: string) {
-    runForm.setFieldValue('timeframe', value);
     const nextSnapshot = datasets.find((snapshot) => snapshot.timeframe === value);
     runForm.setFieldValue('snapshot_id', nextSnapshot?.dataset_snapshot_id);
-  }
-
-  function handleRunSnapshotChange(value: string) {
-    runForm.setFieldValue('snapshot_id', value);
-    const selectedSnapshot = datasetById.get(value);
-    if (selectedSnapshot && selectedSnapshot.timeframe !== selectedRunTimeframe) {
-      runForm.setFieldValue('timeframe', selectedSnapshot.timeframe);
-    }
   }
 
   return (
@@ -710,8 +738,8 @@ function ExecutionView({
               exchange: 'binanceusdm',
               symbol: 'BTC/USDT:USDT',
               timeframe: '1h',
-              since: '2024-01-01T00:00:00+00:00',
-              until: '2024-01-03T00:00:00+00:00',
+              since: dayjs('2024-01-01T00:00:00+08:00'),
+              until: dayjs('2024-01-03T00:00:00+08:00'),
               market_type: 'linear_usdt_perpetual',
               price_type: 'last',
               limit: 1000,
@@ -735,13 +763,23 @@ function ExecutionView({
             </Form.Item>
             <Row gutter={12}>
               <Col span={12}>
-                <Form.Item name="since" label="开始时间 ISO8601" rules={[{ required: true }]}>
-                  <Input />
+                <Form.Item name="since" label="开始时间（北京时间）" rules={[{ required: true }]}>
+                  <DatePicker
+                    showTime
+                    format="YYYY-MM-DD HH:mm:ss"
+                    style={{ width: '100%' }}
+                    placeholder="选择开始时间"
+                  />
                 </Form.Item>
               </Col>
               <Col span={12}>
-                <Form.Item name="until" label="结束时间 ISO8601">
-                  <Input />
+                <Form.Item name="until" label="结束时间（北京时间）">
+                  <DatePicker
+                    showTime
+                    format="YYYY-MM-DD HH:mm:ss"
+                    style={{ width: '100%' }}
+                    placeholder="选择结束时间"
+                  />
                 </Form.Item>
               </Col>
             </Row>
@@ -810,7 +848,6 @@ function ExecutionView({
                       value: snapshot.dataset_snapshot_id,
                     }))}
                     optionFilterProp="label"
-                    onChange={handleRunSnapshotChange}
                   />
                 </Form.Item>
               </Col>
@@ -987,6 +1024,12 @@ function OverviewView({
       ),
     },
     { header: '标的', accessorKey: 'symbol' },
+    {
+      id: 'timeframe',
+      header: '周期',
+      accessorFn: (row) => row.timeframe,
+      cell: ({ row }) => row.original.timeframe.toUpperCase(),
+    },
     { header: '策略', accessorKey: 'strategy_name' },
     { header: '收益率', cell: ({ row }) => formatPct(row.original.total_return) },
     { header: '基准', cell: ({ row }) => formatPct(row.original.benchmark_return) },
@@ -1022,7 +1065,7 @@ function OverviewView({
     }),
     type: 'scatter',
     mode: 'lines',
-    name: `${shortRunId(runId)} · ${summaryByRunId.get(runId)?.symbol ?? '未知标的'}`,
+    name: `${shortRunId(runId)} · ${summaryByRunId.get(runId)?.symbol ?? '未知标的'} · ${(summaryByRunId.get(runId)?.timeframe ?? '').toUpperCase()}`,
     line: {
       width: 2.5,
     },
@@ -1042,7 +1085,7 @@ function OverviewView({
           extra={(
             <Space wrap>
               <Input
-                placeholder="搜索 run / 数据集 / 标的"
+                placeholder="搜索 run / 数据集 / 标的 / 周期"
                 value={overviewQuery}
                 onChange={(event) => setOverviewQuery(event.target.value)}
               />
@@ -1052,7 +1095,7 @@ function OverviewView({
                 style={{ minWidth: 320 }}
                 onChange={setCompareRunIds}
                 options={chartOptions.slice(0, 12).map((summary) => ({
-                  label: `${shortRunId(summary.run_id)} · ${summary.symbol}`,
+                  label: `${shortRunId(summary.run_id)} · ${summary.symbol} · ${summary.timeframe.toUpperCase()}`,
                   value: summary.run_id,
                 }))}
               />
@@ -1068,7 +1111,7 @@ function OverviewView({
               paper_bgcolor: '#ffffff',
               plot_bgcolor: '#ffffff',
               hovermode: 'x unified',
-              xaxis: { title: '时间（UTC）' },
+              xaxis: { title: '时间（北京时间）' },
               yaxis: { title: '权益' },
               legend: { orientation: 'h', title: { text: '每条线代表一个 run 的策略权益' } },
             } as never}
@@ -1141,6 +1184,44 @@ function AnalysisView({
 
   const tradeRows = selectedRun?.trade_rows ?? [];
   const tradeSideOptions = Array.from(new Set(tradeRows.map((row) => row.side))).sort();
+  const tradeSummaryStats = useMemo(() => {
+    const closedTrades = tradeRows.filter((row) => row.exit_time !== null);
+    const openTrades = tradeRows.filter((row) => row.exit_time === null);
+    const winningTrades = closedTrades.filter((row) => row.net_pnl > 0);
+    const losingTrades = closedTrades.filter((row) => row.net_pnl < 0);
+    const avgNetPnl = closedTrades.length
+      ? closedTrades.reduce((sum, row) => sum + row.net_pnl, 0) / closedTrades.length
+      : null;
+    const avgWin = winningTrades.length
+      ? winningTrades.reduce((sum, row) => sum + row.net_pnl, 0) / winningTrades.length
+      : null;
+    const avgLoss = losingTrades.length
+      ? losingTrades.reduce((sum, row) => sum + row.net_pnl, 0) / losingTrades.length
+      : null;
+    const payoffRatio = avgWin !== null && avgLoss !== null && avgLoss !== 0
+      ? avgWin / Math.abs(avgLoss)
+      : null;
+    const maxWin = winningTrades.length
+      ? Math.max(...winningTrades.map((row) => row.net_pnl))
+      : null;
+    const maxLoss = losingTrades.length
+      ? Math.min(...losingTrades.map((row) => row.net_pnl))
+      : null;
+
+    return [
+      { title: '总交易数', value: String(tradeRows.length), tone: 'neutral' },
+      { title: '盈利笔数', value: String(winningTrades.length), tone: 'positive' },
+      { title: '亏损笔数', value: String(losingTrades.length), tone: 'negative' },
+      { title: '未平仓笔数', value: String(openTrades.length), tone: 'neutral' },
+      { title: '胜率', value: formatPct(closedTrades.length ? winningTrades.length / closedTrades.length : null), tone: 'positive' },
+      { title: '平均单笔收益', value: formatNumber(avgNetPnl), tone: avgNetPnl !== null && avgNetPnl < 0 ? 'negative' : avgNetPnl !== null && avgNetPnl > 0 ? 'positive' : 'neutral' },
+      { title: '平均盈利', value: formatNumber(avgWin), tone: 'positive' },
+      { title: '平均亏损', value: formatNumber(avgLoss), tone: 'negative' },
+      { title: '盈亏比', value: formatNumber(payoffRatio), tone: payoffRatio !== null && payoffRatio < 1 ? 'negative' : payoffRatio !== null && payoffRatio > 1 ? 'positive' : 'neutral' },
+      { title: '最大单笔盈利', value: formatNumber(maxWin), tone: 'positive' },
+      { title: '最大单笔亏损', value: formatNumber(maxLoss), tone: 'negative' },
+    ];
+  }, [tradeRows]);
   const filteredTradeRows = useMemo(
     () => tradeRows
       .filter((row) => {
@@ -1188,7 +1269,7 @@ function AnalysisView({
                 style={{ minWidth: 360 }}
                 onChange={setSelectedRunId}
                 options={runs.map((run) => ({
-                  label: `${shortRunId(run.run_id)} · ${run.symbol}`,
+                  label: `${shortRunId(run.run_id)} · ${run.symbol} · ${run.timeframe.toUpperCase()}`,
                   value: run.run_id,
                 }))}
               />
@@ -1237,7 +1318,7 @@ function AnalysisView({
               paper_bgcolor: '#ffffff',
               plot_bgcolor: '#ffffff',
               hovermode: 'x unified',
-              xaxis: { title: '时间（UTC）' },
+              xaxis: { title: '时间（北京时间）' },
               yaxis: { title: '资金' },
               legend: {
                 orientation: 'h',
@@ -1255,9 +1336,15 @@ function AnalysisView({
       <Col xs={24} xl={12}>
         <Card title="运行上下文">
           <Descriptions column={1} size="small">
+            <Descriptions.Item label="标的 / 周期">{`${selectedRun.symbol} · ${selectedRun.timeframe.toUpperCase()}`}</Descriptions.Item>
+            <Descriptions.Item label="数据快照">{selectedRun.dataset_snapshot_id}</Descriptions.Item>
             <Descriptions.Item label="策略版本">{selectedRun.manifest.strategy_version}</Descriptions.Item>
-            <Descriptions.Item label="执行策略">{selectedRun.manifest.execution_policy_id}</Descriptions.Item>
-            <Descriptions.Item label="指标策略">{selectedRun.manifest.metric_policy_id}</Descriptions.Item>
+            <Descriptions.Item label="执行策略">
+              {formatAnalysisFieldValue('execution_policy_id', selectedRun.manifest.execution_policy_id)}
+            </Descriptions.Item>
+            <Descriptions.Item label="指标策略">
+              {formatAnalysisFieldValue('metric_policy_id', selectedRun.manifest.metric_policy_id)}
+            </Descriptions.Item>
             <Descriptions.Item label="特征产物">{selectedRun.manifest.feature_artifact_id}</Descriptions.Item>
           </Descriptions>
         </Card>
@@ -1268,15 +1355,43 @@ function AnalysisView({
           <Descriptions column={1} size="small">
             {Object.entries(strategyParams ?? {}).map(([key, value]) => (
               <Descriptions.Item key={key} label={labelAnalysisField(key)}>
-                {formatAnalysisFieldValue(value)}
+                {formatAnalysisFieldValue(key, value)}
               </Descriptions.Item>
             ))}
             {Object.entries(executionConstraints ?? {}).map(([key, value]) => (
               <Descriptions.Item key={key} label={labelAnalysisField(key)}>
-                {formatAnalysisFieldValue(value)}
+                {formatAnalysisFieldValue(key, value)}
               </Descriptions.Item>
             ))}
           </Descriptions>
+        </Card>
+      </Col>
+
+      <Col span={24}>
+        <Card title="交易统计汇总">
+          <Paragraph type="secondary" style={{ marginBottom: 12 }}>
+            基于当前 run 的全部交易记录计算。
+          </Paragraph>
+          <Row gutter={[10, 10]}>
+            {tradeSummaryStats.map((item) => (
+              <Col xs={12} sm={8} lg={6} xl={4} xxl={3} key={item.title}>
+                <Card size="small" className="cbw-summary-card">
+                  <Statistic
+                    className="cbw-summary-stat"
+                    title={item.title}
+                    value={item.value}
+                    valueStyle={{
+                      color: item.tone === 'positive'
+                        ? '#16a34a'
+                        : item.tone === 'negative'
+                          ? '#dc2626'
+                          : '#101828',
+                    }}
+                  />
+                </Card>
+              </Col>
+            ))}
+          </Row>
         </Card>
       </Col>
 
