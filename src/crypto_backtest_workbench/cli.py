@@ -83,11 +83,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="buy_and_hold",
     )
 
-    ui = subparsers.add_parser("ui", help="Launch the Phase 1 read-only Streamlit UI.")
+    ui = subparsers.add_parser("ui", help="Launch the React UI with the co-hosted Python API.")
     ui.add_argument("--repository-root", default=".")
     ui.add_argument("--data-dir")
     ui.add_argument("--host", default="127.0.0.1")
     ui.add_argument("--port", type=int, default=8501)
+    ui.add_argument("--cors-origin", default="*")
+
+    ui_streamlit = subparsers.add_parser("ui-streamlit", help="Launch the legacy Streamlit UI.")
+    ui_streamlit.add_argument("--repository-root", default=".")
+    ui_streamlit.add_argument("--data-dir")
+    ui_streamlit.add_argument("--host", default="127.0.0.1")
+    ui_streamlit.add_argument("--port", type=int, default=8501)
+
+    api = subparsers.add_parser("api", help="Launch the Phase 1 HTTP API for the React workbench.")
+    api.add_argument("--repository-root", default=".")
+    api.add_argument("--data-dir")
+    api.add_argument("--host", default="127.0.0.1")
+    api.add_argument("--port", type=int, default=8000)
+    api.add_argument("--cors-origin", default="*")
     return parser
 
 
@@ -151,6 +165,12 @@ def main() -> int:
 
     if args.command == "ui":
         return _run_command(_handle_ui, args)
+
+    if args.command == "ui-streamlit":
+        return _run_command(_handle_ui_streamlit, args)
+
+    if args.command == "api":
+        return _run_command(_handle_api, args)
 
     parser.print_help()
     return 0
@@ -275,6 +295,18 @@ def _handle_run_ema(args: argparse.Namespace) -> int:
 
 
 def _handle_ui(args: argparse.Namespace) -> int:
+    from crypto_backtest_workbench.app.api import serve_ui
+
+    return serve_ui(
+        host=args.host,
+        port=args.port,
+        repository_root=args.repository_root,
+        data_dir=args.data_dir,
+        cors_origin=args.cors_origin,
+    )
+
+
+def _handle_ui_streamlit(args: argparse.Namespace) -> int:
     command = _build_ui_launch_command(
         python_executable=sys.executable,
         app_path=_streamlit_app_path(),
@@ -288,6 +320,18 @@ def _handle_ui(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         return 130
     return completed.returncode
+
+
+def _handle_api(args: argparse.Namespace) -> int:
+    from crypto_backtest_workbench.app.api import serve_api
+
+    return serve_api(
+        host=args.host,
+        port=args.port,
+        repository_root=args.repository_root,
+        data_dir=args.data_dir,
+        cors_origin=args.cors_origin,
+    )
 
 
 def _run_command(handler, args: argparse.Namespace) -> int:

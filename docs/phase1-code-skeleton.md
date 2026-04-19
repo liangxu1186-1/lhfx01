@@ -52,6 +52,7 @@ CLI 故意保持极简，它的作用是：
 
 - `cbw ingest` 已支持真实 `ccxt` 依赖
 - `cbw ingest` 已支持 `--exchange-options-json` 与 `--extra-params-json`
+- `cbw ingest` 当前已改为 `ccxt` 优先，Binance USD-M / Bybit 在 `ccxt` 网络失败时可自动 fallback 到交易所 REST K 线接口
 - `cbw run-ema` 已能基于本地 snapshot 执行完整 Phase 1 闭环
 - `cbw run-ema` 已支持最小 `validation split` 时间边界输入
 - `cbw run-ema` 已输出 `task_status / order_count / fill_count / warning_count`，失败时返回 `failure_code / failure_stage`
@@ -708,7 +709,16 @@ src/crypto_backtest_workbench/
 - 已新增最小只读 Streamlit 页面
 - 当前覆盖 `run summary / filter / compare / trade explorer / equity / trade table / warnings`
 - 当前页面文案已改为中文，并隐藏默认 Streamlit 顶栏 / 菜单 / Deploy 入口
-- 当前布局已收成双栏研究工作台：左侧研究主面板，右侧当前 run inspector，下方用 tabs 查看单 run 详情
+- 当前布局已进一步拆成四个明确工作区：`执行台 / 运行总览 / 单次分析 / 参数实验`
+- 当前头部已收成紧凑工具栏式页头，不再占据首屏的大块空间
+- `运行总览` 只负责筛选、列表与多 run 对比，不再和单次分析混在一起
+- `单次分析` 单独承载 run inspector、单 run 详情和交易浏览
+- 当前多 run 对比只在选中至少 2 个 run 时展示，避免和单 run 资金曲线重复
+- 当前运行总览表已加分页与默认核心列选择，避免一次性渲染过宽过长的大表
+- 当前运行总览表的列选择会在当前页面会话里保留，便于连续筛选时保持同一观察视角
+- 当前交易浏览与交易明细已改成表格下方右侧的简单翻页，页面只渲染当前页记录，减少大表卡顿
+- 当前资金曲线与多 run 对比曲线已切到 Plotly 可交互图，并按点数上限抽样，支持拖拽和平移
+- 当前参数实验表已加分页，参数敏感性曲线也按点数上限抽样，避免参数页变成新的性能瓶颈
 - 当前筛选已补到研究型粒度：策略 / 状态 / 标的 / 样本切分 / 收益率范围 / 交易数范围 / 基准有无 / 排序
 - 当前 inspector 已能直接查看基准 / 超额、订单 / 成交、交易 / 告警，以及参数快照
 - 当前已新增 Parameter Lab 只读骨架：从已落盘 run 提取参数组合、参数热区和单参数敏感性，不直接提交 experiment 任务

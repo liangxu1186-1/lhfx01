@@ -20,9 +20,9 @@ from crypto_backtest_workbench.engine.data.canonicalizer import (
     ohlcv_rows_to_canonical_candles,
 )
 from crypto_backtest_workbench.engine.data.fetchers import (
-    CcxtHistoryFetcher,
     HistoryFetchRequest,
     HistoryFetcher,
+    build_default_history_fetcher,
 )
 from crypto_backtest_workbench.engine.data.integrity import build_integrity_report
 from crypto_backtest_workbench.engine.data.service import DatasetIngestionResult, DatasetIngestionService
@@ -61,7 +61,7 @@ def ingest_dataset_workflow(
         price_type=price_type,
         extra_params=extra_params or {},
     )
-    workflow_fetcher = fetcher or CcxtHistoryFetcher.from_exchange_name(
+    workflow_fetcher = fetcher or build_default_history_fetcher(
         exchange,
         options=exchange_options,
     )
@@ -77,12 +77,17 @@ def ingest_dataset_workflow(
         market_type=request.market_type,
         timeframe=request.timeframe,
         price_type=request.price_type,
-        data_source="ccxt_rest",
+        data_source=getattr(workflow_fetcher, "data_source", "ccxt_rest"),
     )
     reference_now = request.until if request.until is not None else now_utc()
     _, has_open_last_candle = drop_open_last_candle(candles, now=reference_now)
 
-    snapshot = _build_snapshot(request=request, row_count=len(candles), candles=candles)
+    snapshot = _build_snapshot(
+        request=request,
+        row_count=len(candles),
+        candles=candles,
+        data_source=getattr(workflow_fetcher, "data_source", "ccxt_rest"),
+    )
     integrity_report = build_integrity_report(
         snapshot.dataset_snapshot_id,
         candles,
@@ -143,6 +148,7 @@ def _build_snapshot(
     request: HistoryFetchRequest,
     candles: list[CanonicalCandle],
     row_count: int,
+    data_source: str,
 ) -> DatasetSnapshot:
     snapshot_id = DatasetIngestionService._build_snapshot_id(request)
     return DatasetSnapshot(
@@ -158,6 +164,6 @@ def _build_snapshot(
         schema_version="v1",
         feature_version="pending",
         storage_uri=f"datasets/{snapshot_id}",
-        data_source="ccxt_rest",
+        data_source=data_source,
         price_type=request.price_type,
     )

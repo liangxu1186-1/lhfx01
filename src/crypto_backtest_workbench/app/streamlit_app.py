@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from crypto_backtest_workbench.app.workflows import (
@@ -60,41 +61,59 @@ def main() -> None:
     summaries = list_run_summary_views(repository)
 
     _render_page_header(data_dir=data_dir)
-    _render_execution_console(repository_root=repository_root, data_dir=data_dir)
+    execution_tab, overview_tab, analysis_tab, parameter_tab = st.tabs(
+        ["执行台", "运行总览", "单次分析", "参数实验"]
+    )
+
+    with execution_tab:
+        _render_execution_console(repository_root=repository_root, data_dir=data_dir)
 
     if not summaries:
-        st.info("当前还没有已落盘的回测结果。你现在可以直接在上面的执行面板里导入历史数据并运行第一组回测。")
+        empty_message = "当前还没有已落盘的回测结果。先在“执行台”里导入历史数据并运行第一组回测。"
+        with overview_tab:
+            st.info(empty_message)
+        with analysis_tab:
+            st.info(empty_message)
+        with parameter_tab:
+            st.info(empty_message)
         return
 
-    filtered_summaries = _render_dashboard_filters(summaries)
-    if not filtered_summaries:
-        st.warning("当前筛选条件下没有匹配的 run。")
-        return
+    with overview_tab:
+        filtered_summaries = _render_dashboard_filters(summaries)
+        if not filtered_summaries:
+            st.warning("当前筛选条件下没有匹配的 run。")
+        else:
+            _render_summary_cards(filtered_summaries)
+            _render_summary_table(filtered_summaries)
+            compare_ids = _render_run_compare_picker(
+                summaries=filtered_summaries,
+                key_prefix="overview",
+                title="总览对比",
+                body="先在筛选后的 run 里圈出几组候选，再做收益、超额收益和资金曲线对比。",
+            )
+            _render_comparison_section(repository, compare_ids)
 
-    _render_summary_cards(filtered_summaries)
-    workspace_col, inspector_col = st.columns([1.78, 0.92], gap="large")
-    with inspector_col:
+    with analysis_tab:
         selected_run_id, selected_compare_ids = _render_run_inspector_controls(
-            summaries=filtered_summaries,
+            summaries=summaries,
             total_run_count=len(summaries),
         )
+        detail = load_run_detail_view(repository, selected_run_id)
+        selected_compare_details = [
+            load_run_detail_view(repository, run_id)
+            for run_id in list(dict.fromkeys(selected_compare_ids))
+        ]
 
-    detail = load_run_detail_view(repository, selected_run_id)
-    selected_compare_details = [
-        load_run_detail_view(repository, run_id)
-        for run_id in list(dict.fromkeys(selected_compare_ids))
-    ]
+        with st.expander("查看当前运行上下文", expanded=False):
+            _render_run_inspector(detail)
+        _render_detail_tabs(detail)
+        if len(selected_compare_details) > 1:
+            _render_trade_explorer_section(selected_compare_details)
+        else:
+            st.caption("当前只选中 1 个 run，下面不再重复显示跨 run 交易浏览。若要比较多组交易，请在上方“加入对比”里再选至少 1 个 run。")
 
-    with workspace_col:
-        _render_summary_table(filtered_summaries)
-        _render_comparison_section(repository, selected_compare_ids)
-        _render_trade_explorer_section(selected_compare_details)
-        _render_parameter_lab_section(repository, filtered_summaries)
-
-    with inspector_col:
-        _render_run_inspector(detail)
-
-    _render_detail_tabs(detail)
+    with parameter_tab:
+        _render_parameter_lab_section(repository, summaries)
 
 
 def _render_dashboard_filters(summaries):
@@ -105,57 +124,67 @@ def _render_dashboard_filters(summaries):
     return_bounds = _float_range_bounds([summary.total_return * 100 for summary in summaries])
     trade_bounds = _int_range_bounds([summary.trade_count for summary in summaries])
 
-    st.sidebar.subheader("筛选")
-    selected_strategies = set(
-        st.sidebar.multiselect(
-            "策略",
-            options=strategy_options,
-            default=strategy_options,
+    _section_header("总览筛选", "先缩小候选 run 集合，再看总览表和资金曲线对比。筛选器只服务这一页，不再全局占据侧边栏。")
+    with st.expander("展开筛选器", expanded=True):
+        row1 = st.columns(4)
+        selected_strategies = set(
+            row1[0].multiselect(
+                "策略",
+                options=strategy_options,
+                default=strategy_options,
+                format_func=_strategy_label,
+            )
         )
-    )
-    selected_statuses = set(
-        st.sidebar.multiselect(
-            "状态",
-            options=status_options,
-            default=status_options,
-            format_func=_status_label,
+        selected_statuses = set(
+            row1[1].multiselect(
+                "状态",
+                options=status_options,
+                default=status_options,
+                format_func=_status_label,
+            )
         )
-    )
-    selected_symbols = set(
-        st.sidebar.multiselect(
-            "标的",
-            options=symbol_options,
-            default=symbol_options,
+        selected_symbols = set(
+            row1[2].multiselect(
+                "标的",
+                options=symbol_options,
+                default=symbol_options,
+            )
         )
-    )
-    selected_validation_splits = set(
-        st.sidebar.multiselect(
-            "样本切分",
-            options=validation_split_options,
-            default=validation_split_options,
+        selected_validation_splits = set(
+            row1[3].multiselect(
+                "样本切分",
+                options=validation_split_options,
+                default=validation_split_options,
+            )
         )
-    )
-    dataset_query = st.sidebar.text_input("Run / 数据集 模糊搜索")
-    benchmark_mode = st.sidebar.selectbox(
-        "基准结果",
-        options=["all", "with", "without"],
-        format_func=_benchmark_mode_label,
-    )
-    return_range = _sidebar_float_slider(
-        "收益率范围 (%)",
-        bounds=return_bounds,
-        key="dashboard_return_range",
-    )
-    trade_range = _sidebar_int_slider(
-        "交易数范围",
-        bounds=trade_bounds,
-        key="dashboard_trade_range",
-    )
-    sort_mode = st.sidebar.selectbox(
-        "排序",
-        options=["created_at_desc", "total_return_desc", "trade_count_desc", "warning_count_desc"],
-        format_func=_sort_mode_label,
-    )
+
+        row2 = st.columns([1.2, 0.9, 1.1, 1.1])
+        dataset_query = row2[0].text_input("Run / 数据集 模糊搜索")
+        benchmark_mode = row2[1].selectbox(
+            "基准结果",
+            options=["all", "with", "without"],
+            format_func=_benchmark_mode_label,
+        )
+        sort_mode = row2[2].selectbox(
+            "排序",
+            options=["created_at_desc", "total_return_desc", "trade_count_desc", "warning_count_desc"],
+            format_func=_sort_mode_label,
+        )
+        row2[3].caption("当前页只负责筛选与比较，不显示单条 run 的细节。")
+
+        row3 = st.columns(2)
+        with row3[0]:
+            return_range = _inline_float_slider(
+                "收益率范围 (%)",
+                bounds=return_bounds,
+                key="dashboard_return_range",
+            )
+        with row3[1]:
+            trade_range = _inline_int_slider(
+                "交易数范围",
+                bounds=trade_bounds,
+                key="dashboard_trade_range",
+            )
 
     filtered = filter_run_summary_views(
         summaries,
@@ -171,6 +200,24 @@ def _render_dashboard_filters(summaries):
         benchmark_mode=benchmark_mode,
     )
     return _sort_run_summaries(filtered, sort_mode=sort_mode)
+
+
+def _render_run_compare_picker(*, summaries, key_prefix: str, title: str, body: str) -> list[str]:
+    _section_header(title, body)
+    run_ids = [summary.run_id for summary in summaries]
+    default_ids = run_ids[: min(3, len(run_ids))]
+    selected_compare_ids = st.multiselect(
+        "选择要对比的 run",
+        options=run_ids,
+        default=default_ids,
+        key=f"{key_prefix}_compare_ids",
+        format_func=lambda run_id: _run_option_label(
+            next(summary for summary in summaries if summary.run_id == run_id)
+        ),
+    )
+    if not selected_compare_ids and run_ids:
+        return [run_ids[0]]
+    return list(selected_compare_ids)
 
 
 def _render_summary_cards(filtered_summaries) -> None:
@@ -194,8 +241,15 @@ def _render_summary_cards(filtered_summaries) -> None:
 
 
 def _render_summary_table(filtered_summaries) -> None:
-    summary_df = pd.DataFrame([summary.as_dict() for summary in filtered_summaries])
+    raw_rows = [summary.as_dict() for summary in filtered_summaries]
+    page_rows, page_number, page_count, total_rows = _paginate_rows(
+        raw_rows,
+        key_prefix="summary_table",
+        page_size=20,
+    )
+    summary_df = pd.DataFrame(page_rows)
     if not summary_df.empty:
+        summary_df["strategy_name"] = summary_df["strategy_name"].map(_strategy_label)
         summary_df["created_at"] = pd.to_datetime(summary_df["created_at"], utc=True)
         summary_df["status"] = summary_df["status"].map(_status_label)
         summary_df["total_return"] = summary_df["total_return"].map(_format_pct)
@@ -206,32 +260,45 @@ def _render_summary_table(filtered_summaries) -> None:
         summary_df["final_equity"] = summary_df["final_equity"].map(_format_number)
         summary_df = summary_df.rename(columns=_summary_column_labels())
     _section_header("运行总览", "筛选后的运行结果列表。先看收益、状态和交易数，再决定下钻哪组 run。")
+    visible_columns = _render_summary_column_picker(summary_df.columns.tolist())
+    summary_df = summary_df[visible_columns]
     st.dataframe(summary_df, hide_index=True, use_container_width=True)
+    _render_table_pager(
+        key_prefix="summary_table",
+        page_number=page_number,
+        page_count=page_count,
+        total_rows=total_rows,
+    )
 
 
 def _render_run_inspector_controls(*, summaries, total_run_count: int) -> tuple[str, list[str]]:
-    st.markdown('<div class="cbw-panel">', unsafe_allow_html=True)
-    _section_header("当前聚焦", "右侧面板固定当前 run 的上下文。先选一个聚焦 run，再决定要不要拉几个 run 一起比较。")
-    selected_run_id = st.selectbox(
-        "聚焦运行",
-        options=[summary.run_id for summary in summaries],
-        index=0,
-        format_func=lambda run_id: _run_option_label(
-            next(summary for summary in summaries if summary.run_id == run_id)
-        ),
-    )
-    selected_compare_ids = st.multiselect(
-        "加入对比",
-        options=[summary.run_id for summary in summaries],
-        default=[selected_run_id],
-    )
+    _section_header("当前聚焦", "先选一个聚焦 run，再决定要不要拉几个 run 一起比较。图表和详情会按当前选择整行展开。")
+    picker_cols = st.columns([1.35, 1.15], gap="large")
+    with picker_cols[0]:
+        selected_run_id = st.selectbox(
+            "聚焦运行",
+            options=[summary.run_id for summary in summaries],
+            index=0,
+            format_func=lambda run_id: _run_option_label(
+                next(summary for summary in summaries if summary.run_id == run_id)
+            ),
+        )
+    with picker_cols[1]:
+        selected_compare_ids = st.multiselect(
+            "加入对比",
+            options=[summary.run_id for summary in summaries],
+            default=[selected_run_id],
+        )
     selected_summary = next(summary for summary in summaries if summary.run_id == selected_run_id)
     st.caption(f"筛选结果 {len(summaries)} / 全部 {total_run_count} 个 run")
-    _render_stat_block(st, "当前策略", selected_summary.strategy_name)
-    _render_stat_block(st, "当前状态", _status_label(selected_summary.status))
-    _render_stat_block(st, "当前收益率", _format_pct(selected_summary.total_return))
-    _render_stat_block(st, "当前交易 / 告警", f"{selected_summary.trade_count} / {selected_summary.warning_count}")
-    st.markdown("</div>", unsafe_allow_html=True)
+    _render_compact_summary_bar(
+        [
+            ("当前策略", _strategy_label(selected_summary.strategy_name)),
+            ("当前状态", _status_label(selected_summary.status)),
+            ("当前收益率", _format_pct(selected_summary.total_return)),
+            ("当前交易 / 告警", f"{selected_summary.trade_count} / {selected_summary.warning_count}"),
+        ]
+    )
     if not selected_compare_ids:
         selected_compare_ids = [selected_run_id]
     return selected_run_id, selected_compare_ids
@@ -241,35 +308,41 @@ def _render_run_inspector(detail) -> None:
     symbol = str(detail.manifest.resolved_config_json.get("symbol") or "-")
     timeframe = str(detail.manifest.resolved_config_json.get("timeframe") or "-")
     strategy_params = detail.manifest.resolved_config_json.get("strategy_params") or {}
+    strategy_display_name = _strategy_label(
+        detail.run.strategy_name,
+        fast_period=_int_or_none(strategy_params.get("fast_period")),
+        slow_period=_int_or_none(strategy_params.get("slow_period")),
+    )
     execution_constraints = detail.manifest.resolved_config_json.get("execution_constraints") or {}
     benchmark_return = None
     excess_return = None
     if detail.benchmark is not None:
         benchmark_return = detail.benchmark.result.return_pct
         excess_return = detail.metrics.total_return - benchmark_return
-    st.markdown('<div class="cbw-panel cbw-panel-tight">', unsafe_allow_html=True)
     _section_header("运行检查器", "查看当前 run 的身份、数据来源和最重要的运行指标。这里是快速判断，不替代下方的详细标签页。")
-    st.markdown(
-        f"""
-        <div class="cbw-inspector-list">
-          <div><span>运行 ID</span><strong>{detail.run.run_id}</strong></div>
-          <div><span>策略</span><strong>{detail.run.strategy_name}</strong></div>
-          <div><span>标的 / 周期</span><strong>{symbol} · {timeframe}</strong></div>
-          <div><span>数据集</span><strong>{detail.run.dataset_snapshot_id}</strong></div>
-          <div><span>状态</span><strong>{_status_label(detail.run.status.value)}</strong></div>
-          <div><span>样本切分</span><strong>{detail.run.validation_split_id}</strong></div>
-          <div><span>特征产物</span><strong>{detail.run.feature_artifact_id}</strong></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    _render_compact_summary_bar(
+        [
+            ("运行 ID", detail.run.run_id),
+            ("策略", strategy_display_name),
+            ("标的 / 周期", f"{symbol} · {timeframe}"),
+            ("状态", _status_label(detail.run.status.value)),
+            ("数据集", detail.run.dataset_snapshot_id),
+            ("样本切分", detail.run.validation_split_id),
+            ("特征产物", detail.run.feature_artifact_id),
+        ],
     )
-    _render_stat_block(st, "最终权益", _format_number(detail.metrics.final_equity))
-    _render_stat_block(st, "总收益率", _format_pct(detail.metrics.total_return))
-    _render_stat_block(st, "基准 / 超额", f"{_format_pct_or_dash(benchmark_return)} / {_format_pct_or_dash(excess_return)}")
-    _render_stat_block(st, "胜率", _format_pct(detail.metrics.win_rate))
-    _render_stat_block(st, "盈亏比", _format_number_or_dash(detail.metrics.profit_factor))
-    _render_stat_block(st, "订单 / 成交", f"{len(detail.execution.orders)} / {len(detail.execution.fills)}")
-    _render_stat_block(st, "交易 / 告警", f"{len(detail.execution.trades)} / {len(detail.execution.warnings)}")
+    _render_compact_summary_bar(
+        [
+            ("最终权益", _format_number(detail.metrics.final_equity)),
+            ("总收益率", _format_pct(detail.metrics.total_return)),
+            ("基准 / 超额", f"{_format_pct_or_dash(benchmark_return)} / {_format_pct_or_dash(excess_return)}"),
+            ("胜率", _format_pct(detail.metrics.win_rate)),
+            ("盈亏比", _format_number_or_dash(detail.metrics.profit_factor)),
+            ("订单 / 成交", f"{len(detail.execution.orders)} / {len(detail.execution.fills)}"),
+            ("交易 / 告警", f"{len(detail.execution.trades)} / {len(detail.execution.warnings)}"),
+        ],
+        compact=True,
+    )
     with st.expander("参数快照", expanded=False):
         st.json(
             {
@@ -279,18 +352,19 @@ def _render_run_inspector(detail) -> None:
         )
     if detail.run.failure_message:
         st.error(detail.run.failure_message)
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _render_comparison_section(repository: FileRunRepository, selected_compare_ids: list[str]) -> None:
     compare_ids = list(dict.fromkeys(selected_compare_ids))
-    if not compare_ids:
+    if len(compare_ids) < 2:
+        st.caption("当前总览对比少于 2 个 run，已跳过重复的资金曲线对比。先多选几组 run 再比较。")
         return
 
     details = [load_run_detail_view(repository, run_id) for run_id in compare_ids]
     comparison_df = pd.DataFrame(
         [row.as_dict() for row in build_run_comparison_views(details)]
     )
+    comparison_df["strategy_name"] = comparison_df["strategy_name"].map(_strategy_label)
     comparison_df["total_return"] = comparison_df["total_return"].map(_format_pct)
     comparison_df["benchmark_return"] = comparison_df["benchmark_return"].map(_format_pct_or_dash)
     comparison_df["excess_return"] = comparison_df["excess_return"].map(_format_pct_or_dash)
@@ -311,10 +385,16 @@ def _render_comparison_section(repository: FileRunRepository, selected_compare_i
     numeric_columns = [column for column in equity_compare_df.columns if column.endswith("_equity")]
     if numeric_columns:
         equity_compare_df = equity_compare_df.rename(
-            columns={column: column.replace("_equity", " 策略权益") for column in numeric_columns}
+            columns={
+                f"{detail.run.run_id}_equity": _comparison_series_label(detail)
+                for detail in details
+            }
         )
-        chart_columns = [column.replace("_equity", " 策略权益") for column in numeric_columns]
-        st.line_chart(equity_compare_df[chart_columns], use_container_width=True)
+        chart_columns = [_comparison_series_label(detail) for detail in details]
+        chart_df, original_count = _downsample_chart_frame(equity_compare_df[chart_columns], max_points=720)
+        if original_count > len(chart_df):
+            st.caption(f"对比曲线已从 {original_count} 个点抽样到 {len(chart_df)} 个点，以减少页面卡顿。")
+        _render_timeseries_chart(chart_df, title="多运行资金曲线对比")
 
 
 def _render_trade_explorer_section(details) -> None:
@@ -337,7 +417,13 @@ def _render_trade_explorer_section(details) -> None:
     _render_stat_block(cols[2], "净利润合计", _format_number(sum(net_pnls), digits=4))
     _render_stat_block(cols[3], "平均持仓 K 线数", f"{(sum(int(row['holding_bars']) for row in filtered_rows) / len(filtered_rows)):.1f}")
 
-    trade_df = pd.DataFrame(filtered_rows)
+    page_rows, page_number, page_count, total_rows = _paginate_rows(
+        filtered_rows,
+        key_prefix="trade_explorer",
+        page_size=50,
+    )
+    trade_df = pd.DataFrame(page_rows)
+    trade_df["strategy_name"] = trade_df["strategy_name"].map(_strategy_label)
     trade_df["side"] = trade_df["side"].map(_side_label)
     trade_df["gross_pnl"] = trade_df["gross_pnl"].map(lambda value: _format_number(float(value), digits=4))
     trade_df["fee"] = trade_df["fee"].map(lambda value: _format_number(float(value), digits=4))
@@ -345,6 +431,12 @@ def _render_trade_explorer_section(details) -> None:
     trade_df["return_pct"] = trade_df["return_pct"].map(lambda value: _format_pct(float(value)))
     trade_df = trade_df.rename(columns=_trade_column_labels())
     st.dataframe(trade_df, hide_index=True, use_container_width=True)
+    _render_table_pager(
+        key_prefix="trade_explorer",
+        page_number=page_number,
+        page_count=page_count,
+        total_rows=total_rows,
+    )
 
 
 def _render_trade_explorer_filters(trade_rows: list[dict[str, object]]) -> TradeFilter:
@@ -377,13 +469,17 @@ def _render_trade_explorer_filters(trade_rows: list[dict[str, object]]) -> Trade
                 format_func=_side_label,
             )
         )
-        holding_range = st.slider(
-            "持仓 K 线数",
-            min_value=0,
-            max_value=max_holding,
-            value=(0, max_holding),
-            key="trade_explorer_holding_range",
-        )
+        if max_holding == 0:
+            st.caption("持仓 K 线数：当前结果里全部为 0")
+            holding_range = (0, 0)
+        else:
+            holding_range = st.slider(
+                "持仓 K 线数",
+                min_value=0,
+                max_value=max_holding,
+                value=(0, max_holding),
+                key="trade_explorer_holding_range",
+            )
         reason_query = st.text_input(
             "原因关键词",
             key="trade_explorer_reason_query",
@@ -400,14 +496,12 @@ def _render_trade_explorer_filters(trade_rows: list[dict[str, object]]) -> Trade
 
 
 def _render_execution_console(*, repository_root: Path, data_dir: Path) -> None:
-    st.markdown('<div class="cbw-panel">', unsafe_allow_html=True)
     _section_header("执行面板", "这里可以直接从页面发起数据导入和单次回测。页面负责提交，底层仍然走现有 workflow 和本地任务执行。")
-    ingest_tab, run_tab = st.tabs(["导入历史数据", "运行 EMA 回测"])
+    ingest_tab, run_tab = st.tabs(["导入历史数据", "运行双 EMA 交叉回测"])
     with ingest_tab:
         _render_ingest_form(repository_root=repository_root, data_dir=data_dir)
     with run_tab:
         _render_run_form(data_dir=data_dir)
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _render_ingest_form(*, repository_root: Path, data_dir: Path) -> None:
@@ -415,28 +509,32 @@ def _render_ingest_form(*, repository_root: Path, data_dir: Path) -> None:
         cols = st.columns(4)
         exchange = cols[0].text_input("交易所", value="binanceusdm")
         symbol = cols[1].text_input("交易对", value="BTC/USDT:USDT")
-        timeframe = cols[2].text_input("周期", value="1h")
+        timeframe = cols[2].selectbox(
+            "周期",
+            options=["1d", "4h", "1h", "15m"],
+            index=2,
+            format_func=_timeframe_label,
+        )
         limit = cols[3].number_input("单次拉取上限", min_value=50, value=1000, step=50)
 
         time_cols = st.columns(2)
         since_text = time_cols[0].text_input("开始时间 (ISO8601)", value="2024-01-01T00:00:00+00:00")
         until_text = time_cols[1].text_input("结束时间 (ISO8601，可选)", value="")
-
-        extra_cols = st.columns(4)
-        market_type = extra_cols[0].selectbox(
-            "市场类型",
-            options=[MarketType.LINEAR_USDT_PERPETUAL.value],
-            format_func=_market_type_label,
-        )
-        price_type = extra_cols[1].selectbox(
-            "价格类型",
-            options=[PriceType.LAST.value],
-            format_func=_price_type_label,
-        )
-        exchange_options_json = extra_cols[2].text_input("交易所选项 JSON", value='{"options":{"defaultType":"future"}}')
-        extra_params_json = extra_cols[3].text_input("附加参数 JSON", value="")
-
-        keep_open_last_candle = st.checkbox("保留最后一根未闭合 K 线", value=False)
+        with st.expander("高级导入选项", expanded=False):
+            extra_cols = st.columns(4)
+            market_type = extra_cols[0].selectbox(
+                "市场类型",
+                options=[MarketType.LINEAR_USDT_PERPETUAL.value],
+                format_func=_market_type_label,
+            )
+            price_type = extra_cols[1].selectbox(
+                "价格类型",
+                options=[PriceType.LAST.value],
+                format_func=_price_type_label,
+            )
+            exchange_options_json = extra_cols[2].text_input("交易所选项 JSON", value='{"options":{"defaultType":"future"}}')
+            extra_params_json = extra_cols[3].text_input("附加参数 JSON", value="")
+            keep_open_last_candle = st.checkbox("保留最后一根未闭合 K 线", value=False)
         submitted = st.form_submit_button("开始导入", use_container_width=True)
 
     if not submitted:
@@ -495,19 +593,19 @@ def _render_run_form(*, data_dir: Path) -> None:
         meta_cols = st.columns(3)
         run_id = meta_cols[0].text_input("运行 ID", value=_default_run_id(selected_snapshot))
         benchmark_enabled = meta_cols[1].checkbox("启用买入持有基准", value=True)
-        qty_policy_ref = meta_cols[2].text_input("数量策略 ID", value="fixed_notional_v1")
+        qty_policy_ref = meta_cols[2].text_input("下单数量策略", value="fixed_notional_v1")
 
         param_cols = st.columns(4)
         fast_period = param_cols[0].number_input("快线周期", min_value=1, value=12, step=1)
         slow_period = param_cols[1].number_input("慢线周期", min_value=2, value=26, step=1)
         qty = param_cols[2].number_input("数量", min_value=0.00000001, value=0.01, step=0.01, format="%.8f")
         initial_cash = param_cols[3].number_input("初始资金", min_value=1.0, value=10000.0, step=100.0)
-
-        execution_cols = st.columns(4)
-        leverage = execution_cols[0].number_input("杠杆", min_value=1.0, value=1.0, step=1.0)
-        fee_rate = execution_cols[1].number_input("手续费率", min_value=0.0, value=0.0004, step=0.0001, format="%.6f")
-        slippage_bps = execution_cols[2].number_input("滑点 (bps)", min_value=0.0, value=0.0, step=1.0)
-        min_notional = execution_cols[3].number_input("最小名义金额", min_value=0.0, value=0.0, step=10.0)
+        with st.expander("执行约束", expanded=False):
+            execution_cols = st.columns(4)
+            leverage = execution_cols[0].number_input("杠杆", min_value=1.0, value=1.0, step=1.0)
+            fee_rate = execution_cols[1].number_input("手续费率", min_value=0.0, value=0.0004, step=0.0001, format="%.6f")
+            slippage_bps = execution_cols[2].number_input("滑点 (bps)", min_value=0.0, value=0.0, step=1.0)
+            min_notional = execution_cols[3].number_input("最小名义金额", min_value=0.0, value=0.0, step=10.0)
 
         submitted = st.form_submit_button("运行回测", use_container_width=True)
 
@@ -595,7 +693,15 @@ def _render_parameter_lab_section(repository: FileRunRepository, filtered_summar
     _render_stat_block(cols[2], "当前指标最佳值", _format_metric_value(max(metric_values), metric_name) if metric_values else "-")
     _render_stat_block(cols[3], "当前指标均值", _format_metric_value(sum(metric_values) / len(metric_values), metric_name) if metric_values else "-")
 
-    parameter_df = pd.DataFrame([row.as_dict() for row in filtered_rows])
+    parameter_raw_rows = [row.as_dict() for row in filtered_rows]
+    page_rows, page_number, page_count, total_rows = _paginate_rows(
+        parameter_raw_rows,
+        key_prefix="parameter_lab_table",
+        page_size=25,
+    )
+    parameter_df = pd.DataFrame(page_rows)
+    parameter_df["strategy_name"] = parameter_df["strategy_name"].map(_strategy_label)
+    parameter_df["qty_policy_ref"] = parameter_df["qty_policy_ref"].map(_qty_policy_label)
     parameter_df["created_at"] = pd.to_datetime(parameter_df["created_at"], utc=True)
     parameter_df["status"] = parameter_df["status"].map(_status_label)
     parameter_df["total_return"] = parameter_df["total_return"].map(_format_pct)
@@ -609,6 +715,12 @@ def _render_parameter_lab_section(repository: FileRunRepository, filtered_summar
     parameter_df["leverage"] = parameter_df["leverage"].map(_format_number_or_dash)
     parameter_df = parameter_df.rename(columns=_parameter_lab_column_labels())
     st.dataframe(parameter_df, hide_index=True, use_container_width=True)
+    _render_table_pager(
+        key_prefix="parameter_lab_table",
+        page_number=page_number,
+        page_count=page_count,
+        total_rows=total_rows,
+    )
 
     chart_col, sensitivity_col = st.columns([1.2, 1.0], gap="large")
     with chart_col:
@@ -630,6 +742,7 @@ def _render_parameter_lab_filters(parameter_rows) -> tuple[ParameterLabFilter, s
                 options=strategy_options,
                 default=strategy_options,
                 key="parameter_lab_strategy_names",
+                format_func=_strategy_label,
             )
         )
         selected_splits = tuple(
@@ -732,7 +845,10 @@ def _render_parameter_sensitivity(rows, *, parameter_name: str, metric_name: str
     sensitivity_df = pd.DataFrame(sensitivity_rows)
     chart_df = sensitivity_df.set_index(parameter_name)[["avg_metric", "best_metric"]]
     chart_df = chart_df.rename(columns={"avg_metric": "平均值", "best_metric": "最好值"})
-    st.line_chart(chart_df, use_container_width=True)
+    sampled_chart_df, original_count = _downsample_chart_frame(chart_df, max_points=240)
+    if original_count > len(sampled_chart_df):
+        st.caption(f"参数敏感性曲线已从 {original_count} 个点抽样到 {len(sampled_chart_df)} 个点。")
+    _render_metric_chart(sampled_chart_df, title="参数敏感性")
 
     display_df = sensitivity_df.copy()
     display_df["avg_metric"] = display_df["avg_metric"].map(lambda value: _format_metric_value(value, metric_name))
@@ -760,8 +876,17 @@ def _render_detail_tabs(detail) -> None:
 
 
 def _render_detail_overview(detail) -> None:
+    strategy_params = detail.manifest.resolved_config_json.get("strategy_params") or {}
     cols = st.columns(5)
-    _render_stat_block(cols[0], "策略", detail.run.strategy_name)
+    _render_stat_block(
+        cols[0],
+        "策略",
+        _strategy_label(
+            detail.run.strategy_name,
+            fast_period=_int_or_none(strategy_params.get("fast_period")),
+            slow_period=_int_or_none(strategy_params.get("slow_period")),
+        ),
+    )
     _render_stat_block(cols[1], "交易数", str(detail.metrics.trade_count))
     _render_stat_block(cols[2], "总收益率", f"{detail.metrics.total_return:.2%}")
     _render_stat_block(cols[3], "最终权益", _format_number(detail.metrics.final_equity))
@@ -786,15 +911,26 @@ def _render_detail_overview(detail) -> None:
         chart_columns = ["策略权益"]
         if "基准权益" in chart_df.columns and chart_df["基准权益"].notna().any():
             chart_columns.append("基准权益")
-        st.line_chart(chart_df[chart_columns], use_container_width=True)
+        line_chart_df, original_count = _downsample_chart_frame(chart_df[chart_columns], max_points=720)
+        if original_count > len(line_chart_df):
+            st.caption(f"资金曲线已从 {original_count} 个点抽样到 {len(line_chart_df)} 个点，以减少页面卡顿。")
+        _render_timeseries_chart(line_chart_df, title="单运行资金曲线")
 
 
 def _render_detail_trades(detail) -> None:
     _section_header("交易明细", "查看每笔交易的方向、进出场价格、手续费和收益。")
-    trade_df = pd.DataFrame(build_trade_rows(detail))
-    if trade_df.empty:
+    trade_rows = build_trade_rows(detail)
+    if not trade_rows:
         st.info("当前 run 没有已平仓交易。")
     else:
+        page_rows, page_number, page_count, total_rows = _paginate_rows(
+            trade_rows,
+            key_prefix=f"detail_trades_{detail.run.run_id}",
+            page_size=50,
+        )
+        trade_df = pd.DataFrame(page_rows)
+        if "strategy_name" in trade_df.columns:
+            trade_df["strategy_name"] = trade_df["strategy_name"].map(_strategy_label)
         trade_df["side"] = trade_df["side"].map(_side_label)
         trade_df["gross_pnl"] = trade_df["gross_pnl"].map(lambda value: _format_number(float(value), digits=4))
         trade_df["fee"] = trade_df["fee"].map(lambda value: _format_number(float(value), digits=4))
@@ -802,6 +938,12 @@ def _render_detail_trades(detail) -> None:
         trade_df["return_pct"] = trade_df["return_pct"].map(lambda value: _format_pct(float(value)))
         trade_df = trade_df.rename(columns=_trade_column_labels())
         st.dataframe(trade_df, hide_index=True, use_container_width=True)
+        _render_table_pager(
+            key_prefix=f"detail_trades_{detail.run.run_id}",
+            page_number=page_number,
+            page_count=page_count,
+            total_rows=total_rows,
+        )
 
 
 def _render_detail_warnings(detail) -> None:
@@ -815,7 +957,7 @@ def _render_detail_warnings(detail) -> None:
         warning_df = warning_df.rename(columns=_warning_column_labels())
         st.dataframe(warning_df, hide_index=True, use_container_width=True)
 
-    with st.expander("运行清单 / 配置", expanded=True):
+    with st.expander("运行清单 / 配置", expanded=False):
         st.json(
             {
                 "manifest": _json_ready(asdict(detail.manifest)),
@@ -857,112 +999,138 @@ def _apply_page_chrome() -> None:
         [data-testid="stStatusWidget"] {display: none;}
         [data-testid="stHeaderActionElements"] {display: none;}
         .block-container {
-            padding-top: 2.25rem;
+            padding-top: 1.1rem;
             padding-bottom: 2.4rem;
             max-width: 1400px;
         }
         .cbw-hero {
-            position: relative;
-            overflow: hidden;
-            padding: 2rem 2rem 1.6rem 2rem;
+            display: grid;
+            grid-template-columns: minmax(0, 1.6fr) auto;
+            gap: 1rem 1.25rem;
+            align-items: start;
+            padding: 1rem 1.15rem;
             border: 1px solid var(--cbw-border);
             background:
-                linear-gradient(135deg, rgba(255,255,255,0.96), rgba(246,250,247,0.92)),
-                linear-gradient(180deg, rgba(13,138,114,0.05), transparent);
-            border-radius: 28px;
-            box-shadow: 0 18px 48px rgba(16, 31, 26, 0.08);
-            margin-bottom: 1.4rem;
-        }
-        .cbw-hero::after {
-            content: "";
-            position: absolute;
-            inset: auto -5% -35% auto;
-            width: 420px;
-            height: 420px;
-            background: radial-gradient(circle, rgba(13,138,114,0.12), transparent 62%);
-            pointer-events: none;
+                linear-gradient(135deg, rgba(255,255,255,0.96), rgba(246,250,247,0.92));
+            border-radius: 20px;
+            box-shadow: 0 10px 28px rgba(16, 31, 26, 0.06);
+            margin-bottom: 0.8rem;
         }
         .cbw-kicker {
             display: inline-flex;
             align-items: center;
             gap: 0.55rem;
-            padding: 0.35rem 0.8rem;
+            padding: 0.26rem 0.68rem;
             border-radius: 999px;
             background: rgba(13, 138, 114, 0.08);
             color: var(--cbw-accent);
-            font-size: 0.78rem;
+            font-size: 0.72rem;
             letter-spacing: 0.08em;
             text-transform: uppercase;
             font-weight: 600;
         }
+        .cbw-hero-main {
+            min-width: 0;
+        }
         .cbw-hero h1 {
-            margin: 0.85rem 0 0 0;
-            font-size: clamp(2.7rem, 4vw, 4.6rem);
-            line-height: 0.95;
-            letter-spacing: -0.045em;
+            margin: 0.45rem 0 0 0;
+            font-size: clamp(1.8rem, 3vw, 2.7rem);
+            line-height: 1.02;
+            letter-spacing: -0.03em;
             font-weight: 700;
         }
         .cbw-hero p {
-            margin: 0.8rem 0 0 0;
-            max-width: 42rem;
+            margin: 0.35rem 0 0 0;
+            max-width: 48rem;
             color: var(--cbw-muted);
-            font-size: 1rem;
-            line-height: 1.6;
+            font-size: 0.93rem;
+            line-height: 1.45;
         }
         .cbw-meta {
             display: flex;
             flex-wrap: wrap;
             gap: 0.65rem;
-            margin-top: 1rem;
+            justify-content: flex-end;
+            align-content: flex-start;
         }
         .cbw-chip {
-            padding: 0.45rem 0.8rem;
+            padding: 0.38rem 0.72rem;
             border-radius: 999px;
             background: rgba(255,255,255,0.78);
             border: 1px solid var(--cbw-border);
             color: var(--cbw-ink);
-            font-size: 0.84rem;
+            font-size: 0.8rem;
+            white-space: nowrap;
+        }
+        @media (max-width: 980px) {
+            .cbw-hero {
+                grid-template-columns: 1fr;
+            }
+            .cbw-meta {
+                justify-content: flex-start;
+            }
         }
         .cbw-section-head {
-            margin-top: 1.35rem;
-            margin-bottom: 0.65rem;
+            margin-top: 1rem;
+            margin-bottom: 0.5rem;
         }
         .cbw-section-head h3 {
             margin: 0;
-            font-size: 1.12rem;
+            font-size: 1rem;
             letter-spacing: -0.02em;
         }
         .cbw-section-head p {
             margin: 0.2rem 0 0 0;
             color: var(--cbw-muted);
-            font-size: 0.92rem;
+            font-size: 0.86rem;
+            line-height: 1.4;
         }
         .cbw-stat {
-            padding: 0.2rem 0 0.9rem 0;
+            padding: 0.1rem 0 0.55rem 0;
             border-top: 1px solid rgba(13, 138, 114, 0.18);
         }
         .cbw-stat-label {
             color: var(--cbw-muted);
-            font-size: 0.8rem;
-            margin-bottom: 0.3rem;
+            font-size: 0.74rem;
+            margin-bottom: 0.18rem;
         }
         .cbw-stat-value {
-            font-size: 1.45rem;
+            font-size: 1.08rem;
             font-weight: 650;
-            letter-spacing: -0.03em;
+            letter-spacing: -0.02em;
             color: var(--cbw-ink);
         }
-        .cbw-panel {
-            padding: 1.15rem 1.2rem 1rem 1.2rem;
-            border-radius: 22px;
-            border: 1px solid var(--cbw-border);
-            background: linear-gradient(180deg, rgba(255,255,255,0.94), rgba(248,250,247,0.88));
-            box-shadow: 0 12px 32px rgba(17, 28, 24, 0.05);
-            margin-bottom: 1rem;
+        .cbw-inline-meta {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 0.55rem 0.75rem;
+            margin: 0.55rem 0 0.8rem 0;
         }
-        .cbw-panel-tight {
-            position: sticky;
-            top: 1rem;
+        .cbw-inline-meta-compact {
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            margin-top: 0.35rem;
+        }
+        .cbw-inline-item {
+            padding: 0.48rem 0.62rem;
+            border-radius: 12px;
+            background: rgba(255,255,255,0.68);
+            border: 1px solid rgba(21, 36, 31, 0.07);
+            min-width: 0;
+        }
+        .cbw-inline-item span {
+            display: block;
+            color: var(--cbw-muted);
+            font-size: 0.72rem;
+            line-height: 1.15;
+            margin-bottom: 0.16rem;
+        }
+        .cbw-inline-item strong {
+            display: block;
+            color: var(--cbw-ink);
+            font-size: 0.94rem;
+            line-height: 1.25;
+            font-weight: 600;
+            word-break: break-word;
         }
         .cbw-inspector-list {
             display: grid;
@@ -995,9 +1163,21 @@ def _apply_page_chrome() -> None:
             overflow: hidden;
             background: var(--cbw-surface-strong);
         }
+        [data-baseweb="tag"] {
+            border-radius: 10px !important;
+            min-height: 28px !important;
+            font-size: 0.82rem !important;
+        }
         [data-testid="stMetric"] {
             background: transparent;
             border: none;
+        }
+        div[data-testid="stButton"] > button,
+        div[data-testid="stFormSubmitButton"] > button {
+            min-height: 2.1rem !important;
+            padding: 0.2rem 0.7rem !important;
+            font-size: 0.84rem !important;
+            border-radius: 12px !important;
         }
         div[data-baseweb="select"] > div,
         div[data-baseweb="input"] > div,
@@ -1011,6 +1191,9 @@ def _apply_page_chrome() -> None:
         }
         [data-baseweb="tab-list"] {
             gap: 0.4rem;
+        }
+        [data-baseweb="tab-border"] {
+            display: none !important;
         }
         button[role="tab"] {
             border-radius: 999px !important;
@@ -1115,13 +1298,15 @@ def _render_page_header(*, data_dir: Path) -> None:
     st.markdown(
         f"""
         <section class="cbw-hero">
-          <div class="cbw-kicker">Phase 1 · Research Console</div>
-          <h1>加密回测工作台</h1>
-          <p>当前页面既能发起数据导入和回测，也能读取已落盘结果做筛选、对比和交易下钻。</p>
+          <div class="cbw-hero-main">
+            <div class="cbw-kicker">Phase 1 · Research Console</div>
+            <h1>加密回测工作台</h1>
+            <p>执行、总览、单次分析和参数实验已经拆开，首屏只保留最必要的上下文，不再让头部抢占工作区。</p>
+          </div>
           <div class="cbw-meta">
             <div class="cbw-chip">数据目录：{data_dir}</div>
-            <div class="cbw-chip">模式：执行 + 分析</div>
-            <div class="cbw-chip">重点：数据导入 / 回测运行 / 运行总览 / 交易浏览</div>
+            <div class="cbw-chip">模式：分区执行 + 分区分析</div>
+            <div class="cbw-chip">视图：执行台 / 运行总览 / 单次分析 / 参数实验</div>
           </div>
         </section>
         """,
@@ -1236,7 +1421,7 @@ def _parameter_lab_column_labels() -> dict[str, str]:
         "created_at": "创建时间",
         "fast_period": "快线周期",
         "slow_period": "慢线周期",
-        "qty_policy_ref": "数量策略",
+        "qty_policy_ref": "下单数量策略",
         "leverage": "杠杆",
         "fee_rate": "手续费率",
         "slippage_bps": "滑点 (bps)",
@@ -1269,6 +1454,15 @@ def _market_type_label(value: str) -> str:
 def _price_type_label(value: str) -> str:
     return {
         PriceType.LAST.value: "Last Price",
+    }.get(value, value)
+
+
+def _timeframe_label(value: str) -> str:
+    return {
+        "1d": "1日",
+        "4h": "4小时",
+        "1h": "1小时",
+        "15m": "15分钟",
     }.get(value, value)
 
 
@@ -1320,6 +1514,37 @@ def _parameter_name_label(value: str) -> str:
         "fast_period": "快线周期",
         "slow_period": "慢线周期",
     }.get(value, value)
+
+
+def _strategy_label(
+    value: str,
+    *,
+    fast_period: int | None = None,
+    slow_period: int | None = None,
+) -> str:
+    base_label = {
+        "ema_crossover": "双 EMA 交叉策略",
+    }.get(value, value)
+    if base_label == "双 EMA 交叉策略" and fast_period is not None and slow_period is not None:
+        return f"{base_label}（{fast_period}/{slow_period}）"
+    return base_label
+
+
+def _qty_policy_label(value: str | None) -> str:
+    if value is None:
+        return "-"
+    return {
+        "fixed_notional_v1": "固定数量下单",
+    }.get(value, value)
+
+
+def _int_or_none(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _warning_type_label(value: str) -> str:
@@ -1378,20 +1603,13 @@ def _int_range_bounds(values: list[int]) -> tuple[int, int]:
     return (min(values), max(values))
 
 
-def _sidebar_float_slider(label: str, *, bounds: tuple[float, float], key: str) -> tuple[float, float]:
+def _inline_float_slider(label: str, *, bounds: tuple[float, float], key: str) -> tuple[float, float]:
     lower, upper = bounds
     if lower == upper:
-        st.sidebar.caption(f"{label}：当前只有 {lower:.2f}")
+        st.caption(f"{label}：当前只有 {lower:.2f}")
         return bounds
-    return st.sidebar.slider(label, min_value=lower, max_value=upper, value=bounds, key=key)
-
-
-def _sidebar_int_slider(label: str, *, bounds: tuple[int, int], key: str) -> tuple[int, int]:
-    lower, upper = bounds
-    if lower == upper:
-        st.sidebar.caption(f"{label}：当前只有 {lower}")
-        return bounds
-    return st.sidebar.slider(label, min_value=lower, max_value=upper, value=bounds, key=key)
+    selected = st.slider(label, min_value=lower, max_value=upper, value=bounds, key=key)
+    return float(selected[0]), float(selected[1])
 
 
 def _inline_int_slider(label: str, *, bounds: tuple[int, int], key: str) -> tuple[int | None, int | None]:
@@ -1401,6 +1619,187 @@ def _inline_int_slider(label: str, *, bounds: tuple[int, int], key: str) -> tupl
         return bounds
     selected = st.slider(label, min_value=lower, max_value=upper, value=bounds, key=key)
     return int(selected[0]), int(selected[1])
+
+
+def _render_summary_column_picker(columns: list[str]) -> list[str]:
+    preferred_columns = [
+        "运行 ID",
+        "策略",
+        "标的",
+        "周期",
+        "状态",
+        "总收益率",
+        "超额收益率",
+        "交易数",
+        "告警数",
+        "创建时间",
+    ]
+    default_columns = [column for column in preferred_columns if column in columns]
+    state_key = "summary_table_columns_state"
+    stored_columns = st.session_state.get(state_key, default_columns or columns)
+    valid_stored_columns = [column for column in stored_columns if column in columns]
+    with st.expander("显示列", expanded=False):
+        selected_columns = st.multiselect(
+            "显示列",
+            options=columns,
+            default=valid_stored_columns or default_columns or columns,
+            key="summary_table_columns",
+        )
+    final_columns = list(selected_columns) if selected_columns else (default_columns or columns)
+    st.session_state[state_key] = final_columns
+    st.caption("列选择会在当前页面会话里保留。")
+    return final_columns
+
+
+def _paginate_rows(
+    rows: list[dict[str, object]],
+    *,
+    key_prefix: str,
+    page_size: int,
+) -> tuple[list[dict[str, object]], int, int, int]:
+    total_rows = len(rows)
+    if total_rows == 0:
+        return [], 1, 1, 0
+
+    page_count = max(1, (total_rows + page_size - 1) // page_size)
+    page_key = f"{key_prefix}_page_number"
+    stored_page = int(st.session_state.get(page_key, 1))
+    page_number = max(1, min(stored_page, page_count))
+    st.session_state[page_key] = page_number
+    start_index = (page_number - 1) * page_size
+    end_index = start_index + page_size
+    return rows[start_index:end_index], page_number, page_count, total_rows
+
+
+def _render_table_pager(*, key_prefix: str, page_number: int, page_count: int, total_rows: int) -> None:
+    page_key = f"{key_prefix}_page_number"
+
+    def _go_prev() -> None:
+        st.session_state[page_key] = max(1, int(st.session_state.get(page_key, 1)) - 1)
+
+    def _go_next() -> None:
+        st.session_state[page_key] = min(page_count, int(st.session_state.get(page_key, 1)) + 1)
+
+    spacer, summary_col, prev_col, next_col = st.columns([8.0, 1.55, 0.72, 0.72])
+    with summary_col:
+        st.caption(f"共 {total_rows} 条 · 第 {page_number}/{page_count} 页")
+    with prev_col:
+        st.button(
+            "‹ 上一页",
+            key=f"{key_prefix}_prev",
+            on_click=_go_prev,
+            disabled=page_number <= 1,
+            use_container_width=True,
+        )
+    with next_col:
+        st.button(
+            "下一页 ›",
+            key=f"{key_prefix}_next",
+            on_click=_go_next,
+            disabled=page_number >= page_count,
+            use_container_width=True,
+        )
+
+
+def _downsample_chart_frame(frame: pd.DataFrame, *, max_points: int) -> tuple[pd.DataFrame, int]:
+    original_count = len(frame)
+    if original_count <= max_points:
+        return frame, original_count
+
+    step = max(1, (original_count + max_points - 1) // max_points)
+    sampled = frame.iloc[::step]
+    if sampled.index[-1] != frame.index[-1]:
+        sampled = pd.concat([sampled, frame.iloc[[-1]]])
+        sampled = sampled[~sampled.index.duplicated(keep="last")]
+    return sampled, original_count
+
+
+def _render_timeseries_chart(frame: pd.DataFrame, *, title: str) -> None:
+    figure = go.Figure()
+    for column in frame.columns:
+        figure.add_trace(
+            go.Scattergl(
+                x=frame.index,
+                y=frame[column],
+                mode="lines",
+                name=str(column),
+                line={"width": 2},
+                hovertemplate=f"{column}<br>时间=%{{x|%Y-%m-%d %H:%M}}<br>数值=%{{y:,.2f}}<extra></extra>",
+            )
+        )
+
+    figure.update_layout(
+        title={"text": title, "x": 0.01, "xanchor": "left"},
+        dragmode="pan",
+        hovermode="x unified",
+        margin={"l": 24, "r": 24, "t": 48, "b": 82},
+        legend={
+            "orientation": "h",
+            "yanchor": "top",
+            "y": -0.16,
+            "x": 0,
+            "xanchor": "left",
+            "font": {"size": 11},
+            "itemwidth": 90,
+        },
+        paper_bgcolor="rgba(255,255,255,0)",
+        plot_bgcolor="rgba(255,255,255,0.9)",
+        font={"family": "IBM Plex Sans, sans-serif", "size": 12},
+    )
+    figure.update_xaxes(
+        title_text="时间",
+        tickformat="%Y-%m-%d\n%H:%M",
+        showgrid=True,
+        gridcolor="rgba(21, 36, 31, 0.06)",
+        rangeslider={"visible": True, "thickness": 0.08},
+    )
+    figure.update_yaxes(
+        title_text="权益",
+        separatethousands=True,
+        showgrid=True,
+        gridcolor="rgba(21, 36, 31, 0.06)",
+    )
+    st.plotly_chart(
+        figure,
+        use_container_width=True,
+        config={
+            "displaylogo": False,
+            "scrollZoom": True,
+            "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+        },
+    )
+
+
+def _render_metric_chart(frame: pd.DataFrame, *, title: str) -> None:
+    figure = go.Figure()
+    for column in frame.columns:
+        figure.add_trace(
+            go.Scatter(
+                x=frame.index,
+                y=frame[column],
+                mode="lines+markers",
+                name=str(column),
+                line={"width": 2},
+                marker={"size": 6},
+                hovertemplate=f"{column}<br>参数=%{{x}}<br>数值=%{{y:,.4f}}<extra></extra>",
+            )
+        )
+    figure.update_layout(
+        title={"text": title, "x": 0.01, "xanchor": "left"},
+        hovermode="x unified",
+        margin={"l": 24, "r": 24, "t": 48, "b": 56},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
+        paper_bgcolor="rgba(255,255,255,0)",
+        plot_bgcolor="rgba(255,255,255,0.9)",
+        font={"family": "IBM Plex Sans, sans-serif", "size": 12},
+    )
+    figure.update_xaxes(title_text="参数取值", showgrid=True, gridcolor="rgba(21, 36, 31, 0.06)")
+    figure.update_yaxes(title_text="指标值", showgrid=True, gridcolor="rgba(21, 36, 31, 0.06)")
+    st.plotly_chart(
+        figure,
+        use_container_width=True,
+        config={"displaylogo": False, "modeBarButtonsToRemove": ["lasso2d", "select2d"]},
+    )
 
 
 def _sort_run_summaries(summaries, *, sort_mode: str):
@@ -1417,6 +1816,27 @@ def _sort_run_summaries(summaries, *, sort_mode: str):
 def _run_option_label(summary) -> str:
     symbol = summary.symbol or summary.dataset_snapshot_id
     return f"{summary.run_id} · {symbol} · {_format_pct(summary.total_return)}"
+
+
+def _comparison_series_label(detail) -> str:
+    symbol = str(detail.manifest.resolved_config_json.get("symbol") or detail.run.dataset_snapshot_id)
+    compact_symbol = symbol.replace(":USDT", "")
+    run_suffix = detail.run.run_id[-6:]
+    return f"{compact_symbol} · {run_suffix}"
+
+
+def _render_compact_summary_bar(items: list[tuple[str, str]], *, compact: bool = False) -> None:
+    class_name = "cbw-inline-meta cbw-inline-meta-compact" if compact else "cbw-inline-meta"
+    cells = "".join(
+        f"""
+        <div class="cbw-inline-item">
+          <span>{label}</span>
+          <strong>{value}</strong>
+        </div>
+        """
+        for label, value in items
+    )
+    st.markdown(f'<div class="{class_name}">{cells}</div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":

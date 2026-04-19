@@ -22,6 +22,7 @@ class FakeHistoryFetcher:
     def __init__(self, rows: list[OhlcvRow]) -> None:
         self.rows = rows
         self.requests: list[HistoryFetchRequest] = []
+        self.data_source = "fixture_rest"
 
     def fetch_ohlcv(self, request: HistoryFetchRequest) -> list[OhlcvRow]:
         self.requests.append(request)
@@ -92,3 +93,24 @@ def test_ingest_dataset_workflow_can_keep_open_last_candle_when_disabled(tmp_pat
     with result.integrity_report_path.open("r", encoding="utf-8") as handle:
         report = json.load(handle)
     assert report["last_bar_closed"] is False
+
+
+def test_ingest_dataset_workflow_preserves_fetcher_data_source(tmp_path: Path) -> None:
+    fetcher = FakeHistoryFetcher(
+        [
+            OhlcvRow(timestamp_ms=_ms(2024, 1, 1, 0), open=99.0, high=101.0, low=98.0, close=100.0, volume=10.0),
+        ]
+    )
+
+    result = ingest_dataset_workflow(
+        data_dir=tmp_path / "custom-data",
+        exchange="binanceusdm",
+        symbol="BTC/USDT:USDT",
+        timeframe="1h",
+        since=_dt(2024, 1, 1, 0),
+        market_type=MarketType.LINEAR_USDT_PERPETUAL,
+        drop_unclosed_last_candle=False,
+        fetcher=fetcher,
+    )
+
+    assert result.snapshot.data_source == "fixture_rest"

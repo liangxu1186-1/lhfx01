@@ -6,7 +6,9 @@ import json
 
 from crypto_backtest_workbench.domain.models import MarketType
 from crypto_backtest_workbench.engine.data.fetchers import (
+    BinanceUsdMRestHistoryFetcher,
     CcxtHistoryFetcher,
+    FallbackHistoryFetcher,
     HistoryFetchRequest,
     OhlcvRow,
 )
@@ -56,9 +58,42 @@ class FakeExchangeClient:
 class FakeHistoryFetcher:
     def __init__(self, rows: list[OhlcvRow]) -> None:
         self._rows = rows
+        self.data_source = "fake_fetcher"
 
     def fetch_ohlcv(self, request: HistoryFetchRequest) -> list[OhlcvRow]:
         return list(self._rows)
+
+
+class FailingHistoryFetcher:
+    def __init__(self, message: str = "primary failed") -> None:
+        self.message = message
+        self.data_source = "primary_source"
+
+    def fetch_ohlcv(self, request: HistoryFetchRequest) -> list[OhlcvRow]:
+        raise RuntimeError(self.message)
+
+
+class FakeResponse:
+    def __init__(self, payload: object) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class FakeSession:
+    def __init__(self, payloads: list[object]) -> None:
+        self.payloads = payloads
+        self.calls: list[dict[str, object]] = []
+
+    def get(self, url: str, *, params: dict[str, object], timeout: float):
+        self.calls.append({"url": url, "params": dict(params), "timeout": timeout})
+        if not self.payloads:
+            return FakeResponse([])
+        return FakeResponse(self.payloads.pop(0))
 
 
 class FakeDatasetRepository:
@@ -156,6 +191,60 @@ def test_ccxt_history_fetcher_stops_when_exchange_repeats_same_page() -> None:
         _ms(2024, 1, 1, 1),
     ]
     assert len(client.calls) == 2
+
+
+def test_fallback_history_fetcher_uses_secondary_when_primary_fails() -> None:
+    request = HistoryFetchRequest(
+        exchange="binanceusdm",
+        symbol="BTC/USDT:USDT",
+        timeframe="1h",
+        market_type=MarketType.LINEAR_USDT_PERPETUAL,
+        since=_dt(2024, 1, 1, 0),
+        limit=2,
+    )
+    fallback_rows = [
+        OhlcvRow(timestamp_ms=_ms(2024, 1, 1, 0), open=99.0, high=101.0, low=98.0, close=100.0, volume=10.0),
+    ]
+    fetcher = FallbackHistoryFetcher(FailingHistoryFetcher(), FakeHistoryFetcher(fallback_rows))
+
+    rows = fetcher.fetch_ohlcv(request)
+
+    assert rows == fallback_rows
+    assert fetcher.data_source == "fake_fetcher"
+
+
+def test_binance_rest_history_fetcher_paginates_without_ccxt() -> None:
+    session = FakeSession(
+        payloads=[
+            [
+                _raw_row(_ms(2024, 1, 1, 0), 100.0),
+                _raw_row(_ms(2024, 1, 1, 1), 101.0),
+            ],
+            [
+                _raw_row(_ms(2024, 1, 1, 2), 102.0),
+            ],
+        ]
+    )
+    fetcher = BinanceUsdMRestHistoryFetcher(session=session)
+    request = HistoryFetchRequest(
+        exchange="binanceusdm",
+        symbol="BTC/USDT:USDT",
+        timeframe="1h",
+        market_type=MarketType.LINEAR_USDT_PERPETUAL,
+        since=_dt(2024, 1, 1, 0),
+        until=_dt(2024, 1, 1, 3),
+        limit=2,
+    )
+
+    rows = fetcher.fetch_ohlcv(request)
+
+    assert [row.timestamp_ms for row in rows] == [
+        _ms(2024, 1, 1, 0),
+        _ms(2024, 1, 1, 1),
+        _ms(2024, 1, 1, 2),
+    ]
+    assert session.calls[0]["params"]["symbol"] == "BTCUSDT"
+    assert session.calls[1]["params"]["startTime"] == _ms(2024, 1, 1, 2)
 
 
 def test_dataset_ingestion_uses_current_time_when_until_is_missing(tmp_path) -> None:

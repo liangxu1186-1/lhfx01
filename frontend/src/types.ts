@@ -1,0 +1,232 @@
+export interface WorkspaceData {
+  generated_at: string;
+  source: WorkspaceSource;
+  datasets: DatasetSnapshotView[];
+  overview: WorkspaceOverview;
+  analysis: WorkspaceAnalysis;
+  parameter_lab: WorkspaceParameterLab;
+}
+
+export interface WorkspaceSource {
+  data_dir: string;
+  run_count: number;
+  dataset_count: number;
+}
+
+export interface WorkspaceOverview {
+  summaries: RunSummaryView[];
+  comparisons: RunComparisonView[];
+  multi_run_equity: MultiRunEquityRow[];
+}
+
+export interface WorkspaceAnalysis {
+  runs: RunAnalysisView[];
+}
+
+export interface WorkspaceParameterLab {
+  rows: ParameterLabRow[];
+  fast_period_total_return: SensitivityRow[];
+  slow_period_total_return: SensitivityRow[];
+}
+
+export interface DatasetsPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  datasets: DatasetSnapshotView[];
+}
+
+export interface OverviewPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  overview: WorkspaceOverview;
+}
+
+export interface RunIndexPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  runs: RunSummaryView[];
+}
+
+export interface RunDetailPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  run: RunAnalysisView;
+}
+
+export interface ParametersPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  parameter_lab: WorkspaceParameterLab;
+}
+
+export interface DatasetSnapshotView {
+  created_at: string;
+  data_source: string;
+  dataset_snapshot_id: string;
+  exchange: string;
+  feature_version: string;
+  market_type: string;
+  price_type: string;
+  row_count: number;
+  schema_version: string;
+  source: string;
+  storage_uri: string;
+  symbol: string;
+  time_range_end: string;
+  time_range_start: string;
+  timeframe: string;
+}
+
+export interface RunSummaryView {
+  run_id: string;
+  strategy_name: string;
+  dataset_snapshot_id: string;
+  symbol: string;
+  timeframe: string;
+  status: string;
+  created_at: string;
+  validation_split_id: string;
+  total_return: number;
+  final_equity: number;
+  trade_count: number;
+  win_rate: number;
+  profit_factor: number | null;
+  benchmark_return: number | null;
+  excess_return: number | null;
+  warning_count: number;
+  order_count: number;
+  fill_count: number;
+}
+
+export interface RunComparisonView {
+  run_id: string;
+  strategy_name: string;
+  total_return: number;
+  benchmark_return: number | null;
+  excess_return: number | null;
+  final_equity: number;
+  trade_count: number;
+  win_rate: number;
+  profit_factor: number;
+}
+
+export interface MultiRunEquityRow {
+  timestamp: string;
+  [key: string]: number | string | null;
+}
+
+export interface RunAnalysisView {
+  run_id: string;
+  strategy_name: string;
+  status: string;
+  created_at: string;
+  dataset_snapshot_id: string;
+  validation_split_id: string;
+  symbol: string;
+  timeframe: string;
+  manifest: {
+    strategy_version: string;
+    engine_version: string;
+    execution_policy_id: string;
+    metric_policy_id: string;
+    feature_artifact_id: string;
+    validation_split_id: string;
+    resolved_config_json: Record<string, unknown>;
+  };
+  metrics: {
+    initial_equity: number;
+    final_equity: number;
+    total_return: number;
+    trade_count: number;
+    win_rate: number;
+    profit_factor: number;
+    expectancy: number;
+  };
+  benchmark: {
+    benchmark_id: string;
+    run_id: string;
+    benchmark_type: string;
+    return_pct: number;
+    max_drawdown: number;
+    sharpe: number;
+    equity_uri: string;
+    daily_returns_uri: string | null;
+  } | null;
+  execution_counts: {
+    order_count: number;
+    fill_count: number;
+    trade_count: number;
+    warning_count: number;
+  };
+  equity_rows: EquityRow[];
+  trade_rows: TradeRow[];
+  warning_rows: WarningRow[];
+}
+
+export interface EquityRow {
+  timestamp: string;
+  strategy_equity: number;
+  benchmark_equity: number | null;
+  strategy_cash: number;
+  strategy_used_margin: number;
+}
+
+export interface TradeRow {
+  trade_id: string;
+  symbol: string;
+  side: string;
+  entry_time: string;
+  entry_price: number;
+  exit_time: string | null;
+  exit_price: number | null;
+  qty: number;
+  gross_pnl: number;
+  fee: number;
+  net_pnl: number;
+  return_pct: number;
+  holding_bars: number;
+  entry_reason: string;
+  exit_reason: string;
+}
+
+export interface WarningRow {
+  warning_id: string;
+  warning_type: string;
+  warning_code: string;
+  severity: string;
+  message: string;
+  created_at: string;
+}
+
+export interface ParameterLabRow {
+  run_id: string;
+  strategy_name: string;
+  dataset_snapshot_id: string;
+  symbol: string;
+  timeframe: string;
+  validation_split_id: string;
+  status: string;
+  created_at: string;
+  fast_period: number | null;
+  slow_period: number | null;
+  qty_policy_ref: string | null;
+  leverage: number | null;
+  fee_rate: number | null;
+  slippage_bps: number | null;
+  total_return: number;
+  benchmark_return: number | null;
+  excess_return: number | null;
+  final_equity: number;
+  trade_count: number;
+  win_rate: number;
+  profit_factor: number | null;
+  warning_count: number;
+}
+
+export interface SensitivityRow {
+  parameter_name: string;
+  parameter_value: number;
+  run_count: number;
+  avg_metric: number;
+  best_metric: number;
+}

@@ -289,7 +289,7 @@ def test_build_ui_launch_command_includes_streamlit_args() -> None:
     ]
 
 
-def test_handle_ui_returns_130_on_keyboard_interrupt(monkeypatch) -> None:
+def test_handle_ui_streamlit_returns_130_on_keyboard_interrupt(monkeypatch) -> None:
     monkeypatch.setattr(
         cli,
         "_streamlit_app_path",
@@ -301,7 +301,7 @@ def test_handle_ui_returns_130_on_keyboard_interrupt(monkeypatch) -> None:
 
     monkeypatch.setattr(cli.subprocess, "run", interrupting_run)
 
-    exit_code = cli._handle_ui(
+    exit_code = cli._handle_ui_streamlit(
         argparse.Namespace(
             repository_root=".",
             data_dir=None,
@@ -311,6 +311,70 @@ def test_handle_ui_returns_130_on_keyboard_interrupt(monkeypatch) -> None:
     )
 
     assert exit_code == 130
+
+
+def test_handle_ui_forwards_arguments(monkeypatch) -> None:
+    recorded: dict[str, object] = {}
+
+    def fake_serve_ui(**kwargs) -> int:
+        recorded.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(
+        "crypto_backtest_workbench.app.api.serve_ui",
+        fake_serve_ui,
+    )
+
+    exit_code = cli._handle_ui(
+        argparse.Namespace(
+            repository_root="/repo",
+            data_dir="/repo/data",
+            host="0.0.0.0",
+            port=8501,
+            cors_origin="http://localhost:4173",
+        )
+    )
+
+    assert exit_code == 0
+    assert recorded == {
+        "host": "0.0.0.0",
+        "port": 8501,
+        "repository_root": "/repo",
+        "data_dir": "/repo/data",
+        "cors_origin": "http://localhost:4173",
+    }
+
+
+def test_handle_api_forwards_arguments(monkeypatch) -> None:
+    recorded: dict[str, object] = {}
+
+    def fake_serve_api(**kwargs) -> int:
+        recorded.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(
+        "crypto_backtest_workbench.app.api.serve_api",
+        fake_serve_api,
+    )
+
+    exit_code = cli._handle_api(
+        argparse.Namespace(
+            repository_root="/repo",
+            data_dir="/repo/data",
+            host="0.0.0.0",
+            port=9000,
+            cors_origin="http://localhost:4173",
+        )
+    )
+
+    assert exit_code == 0
+    assert recorded == {
+        "host": "0.0.0.0",
+        "port": 9000,
+        "repository_root": "/repo",
+        "data_dir": "/repo/data",
+        "cors_origin": "http://localhost:4173",
+    }
 
 
 def test_handle_run_ema_returns_task_failure_payload(monkeypatch, tmp_path, capsys) -> None:
