@@ -29,6 +29,7 @@ class ExecutionConstraints:
     slippage_bps: float = 0.0
     min_notional: float = 0.0
     qty_by_policy: dict[str, float] = field(default_factory=dict)
+    cash_allocation_pct_by_policy: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -55,6 +56,9 @@ def simulate_signals(
 ) -> ExecutionResult:
     if constraints.leverage <= 0:
         raise ValueError("leverage must be greater than 0")
+    for allocation_pct in constraints.cash_allocation_pct_by_policy.values():
+        if allocation_pct <= 0 or allocation_pct > 100:
+            raise ValueError("cash_allocation_pct must be in (0, 100]")
 
     sorted_candles = sorted(candles, key=lambda candle: candle.timestamp)
     index_by_timestamp = {candle.timestamp: index for index, candle in enumerate(sorted_candles)}
@@ -218,7 +222,7 @@ def _open_position(
     constraints: ExecutionConstraints,
     account: AccountSnapshot,
 ) -> tuple[OrderRequest, FillEvent | None, _OpenPosition | None]:
-    qty = constraints.qty_by_policy.get(signal.qty_policy_ref, 0.0)
+    qty = _resolve_order_qty(signal=signal, price=candle.open, constraints=constraints, account=account)
     order = OrderRequest(
         order_id=_next_id("order"),
         run_id=signal.run_id,
@@ -342,6 +346,45 @@ def _validate_open_order(
     if not account.has_margin_for(required_margin + estimated_fee):
         return RejectReasonCode.INSUFFICIENT_MARGIN
     return None
+
+
+def _resolve_order_qty(
+    *,
+    signal: SignalIntent,
+    price: float,
+    constraints: ExecutionConstraints,
+    account: AccountSnapshot,
+) -> float:
+    cash_allocation_pct = constraints.cash_allocation_pct_by_policy.get(signal.qty_policy_ref)
+    if cash_allocation_pct is not None:
+        return _qty_from_cash_allocation(
+            price=price,
+            leverage=constraints.leverage,
+            fee_rate=constraints.fee_rate,
+            available_cash=account.available_cash,
+            cash_allocation_pct=cash_allocation_pct,
+        )
+    return constraints.qty_by_policy.get(signal.qty_policy_ref, 0.0)
+
+
+def _qty_from_cash_allocation(
+    *,
+    price: float,
+    leverage: float,
+    fee_rate: float,
+    available_cash: float,
+    cash_allocation_pct: float,
+) -> float:
+    if price <= 0:
+        return 0.0
+    allocated_cash = available_cash * (cash_allocation_pct / 100)
+    if allocated_cash <= 0:
+        return 0.0
+    notional_cost_per_unit = (1 / leverage) + fee_rate
+    if notional_cost_per_unit <= 0:
+        return 0.0
+    notional = allocated_cash / notional_cost_per_unit
+    return notional / price
 
 
 def _apply_slippage(price: float, side: Side, *, is_entry: bool, slippage_bps: float) -> float:

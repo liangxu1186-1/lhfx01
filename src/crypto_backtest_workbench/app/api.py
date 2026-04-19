@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import threading
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,14 +22,18 @@ from crypto_backtest_workbench.app.readmodels import (
     json_ready,
 )
 from crypto_backtest_workbench.app.workflows import (
+    ParameterExperimentTaskRequest,
+    build_parameter_experiment_task,
     RunBacktestWorkflowRequest,
     ingest_dataset_workflow,
+    run_parameter_experiment_task_workflow,
     run_backtest_task_workflow,
 )
 from crypto_backtest_workbench.domain.models import (
     DatasetSnapshot,
     MarketType,
     PriceType,
+    SearchType,
     ValidationSplit,
     ValidationTargetType,
 )
@@ -36,9 +41,14 @@ from crypto_backtest_workbench.engine.execution import ExecutionConstraints
 from crypto_backtest_workbench.jobs import LocalTaskRunner
 from crypto_backtest_workbench.storage.repositories import (
     FileDatasetRepository,
+    FileParameterExperimentRepository,
     FileFeatureRepository,
     FileRunRepository,
+    FileTaskRepository,
 )
+
+DEFAULT_QTY_POLICY_REF = "percent_of_cash"
+DEFAULT_CASH_ALLOCATION_PCT = 100.0
 
 
 class WorkspaceApiServer(ThreadingHTTPServer):
@@ -59,6 +69,7 @@ class WorkspaceApiServer(ThreadingHTTPServer):
         self.data_dir = data_dir
         self.cors_origin = cors_origin
         self.frontend_dist_dir = frontend_dist_dir
+        self.background_threads: dict[str, threading.Thread] = {}
         super().__init__(server_address, WorkspaceApiHandler)
 
     def server_bind(self) -> None:
@@ -110,6 +121,22 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                     ),
                 )
                 return
+            if path == "/api/tasks":
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        tasks=self._build_task_index(),
+                    ),
+                )
+                return
+            if path == "/api/parameter-experiments":
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        parameter_experiments=self._build_parameter_experiment_index(),
+                    ),
+                )
+                return
             if path.startswith("/api/runs/"):
                 self._send_json(
                     HTTPStatus.OK,
@@ -117,6 +144,24 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                         run=build_workspace_run_detail(
                             data_dir=self.server.data_dir,
                             run_id=unquote(path.removeprefix("/api/runs/")),
+                        ),
+                    ),
+                )
+                return
+            if path.startswith("/api/tasks/"):
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        task=self._build_task_detail(unquote(path.removeprefix("/api/tasks/"))),
+                    ),
+                )
+                return
+            if path.startswith("/api/parameter-experiments/"):
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        parameter_experiment=self._build_parameter_experiment_detail(
+                            unquote(path.removeprefix("/api/parameter-experiments/"))
                         ),
                     ),
                 )
@@ -151,6 +196,10 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/run-ema":
                 status, body = self._handle_run_ema(payload)
+                self._send_json(status, body)
+                return
+            if path == "/api/parameter-experiments":
+                status, body = self._handle_parameter_experiment(payload)
                 self._send_json(status, body)
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": {"message": f"Unknown endpoint: {path}"}})
@@ -206,6 +255,7 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             payload=payload,
             snapshot=snapshot,
         )
+        qty_policy_ref, constraints = _build_execution_constraints(payload)
 
         request = RunBacktestWorkflowRequest(
             run_id=_require_str(payload, "run_id"),
@@ -213,18 +263,9 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             strategy_params={
                 "fast_period": int(payload.get("fast_period", 2)),
                 "slow_period": int(payload.get("slow_period", 3)),
-                "qty_policy_ref": str(payload.get("qty_policy_ref", "fixed_notional_v1")),
+                "qty_policy_ref": qty_policy_ref,
             },
-            constraints=ExecutionConstraints(
-                initial_cash=float(payload.get("initial_cash", 10_000.0)),
-                leverage=float(payload.get("leverage", 1.0)),
-                fee_rate=float(payload.get("fee_rate", 0.0)),
-                slippage_bps=float(payload.get("slippage_bps", 0.0)),
-                min_notional=float(payload.get("min_notional", 0.0)),
-                qty_by_policy={
-                    str(payload.get("qty_policy_ref", "fixed_notional_v1")): float(_require_number(payload, "qty"))
-                },
-            ),
+            constraints=constraints,
             validation_split=validation_split,
             enable_buy_and_hold_benchmark=str(payload.get("benchmark", "buy_and_hold")) == "buy_and_hold",
         )
@@ -233,6 +274,7 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
         dataset_repository = FileDatasetRepository(self.server.data_dir)
         feature_repository = FileFeatureRepository(self.server.data_dir)
         run_repository = FileRunRepository(self.server.data_dir)
+        task_repository = FileTaskRepository(self.server.data_dir)
         task_result = run_backtest_task_workflow(
             runner=runner,
             dataset_repository=dataset_repository,
@@ -241,6 +283,7 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             request=request,
         )
         task = task_result.task
+        task_repository.save_task(task)
         if task_result.output is None:
             return (
                 HTTPStatus.UNPROCESSABLE_ENTITY,
@@ -276,6 +319,119 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                 "metrics": metrics,
                 "persisted": json_ready(task_result.output.persisted_paths),
             },
+        )
+
+    def _build_task_index(self) -> list[dict[str, object]]:
+        task_repository = FileTaskRepository(self.server.data_dir)
+        return [json_ready(task) for task in task_repository.list_tasks()]
+
+    def _build_task_detail(self, task_id: str) -> dict[str, object]:
+        task_repository = FileTaskRepository(self.server.data_dir)
+        return json_ready(task_repository.load_task(task_id))
+
+    def _build_parameter_experiment_index(self) -> list[dict[str, object]]:
+        experiment_repository = FileParameterExperimentRepository(self.server.data_dir)
+        payloads: list[dict[str, object]] = []
+        for experiment_id in experiment_repository.list_experiment_ids():
+            experiment = experiment_repository.load_experiment(experiment_id)
+            execution = experiment_repository.load_execution_index(experiment_id)
+            payloads.append(
+                {
+                    "experiment_id": experiment.experiment_id,
+                    "strategy_name": experiment.strategy_name,
+                    "dataset_bundle_id": experiment.dataset_bundle_id,
+                    "search_type": experiment.search_type.value,
+                    "task_id": execution.get("task_id"),
+                    "status": execution.get("status", "pending"),
+                    "planned_run_count": execution.get("planned_run_count", len(execution.get("run_ids", []))),
+                    "run_count": len(execution.get("run_ids", [])),
+                    "failed_run_count": len(execution.get("failed_child_task_ids", [])),
+                    "created_at": experiment.created_at,
+                }
+            )
+        return payloads
+
+    def _build_parameter_experiment_detail(self, experiment_id: str) -> dict[str, object]:
+        experiment_repository = FileParameterExperimentRepository(self.server.data_dir)
+        return {
+            "experiment": json_ready(experiment_repository.load_experiment(experiment_id)),
+            "execution": experiment_repository.load_execution_index(experiment_id),
+        }
+
+    def _handle_parameter_experiment(self, payload: dict[str, object]) -> tuple[HTTPStatus, dict[str, object]]:
+        snapshot = _load_snapshot(self.server.data_dir, _require_str(payload, "snapshot_id"))
+        experiment_id = _require_str(payload, "experiment_id")
+        qty_policy_ref = _resolve_qty_policy_ref(payload)
+        experiment_repository = FileParameterExperimentRepository(self.server.data_dir)
+        if experiment_id in experiment_repository.list_experiment_ids():
+            raise FileExistsError(f"Parameter experiment already exists: {experiment_id}")
+        request = ParameterExperimentTaskRequest(
+            experiment_id=experiment_id,
+            snapshot=snapshot,
+            search_type=SearchType(str(payload.get("search_type", SearchType.GRID.value))),
+            fast_periods=_require_int_tuple(payload, "fast_periods"),
+            slow_periods=_require_int_tuple(payload, "slow_periods"),
+            qty_policy_ref=qty_policy_ref,
+            qty=_optional_number(payload.get("qty")),
+            cash_allocation_pct=_optional_number(
+                payload.get("cash_allocation_pct"),
+                default=DEFAULT_CASH_ALLOCATION_PCT if qty_policy_ref == DEFAULT_QTY_POLICY_REF else None,
+            ),
+            initial_cash=float(payload.get("initial_cash", 10_000.0)),
+            leverage=float(payload.get("leverage", 1.0)),
+            fee_rate=float(payload.get("fee_rate", 0.0)),
+            slippage_bps=float(payload.get("slippage_bps", 0.0)),
+            min_notional=float(payload.get("min_notional", 0.0)),
+            benchmark_enabled=str(payload.get("benchmark", "buy_and_hold")) == "buy_and_hold",
+            max_samples=int(payload["max_samples"]) if payload.get("max_samples") is not None else None,
+            seed=int(payload["seed"]) if payload.get("seed") is not None else None,
+            validation_split=_build_validation_split(payload=payload, snapshot=snapshot),
+        )
+        task, experiment, combinations = build_parameter_experiment_task(request)
+        task_repository = FileTaskRepository(self.server.data_dir)
+        task_repository.save_task(task)
+        experiment_repository.save_experiment(experiment)
+        experiment_repository.save_execution_index(
+            experiment_id,
+            {
+                "experiment_id": experiment_id,
+                "task_id": task.task_id,
+                "status": task.status.value,
+                "run_ids": [],
+                "child_task_ids": [],
+                "failed_child_task_ids": [],
+                "planned_run_count": len(combinations),
+                "updated_at": task.updated_at.isoformat(),
+            },
+        )
+
+        worker = threading.Thread(
+            target=self._run_parameter_experiment_in_background,
+            args=(request,),
+            daemon=True,
+            name=f"parameter-experiment:{experiment_id}",
+        )
+        self.server.background_threads[task.task_id] = worker
+        worker.start()
+        return (
+            HTTPStatus.ACCEPTED,
+            {
+                "task_id": task.task_id,
+                "task_status": task.status.value,
+                "experiment_id": experiment_id,
+                "search_type": request.search_type.value,
+                "planned_run_count": len(combinations),
+            },
+        )
+
+    def _run_parameter_experiment_in_background(self, request: ParameterExperimentTaskRequest) -> None:
+        run_parameter_experiment_task_workflow(
+            request=request,
+            task_repository=FileTaskRepository(self.server.data_dir),
+            experiment_repository=FileParameterExperimentRepository(self.server.data_dir),
+            dataset_repository=FileDatasetRepository(self.server.data_dir),
+            feature_repository=FileFeatureRepository(self.server.data_dir),
+            run_repository=FileRunRepository(self.server.data_dir),
         )
 
     def _handle_delete_run(self, run_id: str) -> dict[str, object]:
@@ -316,6 +472,8 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
     def _send_error_json(self, exc: Exception) -> None:
         if isinstance(exc, FileNotFoundError):
             status = HTTPStatus.NOT_FOUND
+        elif isinstance(exc, FileExistsError):
+            status = HTTPStatus.CONFLICT
         elif isinstance(exc, (ValueError, KeyError)):
             status = HTTPStatus.BAD_REQUEST
         else:
@@ -557,3 +715,54 @@ def _require_number(payload: dict[str, object], field_name: str) -> float:
     if value is None:
         raise KeyError(field_name)
     return float(value)
+
+
+def _optional_number(value: object | None, *, default: float | None = None) -> float | None:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError("Expected number, got boolean")
+    return float(value)
+
+
+def _resolve_qty_policy_ref(payload: dict[str, object]) -> str:
+    return str(payload.get("qty_policy_ref", DEFAULT_QTY_POLICY_REF))
+
+
+def _build_execution_constraints(payload: dict[str, object]) -> tuple[str, ExecutionConstraints]:
+    qty_policy_ref = _resolve_qty_policy_ref(payload)
+    qty = _optional_number(payload.get("qty"))
+    cash_allocation_pct = _optional_number(payload.get("cash_allocation_pct"))
+    qty_by_policy: dict[str, float] = {}
+    cash_allocation_pct_by_policy: dict[str, float] = {}
+
+    if cash_allocation_pct is not None:
+        if qty_policy_ref != DEFAULT_QTY_POLICY_REF:
+            raise ValueError("cash_allocation_pct only supports qty_policy_ref=percent_of_cash")
+        cash_allocation_pct_by_policy[qty_policy_ref] = cash_allocation_pct
+    elif qty is not None:
+        qty_by_policy[qty_policy_ref] = qty
+    elif qty_policy_ref == DEFAULT_QTY_POLICY_REF:
+        cash_allocation_pct_by_policy[qty_policy_ref] = DEFAULT_CASH_ALLOCATION_PCT
+    else:
+        raise KeyError("Either qty or cash_allocation_pct must be provided")
+
+    return (
+        qty_policy_ref,
+        ExecutionConstraints(
+            initial_cash=float(payload.get("initial_cash", 10_000.0)),
+            leverage=float(payload.get("leverage", 1.0)),
+            fee_rate=float(payload.get("fee_rate", 0.0)),
+            slippage_bps=float(payload.get("slippage_bps", 0.0)),
+            min_notional=float(payload.get("min_notional", 0.0)),
+            qty_by_policy=qty_by_policy,
+            cash_allocation_pct_by_policy=cash_allocation_pct_by_policy,
+        ),
+    )
+
+
+def _require_int_tuple(payload: dict[str, object], field_name: str) -> tuple[int, ...]:
+    value = payload.get(field_name)
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{field_name} must be a non-empty array")
+    return tuple(int(item) for item in value)

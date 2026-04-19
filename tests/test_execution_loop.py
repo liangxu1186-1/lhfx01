@@ -84,6 +84,36 @@ def test_simulate_signals_rejects_order_when_margin_is_insufficient() -> None:
     assert result.trades == []
 
 
+def test_simulate_signals_percent_of_cash_uses_dynamic_available_cash() -> None:
+    candles = _sample_candles_for_dynamic_sizing()
+    signals = [
+        _signal(signal_id="sig-open-1", timestamp=candles[0].timestamp, action=SignalAction.OPEN, side=Side.LONG),
+        _signal(signal_id="sig-close-1", timestamp=candles[1].timestamp, action=SignalAction.CLOSE, side=Side.LONG),
+        _signal(signal_id="sig-open-2", timestamp=candles[2].timestamp, action=SignalAction.OPEN, side=Side.LONG),
+        _signal(signal_id="sig-close-2", timestamp=candles[3].timestamp, action=SignalAction.CLOSE, side=Side.LONG),
+    ]
+    for signal in signals:
+        signal.qty_policy_ref = "percent_of_cash"
+
+    result = simulate_signals(
+        candles=candles,
+        signals=signals,
+        constraints=ExecutionConstraints(
+            initial_cash=1_000.0,
+            leverage=2.0,
+            fee_rate=0.0,
+            cash_allocation_pct_by_policy={"percent_of_cash": 100.0},
+        ),
+    )
+
+    assert len(result.trades) == 2
+    first_trade, second_trade = result.trades
+    assert round(first_trade.qty, 6) == 20.0
+    assert round(second_trade.qty, 6) == round(1_400.0 * 2 / 120.0, 6)
+    assert second_trade.qty > first_trade.qty
+    assert round(result.account.equity, 6) == 1_960.0
+
+
 def test_single_run_orchestrator_assembles_manifest_run_and_metrics() -> None:
     candles = _sample_candles()
     signals = [
@@ -147,6 +177,35 @@ def _sample_candles() -> list[CanonicalCandle]:
         (100.0, 101.0, 99.0, 100.0),
         (102.0, 103.0, 101.0, 102.0),
         (105.0, 106.0, 104.0, 105.0),
+    ]
+    candles: list[CanonicalCandle] = []
+    for index, (open_price, high, low, close) in enumerate(prices):
+        candles.append(
+            CanonicalCandle(
+                timestamp=start + timedelta(hours=index),
+                symbol="BTC/USDT:USDT",
+                exchange="binance",
+                market_type=MarketType.LINEAR_USDT_PERPETUAL,
+                timeframe="1h",
+                open=open_price,
+                high=high,
+                low=low,
+                close=close,
+                volume=10.0,
+                price_type=PriceType.LAST,
+            )
+        )
+    return candles
+
+
+def _sample_candles_for_dynamic_sizing() -> list[CanonicalCandle]:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    prices = [
+        (100.0, 100.0, 99.0, 100.0),
+        (100.0, 101.0, 99.0, 100.0),
+        (120.0, 121.0, 119.0, 120.0),
+        (120.0, 121.0, 119.0, 120.0),
+        (144.0, 145.0, 143.0, 144.0),
     ]
     candles: list[CanonicalCandle] = []
     for index, (open_price, high, low, close) in enumerate(prices):

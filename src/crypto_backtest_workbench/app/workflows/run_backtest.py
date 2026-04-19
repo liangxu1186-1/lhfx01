@@ -173,6 +173,7 @@ def _build_resolved_config(
             "slippage_bps": request.constraints.slippage_bps,
             "min_notional": request.constraints.min_notional,
             "qty_by_policy": dict(sorted(request.constraints.qty_by_policy.items())),
+            "cash_allocation_pct_by_policy": dict(sorted(request.constraints.cash_allocation_pct_by_policy.items())),
         },
         "validation_split_id": _validation_split_id(request.validation_split),
         "benchmark": _benchmark_config_json(request.enable_buy_and_hold_benchmark),

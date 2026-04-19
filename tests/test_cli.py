@@ -458,6 +458,24 @@ def test_handle_run_ema_returns_task_failure_payload(monkeypatch, tmp_path, caps
     assert '"failure_stage": "run_backtest_task_executor"' in captured.out
 
 
+def test_build_execution_constraints_supports_percent_of_cash_defaults() -> None:
+    constraints = cli._build_execution_constraints(
+        argparse.Namespace(
+            qty_policy_ref="percent_of_cash",
+            qty=None,
+            cash_allocation_pct=50.0,
+            initial_cash=1000.0,
+            leverage=2.0,
+            fee_rate=0.0,
+            slippage_bps=0.0,
+            min_notional=0.0,
+        )
+    )
+
+    assert constraints.qty_by_policy == {}
+    assert constraints.cash_allocation_pct_by_policy == {"percent_of_cash": 50.0}
+
+
 def _snapshot() -> DatasetSnapshot:
     return DatasetSnapshot(
         dataset_snapshot_id="snapshot-001",

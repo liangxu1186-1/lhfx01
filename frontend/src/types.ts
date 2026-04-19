@@ -59,6 +59,18 @@ export interface ParametersPayload {
   parameter_lab: WorkspaceParameterLab;
 }
 
+export interface ParameterExperimentIndexPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  parameter_experiments: ParameterExperimentSummary[];
+}
+
+export interface ParameterExperimentDetailPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  parameter_experiment: ParameterExperimentDetail;
+}
+
 export interface DatasetSnapshotView {
   created_at: string;
   data_source: string;
@@ -83,6 +95,9 @@ export interface RunSummaryView {
   dataset_snapshot_id: string;
   symbol: string;
   timeframe: string;
+  fast_period: number | null;
+  slow_period: number | null;
+  leverage: number | null;
   status: string;
   created_at: string;
   validation_split_id: string;
@@ -210,6 +225,7 @@ export interface ParameterLabRow {
   fast_period: number | null;
   slow_period: number | null;
   qty_policy_ref: string | null;
+  cash_allocation_pct: number | null;
   leverage: number | null;
   fee_rate: number | null;
   slippage_bps: number | null;
@@ -229,4 +245,46 @@ export interface SensitivityRow {
   run_count: number;
   avg_metric: number;
   best_metric: number;
+}
+
+export interface ParameterExperimentSummary {
+  experiment_id: string;
+  strategy_name: string;
+  dataset_bundle_id: string;
+  search_type: string;
+  task_id: string | null;
+  status: string;
+  planned_run_count: number;
+  run_count: number;
+  failed_run_count: number;
+  created_at: string;
+}
+
+export interface ParameterExperimentDetail {
+  experiment: {
+    experiment_id: string;
+    strategy_name: string;
+    dataset_bundle_id: string;
+    validation_split_id: string;
+    metric_policy_id: string;
+    benchmark_policy_version: string;
+    benchmark_config_uri: string;
+    search_type: string;
+    search_space_json: Record<string, unknown>;
+    base_config_uri: string;
+    seed_policy: string;
+    seed: number | null;
+    shared_feature_artifact_ids: string[];
+    created_at: string;
+  };
+  execution: {
+    experiment_id?: string;
+    task_id?: string;
+    status?: string;
+    run_ids?: string[];
+    child_task_ids?: string[];
+    failed_child_task_ids?: string[];
+    planned_run_count?: number;
+    updated_at?: string;
+  };
 }

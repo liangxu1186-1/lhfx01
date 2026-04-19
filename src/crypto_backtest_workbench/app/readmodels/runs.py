@@ -25,6 +25,9 @@ class RunSummaryView:
     dataset_snapshot_id: str
     symbol: str
     timeframe: str
+    fast_period: int | None
+    slow_period: int | None
+    leverage: float | None
     status: str
     created_at: datetime
     validation_split_id: str
@@ -88,6 +91,8 @@ def list_run_summary_views(run_repository: RunRepository) -> list[RunSummaryView
         metrics = run_repository.load_metrics(run_id)
         benchmark = run_repository.load_benchmark(run_id)
         execution = run_repository.load_execution(run_id)
+        strategy_params = manifest.resolved_config_json.get("strategy_params") or {}
+        execution_constraints = manifest.resolved_config_json.get("execution_constraints") or {}
         benchmark_return = benchmark.result.return_pct if benchmark is not None else None
         excess_return = None
         if benchmark_return is not None:
@@ -99,6 +104,9 @@ def list_run_summary_views(run_repository: RunRepository) -> list[RunSummaryView
                 dataset_snapshot_id=run.dataset_snapshot_id,
                 symbol=str(manifest.resolved_config_json.get("symbol") or ""),
                 timeframe=str(manifest.resolved_config_json.get("timeframe") or ""),
+                fast_period=_coerce_int(strategy_params.get("fast_period")),
+                slow_period=_coerce_int(strategy_params.get("slow_period")),
+                leverage=_coerce_float(execution_constraints.get("leverage")),
                 status=run.status.value,
                 created_at=run.created_at,
                 validation_split_id=run.validation_split_id,
@@ -322,6 +330,18 @@ def _normalize_float(value: float) -> float | None:
     if isnan(value):
         return None
     return value
+
+
+def _coerce_int(value: object) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _coerce_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)
 
 
 def _matches_outcome(*, outcome: str, net_pnl: float) -> bool:

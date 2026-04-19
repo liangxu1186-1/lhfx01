@@ -193,6 +193,30 @@ def test_ccxt_history_fetcher_stops_when_exchange_repeats_same_page() -> None:
     assert len(client.calls) == 2
 
 
+def test_ccxt_history_fetcher_normalizes_uppercase_timeframe() -> None:
+    client = FakeExchangeClient(
+        pages=[
+            [
+                _raw_row(_ms(2024, 1, 1, 0), 100.0),
+            ],
+        ]
+    )
+    fetcher = CcxtHistoryFetcher(client)
+    request = HistoryFetchRequest(
+        exchange="binance",
+        symbol="BTC/USDT:USDT",
+        timeframe="1D",
+        market_type=MarketType.LINEAR_USDT_PERPETUAL,
+        since=_dt(2024, 1, 1, 0),
+        limit=100,
+    )
+
+    rows = fetcher.fetch_ohlcv(request)
+
+    assert len(rows) == 1
+    assert client.calls[0]["timeframe"] == "1d"
+
+
 def test_fallback_history_fetcher_uses_secondary_when_primary_fails() -> None:
     request = HistoryFetchRequest(
         exchange="binanceusdm",

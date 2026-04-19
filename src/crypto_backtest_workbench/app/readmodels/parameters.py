@@ -23,6 +23,7 @@ class ParameterLabRow:
     fast_period: int | None
     slow_period: int | None
     qty_policy_ref: str | None
+    cash_allocation_pct: float | None
     leverage: float | None
     fee_rate: float | None
     slippage_bps: float | None
@@ -80,6 +81,7 @@ def build_parameter_lab_rows(
                 fast_period=_coerce_int(strategy_params.get("fast_period")),
                 slow_period=_coerce_int(strategy_params.get("slow_period")),
                 qty_policy_ref=_coerce_str(strategy_params.get("qty_policy_ref")),
+                cash_allocation_pct=_coerce_policy_float(execution_constraints.get("cash_allocation_pct_by_policy")),
                 leverage=_coerce_float(execution_constraints.get("leverage")),
                 fee_rate=_coerce_float(execution_constraints.get("fee_rate")),
                 slippage_bps=_coerce_float(execution_constraints.get("slippage_bps")),
@@ -177,6 +179,13 @@ def _coerce_str(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _coerce_policy_float(value: object) -> float | None:
+    if not isinstance(value, dict) or not value:
+        return None
+    first_value = next(iter(value.values()))
+    return _coerce_float(first_value)
 
 
 def _normalize_float(value: float) -> float | None:

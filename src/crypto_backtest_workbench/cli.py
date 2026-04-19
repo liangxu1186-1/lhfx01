@@ -18,6 +18,9 @@ from crypto_backtest_workbench.domain.models import (
     ValidationTargetType,
 )
 
+DEFAULT_QTY_POLICY_REF = "percent_of_cash"
+DEFAULT_CASH_ALLOCATION_PCT = 100.0
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cbw")
@@ -64,8 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_ema.add_argument("--data-dir")
     run_ema.add_argument("--fast-period", type=int, required=True)
     run_ema.add_argument("--slow-period", type=int, required=True)
-    run_ema.add_argument("--qty-policy-ref", default="fixed_notional_v1")
-    run_ema.add_argument("--qty", type=float, required=True)
+    run_ema.add_argument("--qty-policy-ref", default=DEFAULT_QTY_POLICY_REF)
+    run_ema.add_argument("--qty", type=float)
+    run_ema.add_argument("--cash-allocation-pct", type=float)
     run_ema.add_argument("--initial-cash", type=float, default=10_000.0)
     run_ema.add_argument("--leverage", type=float, default=1.0)
     run_ema.add_argument("--fee-rate", type=float, default=0.0)
@@ -215,7 +219,6 @@ def _handle_run_ema(args: argparse.Namespace) -> int:
         RunBacktestWorkflowRequest,
         run_backtest_task_workflow,
     )
-    from crypto_backtest_workbench.engine.execution import ExecutionConstraints
     from crypto_backtest_workbench.jobs import LocalTaskRunner
     from crypto_backtest_workbench.storage.repositories import (
         FileDatasetRepository,
@@ -241,16 +244,9 @@ def _handle_run_ema(args: argparse.Namespace) -> int:
             strategy_params={
                 "fast_period": args.fast_period,
                 "slow_period": args.slow_period,
-                "qty_policy_ref": args.qty_policy_ref,
+                "qty_policy_ref": getattr(args, "qty_policy_ref", DEFAULT_QTY_POLICY_REF),
             },
-            constraints=ExecutionConstraints(
-                initial_cash=args.initial_cash,
-                leverage=args.leverage,
-                fee_rate=args.fee_rate,
-                slippage_bps=args.slippage_bps,
-                min_notional=args.min_notional,
-                qty_by_policy={args.qty_policy_ref: args.qty},
-            ),
+            constraints=_build_execution_constraints(args),
             validation_split=validation_split,
             enable_buy_and_hold_benchmark=args.benchmark == "buy_and_hold",
         ),
@@ -427,6 +423,37 @@ def _parse_json_object_arg(value: str | None, *, field_name: str) -> dict[str, o
     if not isinstance(parsed, dict):
         raise ValueError(f"{field_name} must be a JSON object")
     return parsed
+
+
+def _build_execution_constraints(args: argparse.Namespace):
+    from crypto_backtest_workbench.engine.execution import ExecutionConstraints
+
+    qty_policy_ref = getattr(args, "qty_policy_ref", DEFAULT_QTY_POLICY_REF)
+    qty = getattr(args, "qty", None)
+    cash_allocation_pct = getattr(args, "cash_allocation_pct", None)
+    qty_by_policy: dict[str, float] = {}
+    cash_allocation_pct_by_policy: dict[str, float] = {}
+
+    if cash_allocation_pct is not None:
+        if qty_policy_ref != DEFAULT_QTY_POLICY_REF:
+            raise ValueError("cash_allocation_pct only supports --qty-policy-ref percent_of_cash")
+        cash_allocation_pct_by_policy[qty_policy_ref] = float(cash_allocation_pct)
+    elif qty is not None:
+        qty_by_policy[qty_policy_ref] = float(qty)
+    elif qty_policy_ref == DEFAULT_QTY_POLICY_REF:
+        cash_allocation_pct_by_policy[qty_policy_ref] = DEFAULT_CASH_ALLOCATION_PCT
+    else:
+        raise ValueError("Either --qty or --cash-allocation-pct is required")
+
+    return ExecutionConstraints(
+        initial_cash=args.initial_cash,
+        leverage=args.leverage,
+        fee_rate=args.fee_rate,
+        slippage_bps=args.slippage_bps,
+        min_notional=args.min_notional,
+        qty_by_policy=qty_by_policy,
+        cash_allocation_pct_by_policy=cash_allocation_pct_by_policy,
+    )
 
 
 def _build_validation_split(

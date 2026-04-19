@@ -23,6 +23,7 @@ from crypto_backtest_workbench.engine.data.fetchers import (
     HistoryFetchRequest,
     HistoryFetcher,
     build_default_history_fetcher,
+    normalize_timeframe,
 )
 from crypto_backtest_workbench.engine.data.integrity import build_integrity_report
 from crypto_backtest_workbench.engine.data.service import DatasetIngestionResult, DatasetIngestionService
@@ -53,7 +54,7 @@ def ingest_dataset_workflow(
     request = HistoryFetchRequest(
         exchange=exchange,
         symbol=symbol,
-        timeframe=timeframe,
+        timeframe=normalize_timeframe(timeframe),
         market_type=market_type,
         since=since,
         until=until,

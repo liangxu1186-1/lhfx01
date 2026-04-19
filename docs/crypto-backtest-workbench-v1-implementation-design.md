@@ -169,7 +169,9 @@ Parameter Lab 的目标是发现稳健区间，而不是制造参数赌博机。
 - `fee`：以 quote currency 结算
 - `pnl`：以 quote currency 结算
 - `equity`：以 quote currency 表示
-- `leverage`：只影响保证金占用与暴露，不改变 `qty` 定义
+- `leverage`：影响保证金占用与暴露
+- `qty` 始终表示最终成交的 base asset 数量
+- 当使用 `percent_of_cash` 仓位策略时，`qty` 由 `available_cash`、`leverage` 和成交价动态派生，不再由用户直接输入
 
 ### 5.3 仓位与账户规则
 
@@ -1519,7 +1521,8 @@ v1 固定为 `linear USDT perpetual`。
 ### C.4 leverage
 
 - leverage 影响保证金占用和风险暴露
-- leverage 不改变 `qty` 的语义
+- leverage 不改变 `qty` 的计量单位
+- 在 `percent_of_cash` 仓位策略下，leverage 会直接影响最终派生出的 `qty`
 - v1 默认允许 run 级全局 leverage 配置
 - symbol 级差异化 leverage 后置
 

@@ -1,6 +1,8 @@
 import type {
   DatasetsPayload,
+  ParameterExperimentDetailPayload,
   OverviewPayload,
+  ParameterExperimentIndexPayload,
   ParametersPayload,
   RunDetailPayload,
   RunIndexPayload,
@@ -110,6 +112,14 @@ export async function loadParameters(): Promise<ParametersPayload> {
   }
 }
 
+export async function loadParameterExperiments(): Promise<ParameterExperimentIndexPayload> {
+  return fetchJson<ParameterExperimentIndexPayload>('/api/parameter-experiments');
+}
+
+export async function loadParameterExperimentDetail(experimentId: string): Promise<ParameterExperimentDetailPayload> {
+  return fetchJson<ParameterExperimentDetailPayload>(`/api/parameter-experiments/${encodeURIComponent(experimentId)}`);
+}
+
 export async function postIngest(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   const response = await fetch(apiUrl('/api/ingest'), {
     method: 'POST',
@@ -121,6 +131,15 @@ export async function postIngest(payload: Record<string, unknown>): Promise<Reco
 
 export async function postRunEma(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   const response = await fetch(apiUrl('/api/run-ema'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<Record<string, unknown>>(response);
+}
+
+export async function postParameterExperiment(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl('/api/parameter-experiments'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),

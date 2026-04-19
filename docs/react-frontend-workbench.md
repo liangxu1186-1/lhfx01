@@ -26,6 +26,14 @@
 - 单次分析
 - 参数实验
 
+其中参数实验页当前已支持：
+
+- 提交参数实验
+- 轮询实验状态
+- 查看父实验详情
+- 展示子 run 结果表
+- 从实验结果一键跳转单次分析
+
 当前 Python 轻 API 已提供：
 
 - `GET /api/datasets`
@@ -33,15 +41,24 @@
 - `GET /api/runs`
 - `GET /api/runs/<run_id>`
 - `GET /api/parameters`
+- `GET /api/parameter-experiments`
+- `GET /api/parameter-experiments/<experiment_id>`
 - `GET /api/workspace`
 - `POST /api/ingest`
 - `POST /api/run-ema`
+- `POST /api/parameter-experiments`
 
 当前仍不包含：
 
 - WebSocket / 任务轮询
 - 登录、权限、多用户
-- 参数实验任务提交
+- 独立任务页
+
+补充说明：
+
+- `POST /api/run-ema` 现已支持 `cash_allocation_pct`
+- React 执行台默认使用 `percent_of_cash` 动态资金仓位策略
+- 旧的 `qty` 固定数量输入在 API / CLI 层仍保留兼容
 
 ## 目录
 
@@ -190,5 +207,5 @@ npm run build
 
 1. 把 Plotly 按页面或图表做懒加载，压缩当前较大的前端 bundle。
 2. 把总览和参数实验筛选继续下推到服务端查询参数，减少大 workspace 下的前端过滤成本。
-3. 把参数实验提交和任务状态轮询接进 API。
+3. 把参数实验结果页继续补到 IS / OOS 研究消费层，而不只停留在总收益排序。
 4. 视情况再引入正式路由库，把分析页拆成更明确的独立 URL。

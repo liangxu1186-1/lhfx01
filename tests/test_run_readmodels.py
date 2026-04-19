@@ -38,6 +38,9 @@ def test_run_readmodels_build_summary_and_detail(tmp_path) -> None:
     assert summaries[0].strategy_name == "manual-signals"
     assert summaries[0].trade_count == 1
     assert summaries[0].benchmark_return is not None
+    assert summaries[0].fast_period == 2
+    assert summaries[0].slow_period == 5
+    assert summaries[0].leverage == 2.0
 
     detail = load_run_detail_view(repository, "run-001")
     equity_rows = build_equity_chart_rows(detail)
@@ -182,7 +185,16 @@ def _build_single_run_result(*, run_id: str):
             fee_model_params_json={"rate": 0.001},
             slippage_model_params_json={"bps": 0},
             benchmark_config_json={"benchmark_type": "buy_and_hold"},
-            resolved_config_json={"qty_policy_ref": "fixed_1"},
+            resolved_config_json={
+                "strategy_params": {
+                    "fast_period": 2,
+                    "slow_period": 5,
+                    "qty_policy_ref": "fixed_1",
+                },
+                "execution_constraints": {
+                    "leverage": 2.0,
+                },
+            },
             resolved_config_uri="memory://resolved-config.json",
             benchmark_config_uri="memory://benchmark-config.json",
             run_manifest_uri="memory://run-manifest.json",
