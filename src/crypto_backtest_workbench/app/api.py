@@ -157,6 +157,21 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_error_json(exc)
 
+    def do_DELETE(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+        try:
+            if path.startswith("/api/datasets/"):
+                snapshot_id = unquote(path.removeprefix("/api/datasets/"))
+                self._send_json(HTTPStatus.OK, self._handle_delete_dataset(snapshot_id))
+                return
+            if path.startswith("/api/runs/"):
+                run_id = unquote(path.removeprefix("/api/runs/"))
+                self._send_json(HTTPStatus.OK, self._handle_delete_run(run_id))
+                return
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": {"message": f"Unknown endpoint: {path}"}})
+        except Exception as exc:
+            self._send_error_json(exc)
+
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         return
 
@@ -263,6 +278,22 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_delete_run(self, run_id: str) -> dict[str, object]:
+        run_repository = FileRunRepository(self.server.data_dir)
+        run_repository.delete_run(run_id)
+        return {
+            "run_id": run_id,
+            "deleted": True,
+        }
+
+    def _handle_delete_dataset(self, snapshot_id: str) -> dict[str, object]:
+        dataset_repository = FileDatasetRepository(self.server.data_dir)
+        dataset_repository.delete_snapshot(snapshot_id)
+        return {
+            "dataset_snapshot_id": snapshot_id,
+            "deleted": True,
+        }
+
     def _read_json_body(self) -> dict[str, object]:
         content_length = int(self.headers.get("Content-Length", "0"))
         if content_length <= 0:
@@ -283,7 +314,12 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_error_json(self, exc: Exception) -> None:
-        status = HTTPStatus.BAD_REQUEST if isinstance(exc, (ValueError, FileNotFoundError, KeyError)) else HTTPStatus.INTERNAL_SERVER_ERROR
+        if isinstance(exc, FileNotFoundError):
+            status = HTTPStatus.NOT_FOUND
+        elif isinstance(exc, (ValueError, KeyError)):
+            status = HTTPStatus.BAD_REQUEST
+        else:
+            status = HTTPStatus.INTERNAL_SERVER_ERROR
         self._send_json(
             status,
             {
@@ -329,7 +365,7 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
     def _write_cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", self.server.cors_origin)
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 
 
 def create_api_server(
@@ -368,6 +404,7 @@ def serve_api(
         data_dir=data_dir,
         cors_origin=cors_origin,
     )
+    _print_startup_banner(server=server, mode="api")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -406,6 +443,7 @@ def serve_ui(
         cors_origin=cors_origin,
         frontend_dist_dir=frontend_dist_path,
     )
+    _print_startup_banner(server=server, mode="ui")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -435,6 +473,21 @@ def _load_snapshot(data_dir: Path, snapshot_id: str) -> DatasetSnapshot:
         data_source=payload["data_source"],
         price_type=PriceType(payload.get("price_type", PriceType.LAST.value)),
     )
+
+
+def _print_startup_banner(*, server: WorkspaceApiServer, mode: str) -> None:
+    host = str(server.server_address[0])
+    port = int(server.server_address[1])
+    base_url = f"http://{host}:{port}"
+    print("=== CBW STARTED ===")
+    print(f"status: 启动成功")
+    print(f"mode: {mode}")
+    print(f"url: {base_url}")
+    print(f"health: {base_url}/api/health")
+    if mode == "ui":
+        print(f"ui: {base_url}/")
+    print(f"data_dir: {server.data_dir}")
+    print(f"repository_root: {server.repository_root}")
 
 
 def _build_validation_split(

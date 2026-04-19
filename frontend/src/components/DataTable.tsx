@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react';
-import { Empty, Pagination, Select, Space, Typography } from 'antd';
+import { Button, Empty, Pagination, Select, Space, Typography } from 'antd';
 import {
   flexRender,
   getCoreRowModel,
   getPaginationRowModel,
+  getSortedRowModel,
   useReactTable,
   type ColumnDef,
   type PaginationState,
+  type SortingState,
 } from '@tanstack/react-table';
 
 const { Text } = Typography;
@@ -16,6 +18,7 @@ interface DataTableProps<T extends object> {
   data: T[];
   initialPageSize?: number;
   pageSizeOptions?: number[];
+  initialSorting?: SortingState;
 }
 
 export function DataTable<T extends object>({
@@ -23,19 +26,23 @@ export function DataTable<T extends object>({
   data,
   initialPageSize = 10,
   pageSizeOptions = [10, 20, 50],
+  initialSorting = [],
 }: DataTableProps<T>) {
   const [pagination, setPagination] = useState<PaginationState>({
     pageIndex: 0,
     pageSize: initialPageSize,
   });
+  const [sorting, setSorting] = useState<SortingState>(initialSorting);
 
   const table = useReactTable({
     data,
     columns,
-    state: { pagination },
+    state: { pagination, sorting },
     onPaginationChange: setPagination,
+    onSortingChange: setSorting,
     getCoreRowModel: getCoreRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
+    getSortedRowModel: getSortedRowModel(),
   });
 
   useEffect(() => {
@@ -58,7 +65,27 @@ export function DataTable<T extends object>({
               <tr key={headerGroup.id}>
                 {headerGroup.headers.map((header) => (
                   <th key={header.id}>
-                    {header.isPlaceholder ? null : flexRender(header.column.columnDef.header, header.getContext())}
+                    {header.isPlaceholder ? null : (
+                      <div className="cbw-th-content">
+                        <span>{flexRender(header.column.columnDef.header, header.getContext())}</span>
+                        {header.column.getCanSort() ? (
+                          <span className="cbw-th-sorter">
+                            <Button
+                              type="text"
+                              size="small"
+                              className={header.column.getIsSorted() ? 'is-active' : ''}
+                              onClick={() => header.column.toggleSorting(header.column.getIsSorted() === 'asc')}
+                            >
+                              {header.column.getIsSorted() === 'asc'
+                                ? '↑'
+                                : header.column.getIsSorted() === 'desc'
+                                  ? '↓'
+                                  : '↕'}
+                            </Button>
+                          </span>
+                        ) : null}
+                      </div>
+                    )}
                   </th>
                 ))}
               </tr>

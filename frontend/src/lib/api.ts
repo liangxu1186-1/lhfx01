@@ -127,3 +127,17 @@ export async function postRunEma(payload: Record<string, unknown>): Promise<Reco
   });
   return parseResponse<Record<string, unknown>>(response);
 }
+
+export async function deleteRun(runId: string): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl(`/api/runs/${encodeURIComponent(runId)}`), {
+    method: 'DELETE',
+  });
+  return parseResponse<Record<string, unknown>>(response);
+}
+
+export async function deleteDataset(snapshotId: string): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl(`/api/datasets/${encodeURIComponent(snapshotId)}`), {
+    method: 'DELETE',
+  });
+  return parseResponse<Record<string, unknown>>(response);
+}

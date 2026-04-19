@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
 from dataclasses import asdict
 from pathlib import Path
 from typing import Protocol
@@ -22,6 +23,9 @@ class DatasetRepository(Protocol):
 
     def save_integrity_report(self, report: DataIntegrityReport) -> Path:
         """Persist data integrity report."""
+
+    def delete_snapshot(self, snapshot_id: str) -> None:
+        """Delete a persisted dataset snapshot and all associated artifacts."""
 
 
 class FileDatasetRepository:
@@ -95,6 +99,12 @@ class FileDatasetRepository:
         )
         return path
 
+    def delete_snapshot(self, snapshot_id: str) -> None:
+        directory = self._snapshot_dir(snapshot_id)
+        if not directory.exists():
+            raise FileNotFoundError(f"Dataset snapshot not found: {snapshot_id}")
+        shutil.rmtree(directory)
+
 
 def _json_ready(value: object) -> object:
     if isinstance(value, dict):
@@ -108,4 +118,3 @@ def _json_ready(value: object) -> object:
     if hasattr(value, "value"):
         return getattr(value, "value")
     return value
-

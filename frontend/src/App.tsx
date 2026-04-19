@@ -13,6 +13,8 @@ import {
   Input,
   InputNumber,
   Layout,
+  Modal,
+  Popconfirm,
   Row,
   Segmented,
   Select,
@@ -25,7 +27,7 @@ import {
 } from 'antd';
 import { DataTable } from './components/DataTable';
 import { LazyPlot } from './components/LazyPlot';
-import { loadDatasets, loadOverview, loadParameters, loadRunDetail, loadRuns, postIngest, postRunEma } from './lib/api';
+import { deleteDataset, deleteRun, loadDatasets, loadOverview, loadParameters, loadRunDetail, loadRuns, postIngest, postRunEma } from './lib/api';
 import { formatDateRange, formatDateTime, formatNumber, formatPct, shortRunId } from './lib/format';
 import type {
   DatasetSnapshotView,
@@ -58,12 +60,46 @@ const TAB_OPTIONS = [
   { label: '参数实验', value: 'parameters' },
 ] satisfies Array<{ label: string; value: TabId }>;
 
+const ANALYSIS_FIELD_LABELS: Record<string, string> = {
+  strategy_version: '策略版本',
+  execution_policy_id: '执行策略',
+  metric_policy_id: '指标策略',
+  feature_artifact_id: '特征产物',
+  fast_period: '快线周期',
+  slow_period: '慢线周期',
+  input_price_field: '输入价格字段',
+  qty_policy_ref: '仓位策略标识',
+  feature_version: '特征版本',
+  name: '策略名称',
+  version: '策略版本号',
+  initial_cash: '初始资金',
+  leverage: '杠杆倍数',
+  fee_rate: '手续费率',
+  slippage_bps: '滑点基点',
+  min_notional: '最小名义价值',
+  qty_by_policy: '按策略下单数量',
+};
+
 function isTabId(value: string | null): value is TabId {
   return value === 'execution' || value === 'overview' || value === 'analysis' || value === 'parameters';
 }
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))];
+}
+
+function labelAnalysisField(key: string): string {
+  return ANALYSIS_FIELD_LABELS[key] ?? key;
+}
+
+function formatAnalysisFieldValue(value: unknown): string {
+  if (typeof value === 'number') {
+    return Number.isInteger(value) ? String(value) : formatNumber(value);
+  }
+  if (typeof value === 'object' && value !== null) {
+    return JSON.stringify(value);
+  }
+  return String(value);
 }
 
 function readUrlState(): UrlState {
@@ -123,6 +159,8 @@ function WorkspaceShell() {
   const [parameterQuery, setParameterQuery] = useState(initialState.parameterQuery);
   const [lastActionResult, setLastActionResult] = useState('');
   const [submitting, setSubmitting] = useState<'ingest' | 'run' | null>(null);
+  const [deletingDatasetId, setDeletingDatasetId] = useState<string | null>(null);
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
   const [ingestForm] = Form.useForm();
   const [runForm] = Form.useForm();
   const deferredOverviewQuery = useDeferredValue(overviewQuery);
@@ -332,6 +370,43 @@ function WorkspaceShell() {
     }
   }
 
+  async function handleDeleteRun(runId: string) {
+    setDeletingRunId(runId);
+    try {
+      await deleteRun(runId);
+      setLastActionResult(`已删除回测：${runId}`);
+      message.success(`已删除回测：${runId}`);
+      if (selectedRunId === runId) {
+        setSelectedRunId('');
+      }
+      invalidateDerivedData();
+      await refreshShell();
+      setActiveTab('overview');
+    } catch (submitError: unknown) {
+      const text = submitError instanceof Error ? submitError.message : '删除回测失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setDeletingRunId(null);
+    }
+  }
+
+  async function handleDeleteDataset(snapshotId: string) {
+    setDeletingDatasetId(snapshotId);
+    try {
+      await deleteDataset(snapshotId);
+      setLastActionResult(`已删除数据集：${snapshotId}`);
+      message.success(`已删除数据集：${snapshotId}`);
+      await refreshShell();
+    } catch (submitError: unknown) {
+      const text = submitError instanceof Error ? submitError.message : '删除数据集失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setDeletingDatasetId(null);
+    }
+  }
+
   const filteredSummaries = useMemo(() => {
     const rows = overview?.summaries ?? [];
     const query = deferredOverviewQuery.trim().toLowerCase();
@@ -406,8 +481,11 @@ function WorkspaceShell() {
               ingestForm={ingestForm}
               runForm={runForm}
               submitting={submitting}
+              deletingDatasetId={deletingDatasetId}
+              deletingRunId={deletingRunId}
               onIngest={handleIngest}
               onRun={handleRun}
+              onDeleteDataset={handleDeleteDataset}
             />
           )}
           {activeTab === 'overview' && overview && (
@@ -419,6 +497,8 @@ function WorkspaceShell() {
               overviewQuery={overviewQuery}
               setOverviewQuery={setOverviewQuery}
               overviewStats={overviewStats}
+              deletingRunId={deletingRunId}
+              onDeleteRun={handleDeleteRun}
             />
           )}
           {activeTab === 'analysis' && (
@@ -427,6 +507,8 @@ function WorkspaceShell() {
               selectedRun={selectedRun}
               selectedRunId={selectedRunId}
               setSelectedRunId={setSelectedRunId}
+              deletingRunId={deletingRunId}
+              onDeleteRun={handleDeleteRun}
             />
           )}
           {activeTab === 'parameters' && parameterLab && (
@@ -449,16 +531,174 @@ function ExecutionView({
   ingestForm,
   runForm,
   submitting,
+  deletingDatasetId,
+  deletingRunId,
   onIngest,
   onRun,
+  onDeleteDataset,
 }: {
   datasets: DatasetSnapshotView[];
   ingestForm: ReturnType<typeof Form.useForm>[0];
   runForm: ReturnType<typeof Form.useForm>[0];
   submitting: 'ingest' | 'run' | null;
+  deletingDatasetId: string | null;
+  deletingRunId: string | null;
   onIngest: (values: Record<string, unknown>) => Promise<void>;
   onRun: (values: Record<string, unknown>) => Promise<void>;
+  onDeleteDataset: (snapshotId: string) => Promise<void>;
 }) {
+  const selectedSnapshotId = Form.useWatch('snapshot_id', runForm) as string | undefined;
+  const selectedRunTimeframe = Form.useWatch('timeframe', runForm) as string | undefined;
+  const [isDatasetModalOpen, setIsDatasetModalOpen] = useState(false);
+  const [datasetTimeframeFilter, setDatasetTimeframeFilter] = useState<string>('all');
+  const [datasetExchangeFilter, setDatasetExchangeFilter] = useState<string>('all');
+  const [datasetQuery, setDatasetQuery] = useState('');
+  const timeframeOptions = useMemo(
+    () => [...new Set(datasets.map((snapshot) => snapshot.timeframe))]
+      .filter(Boolean)
+      .sort((left, right) => left.localeCompare(right, 'en', { numeric: true }))
+      .map((timeframe) => ({
+        label: timeframe.toUpperCase(),
+        value: timeframe,
+      })),
+    [datasets],
+  );
+  const filteredDatasets = useMemo(
+    () => selectedRunTimeframe
+      ? datasets.filter((snapshot) => snapshot.timeframe === selectedRunTimeframe)
+      : datasets,
+    [datasets, selectedRunTimeframe],
+  );
+  const datasetById = useMemo(
+    () => new Map(datasets.map((snapshot) => [snapshot.dataset_snapshot_id, snapshot] as const)),
+    [datasets],
+  );
+  const datasetTableTimeframeOptions = useMemo(
+    () => timeframeOptions.map((option) => ({ label: option.label, value: option.value })),
+    [timeframeOptions],
+  );
+  const datasetExchangeOptions = useMemo(
+    () => [...new Set(datasets.map((snapshot) => snapshot.exchange))]
+      .filter(Boolean)
+      .sort((left, right) => left.localeCompare(right, 'en'))
+      .map((exchange) => ({
+        label: exchange,
+        value: exchange,
+      })),
+    [datasets],
+  );
+  const filteredDatasetRows = useMemo(() => {
+    const query = datasetQuery.trim().toLowerCase();
+    return datasets.filter((snapshot) => {
+      if (datasetTimeframeFilter !== 'all' && snapshot.timeframe !== datasetTimeframeFilter) {
+        return false;
+      }
+      if (datasetExchangeFilter !== 'all' && snapshot.exchange !== datasetExchangeFilter) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      return [
+        snapshot.dataset_snapshot_id,
+        snapshot.symbol,
+        snapshot.exchange,
+        snapshot.timeframe,
+      ].join(' ').toLowerCase().includes(query);
+    });
+  }, [datasetExchangeFilter, datasetQuery, datasetTimeframeFilter, datasets]);
+  const datasetColumns = useMemo<ColumnDef<DatasetSnapshotView>[]>(() => [
+    {
+      header: '数据集',
+      accessorKey: 'dataset_snapshot_id',
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Text strong>{row.original.dataset_snapshot_id}</Text>
+          <Text type="secondary">{row.original.symbol}</Text>
+        </Space>
+      ),
+    },
+    { header: '交易所', accessorKey: 'exchange' },
+    {
+      id: 'timeframe',
+      header: '周期',
+      accessorFn: (row) => row.timeframe,
+      cell: ({ row }) => row.original.timeframe.toUpperCase(),
+    },
+    {
+      id: 'time_range_start',
+      header: '时间范围',
+      accessorFn: (row) => row.time_range_start,
+      cell: ({ row }) => formatDateRange(row.original.time_range_start, row.original.time_range_end),
+    },
+    {
+      id: 'row_count',
+      header: 'K线数',
+      accessorFn: (row) => row.row_count,
+      cell: ({ row }) => formatNumber(row.original.row_count, 0),
+    },
+    {
+      id: 'created_at',
+      header: '导入时间',
+      accessorFn: (row) => row.created_at,
+      cell: ({ row }) => formatDateTime(row.original.created_at),
+    },
+    {
+      id: 'actions',
+      header: '操作',
+      enableSorting: false,
+      cell: ({ row }) => (
+        <Popconfirm
+          title="删除这个数据集？"
+          description={(
+            <>
+              <div>{row.original.dataset_snapshot_id}</div>
+              <div>已有回测结果不会被删除。</div>
+            </>
+          )}
+          okText="删除"
+          cancelText="取消"
+          okButtonProps={{ danger: true, loading: deletingDatasetId === row.original.dataset_snapshot_id }}
+          onConfirm={() => onDeleteDataset(row.original.dataset_snapshot_id)}
+        >
+          <Button type="link" danger size="small">删除</Button>
+        </Popconfirm>
+      ),
+    },
+  ], [deletingDatasetId, onDeleteDataset]);
+
+  useEffect(() => {
+    if (!selectedRunTimeframe && datasets[0]?.timeframe) {
+      runForm.setFieldValue('timeframe', datasets[0].timeframe);
+    }
+  }, [datasets, runForm, selectedRunTimeframe]);
+
+  useEffect(() => {
+    if (!filteredDatasets.length) {
+      if (selectedSnapshotId) {
+        runForm.setFieldValue('snapshot_id', undefined);
+      }
+      return;
+    }
+    if (!selectedSnapshotId || !filteredDatasets.some((snapshot) => snapshot.dataset_snapshot_id === selectedSnapshotId)) {
+      runForm.setFieldValue('snapshot_id', filteredDatasets[0].dataset_snapshot_id);
+    }
+  }, [filteredDatasets, runForm, selectedSnapshotId]);
+
+  function handleRunTimeframeChange(value: string) {
+    runForm.setFieldValue('timeframe', value);
+    const nextSnapshot = datasets.find((snapshot) => snapshot.timeframe === value);
+    runForm.setFieldValue('snapshot_id', nextSnapshot?.dataset_snapshot_id);
+  }
+
+  function handleRunSnapshotChange(value: string) {
+    runForm.setFieldValue('snapshot_id', value);
+    const selectedSnapshot = datasetById.get(value);
+    if (selectedSnapshot && selectedSnapshot.timeframe !== selectedRunTimeframe) {
+      runForm.setFieldValue('timeframe', selectedSnapshot.timeframe);
+    }
+  }
+
   return (
     <Row gutter={[16, 16]}>
       <Col xs={24} xl={12}>
@@ -536,6 +776,7 @@ function ExecutionView({
             layout="vertical"
             initialValues={{
               run_id: `run-${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}`,
+              timeframe: datasets[0]?.timeframe,
               fast_period: 2,
               slow_period: 3,
               qty_policy_ref: 'fixed_1',
@@ -548,15 +789,32 @@ function ExecutionView({
             }}
             onFinish={(values) => void onRun(values as Record<string, unknown>)}
           >
-            <Form.Item name="snapshot_id" label="数据快照" rules={[{ required: true }]}>
-              <Select
-                showSearch
-                options={datasets.map((snapshot) => ({
-                  label: `${snapshot.dataset_snapshot_id} · ${snapshot.symbol}`,
-                  value: snapshot.dataset_snapshot_id,
-                }))}
-              />
-            </Form.Item>
+            <Row gutter={12}>
+              <Col span={8}>
+                <Form.Item name="timeframe" label="周期" rules={[{ required: true }]}>
+                  <Select
+                    options={timeframeOptions}
+                    placeholder="选择周期"
+                    onChange={handleRunTimeframeChange}
+                  />
+                </Form.Item>
+              </Col>
+              <Col span={16}>
+                <Form.Item name="snapshot_id" label="数据快照" rules={[{ required: true }]}>
+                  <Select
+                    showSearch
+                    placeholder={filteredDatasets.length ? '选择数据快照' : '该周期下暂无数据快照'}
+                    notFoundContent="该周期下暂无数据快照"
+                    options={filteredDatasets.map((snapshot) => ({
+                      label: `${snapshot.dataset_snapshot_id} · ${snapshot.symbol} · ${snapshot.timeframe.toUpperCase()}`,
+                      value: snapshot.dataset_snapshot_id,
+                    }))}
+                    optionFilterProp="label"
+                    onChange={handleRunSnapshotChange}
+                  />
+                </Form.Item>
+              </Col>
+            </Row>
             <Form.Item name="run_id" label="运行 ID" rules={[{ required: true }]}>
               <Input />
             </Form.Item>
@@ -617,14 +875,26 @@ function ExecutionView({
       </Col>
 
       <Col span={24}>
-        <Card title="当前已入库数据集">
+        <Card
+          title="当前已入库数据集"
+          extra={(
+            <Space>
+              {deletingRunId ? <Text type="secondary">正在删除回测…</Text> : null}
+              {deletingDatasetId ? <Text type="secondary">正在删除数据集…</Text> : null}
+              <Button onClick={() => setIsDatasetModalOpen(true)}>管理数据集</Button>
+            </Space>
+          )}
+        >
+          <Paragraph type="secondary">
+            默认展示最近导入的数据集摘要。完整数据集清单、分页筛选和删除入口放在“管理数据集”弹框里。
+          </Paragraph>
           <Row gutter={[16, 16]}>
-            {datasets.map((snapshot) => (
+            {datasets.slice(0, 6).map((snapshot) => (
               <Col xs={24} md={12} xxl={8} key={snapshot.dataset_snapshot_id}>
                 <Card size="small">
                   <Space direction="vertical" size={4}>
                     <Text strong>{snapshot.symbol}</Text>
-                    <Text type="secondary">{snapshot.dataset_snapshot_id}</Text>
+                    <Text type="secondary">{`${snapshot.dataset_snapshot_id} · ${snapshot.timeframe.toUpperCase()}`}</Text>
                     <Text type="secondary">{formatDateRange(snapshot.time_range_start, snapshot.time_range_end)}</Text>
                   </Space>
                 </Card>
@@ -633,6 +903,53 @@ function ExecutionView({
           </Row>
         </Card>
       </Col>
+
+      <Modal
+        title="数据集管理"
+        open={isDatasetModalOpen}
+        onCancel={() => setIsDatasetModalOpen(false)}
+        footer={null}
+        width={1120}
+      >
+        <Space direction="vertical" size={16} style={{ width: '100%' }}>
+          <Paragraph type="secondary" style={{ marginBottom: 0 }}>
+            共 {datasets.length} 个已导入数据集。这里适合集中做分页浏览、筛选和删除，避免把执行台主布局撑乱。
+          </Paragraph>
+          <Space wrap size={12}>
+            <Select
+              value={datasetTimeframeFilter}
+              style={{ width: 140 }}
+              onChange={setDatasetTimeframeFilter}
+              options={[
+                { label: '全部周期', value: 'all' },
+                ...datasetTableTimeframeOptions,
+              ]}
+            />
+            <Select
+              value={datasetExchangeFilter}
+              style={{ width: 160 }}
+              onChange={setDatasetExchangeFilter}
+              options={[
+                { label: '全部交易所', value: 'all' },
+                ...datasetExchangeOptions,
+              ]}
+            />
+            <Input
+              value={datasetQuery}
+              onChange={(event) => setDatasetQuery(event.target.value)}
+              placeholder="搜索快照ID / 标的 / 交易所 / 周期"
+              style={{ width: 260 }}
+            />
+          </Space>
+          <DataTable
+            columns={datasetColumns}
+            data={filteredDatasetRows}
+            initialPageSize={8}
+            pageSizeOptions={[8, 16, 32, 50]}
+            initialSorting={[{ id: 'created_at', desc: true }]}
+          />
+        </Space>
+      </Modal>
     </Row>
   );
 }
@@ -645,6 +962,8 @@ function OverviewView({
   overviewQuery,
   setOverviewQuery,
   overviewStats,
+  deletingRunId,
+  onDeleteRun,
 }: {
   overview: WorkspaceOverview;
   filteredSummaries: RunSummaryView[];
@@ -653,6 +972,8 @@ function OverviewView({
   overviewQuery: string;
   setOverviewQuery: (value: string) => void;
   overviewStats: Array<{ title: string; value: string }>;
+  deletingRunId: string | null;
+  onDeleteRun: (runId: string) => Promise<void>;
 }) {
   const columns = useMemo<ColumnDef<RunSummaryView>[]>(() => [
     {
@@ -671,10 +992,28 @@ function OverviewView({
     { header: '基准', cell: ({ row }) => formatPct(row.original.benchmark_return) },
     { header: '交易', accessorKey: 'trade_count' },
     { header: '告警', accessorKey: 'warning_count' },
+    {
+      id: 'actions',
+      header: '操作',
+      enableSorting: false,
+      cell: ({ row }) => (
+        <Popconfirm
+          title="删除这个回测？"
+          description={`run_id: ${row.original.run_id}`}
+          okText="删除"
+          cancelText="取消"
+          okButtonProps={{ danger: true, loading: deletingRunId === row.original.run_id }}
+          onConfirm={() => onDeleteRun(row.original.run_id)}
+        >
+          <Button type="link" danger size="small">删除</Button>
+        </Popconfirm>
+      ),
+    },
   ], []);
 
   const plotRows = overview.multi_run_equity;
   const chartOptions = filteredSummaries.length ? filteredSummaries : overview.summaries;
+  const summaryByRunId = new Map(overview.summaries.map((summary) => [summary.run_id, summary] as const));
   const plotSeries = compareRunIds.map((runId) => ({
     x: plotRows.map((row) => row.timestamp),
     y: plotRows.map((row) => {
@@ -683,7 +1022,10 @@ function OverviewView({
     }),
     type: 'scatter',
     mode: 'lines',
-    name: shortRunId(runId),
+    name: `${shortRunId(runId)} · ${summaryByRunId.get(runId)?.symbol ?? '未知标的'}`,
+    line: {
+      width: 2.5,
+    },
   }));
 
   return (
@@ -725,7 +1067,10 @@ function OverviewView({
               margin: { l: 40, r: 20, t: 20, b: 40 },
               paper_bgcolor: '#ffffff',
               plot_bgcolor: '#ffffff',
-              legend: { orientation: 'h' },
+              hovermode: 'x unified',
+              xaxis: { title: '时间（UTC）' },
+              yaxis: { title: '权益' },
+              legend: { orientation: 'h', title: { text: '每条线代表一个 run 的策略权益' } },
             } as never}
             config={{ displayModeBar: false, responsive: true }}
             style={{ width: '100%' }}
@@ -748,15 +1093,25 @@ function AnalysisView({
   selectedRun,
   selectedRunId,
   setSelectedRunId,
+  deletingRunId,
+  onDeleteRun,
 }: {
   runs: RunSummaryView[];
   selectedRun: RunAnalysisView | null;
   selectedRunId: string;
   setSelectedRunId: (value: string) => void;
+  deletingRunId: string | null;
+  onDeleteRun: (runId: string) => Promise<void>;
 }) {
+  const [tradeSideFilter, setTradeSideFilter] = useState<string>('all');
+  const [tradeOutcomeFilter, setTradeOutcomeFilter] = useState<'all' | 'win' | 'loss' | 'open'>('all');
+  const [tradeReasonQuery, setTradeReasonQuery] = useState('');
+
   const tradeColumns = useMemo<ColumnDef<RunAnalysisView['trade_rows'][number]>[]>(() => [
     {
+      id: 'trade_id',
       header: '交易',
+      enableSorting: false,
       cell: ({ row }) => (
         <Space direction="vertical" size={0}>
           <Text strong>{shortRunId(row.original.trade_id)}</Text>
@@ -765,16 +1120,16 @@ function AnalysisView({
       ),
     },
     { header: '方向', accessorKey: 'side' },
-    { header: '开仓', cell: ({ row }) => formatDateTime(row.original.entry_time) },
-    { header: '平仓', cell: ({ row }) => row.original.exit_time ? formatDateTime(row.original.exit_time) : '--' },
-    { header: '开仓价', cell: ({ row }) => formatNumber(row.original.entry_price) },
-    { header: '平仓价', cell: ({ row }) => row.original.exit_price === null ? '--' : formatNumber(row.original.exit_price) },
-    { header: '数量', cell: ({ row }) => formatNumber(row.original.qty) },
-    { header: '净收益', cell: ({ row }) => formatNumber(row.original.net_pnl) },
-    { header: '收益率', cell: ({ row }) => formatPct(row.original.return_pct) },
-    { header: '持仓K线', cell: ({ row }) => row.original.holding_bars },
-    { header: '开仓原因', cell: ({ row }) => row.original.entry_reason || '--' },
-    { header: '平仓原因', cell: ({ row }) => row.original.exit_reason || '--' },
+    { id: 'entry_time', header: '开仓', accessorFn: (row) => row.entry_time, cell: ({ row }) => formatDateTime(row.original.entry_time) },
+    { id: 'exit_time', header: '平仓', accessorFn: (row) => row.exit_time ?? '', cell: ({ row }) => row.original.exit_time ? formatDateTime(row.original.exit_time) : '--' },
+    { id: 'entry_price', header: '开仓价', accessorFn: (row) => row.entry_price, cell: ({ row }) => formatNumber(row.original.entry_price) },
+    { id: 'exit_price', header: '平仓价', accessorFn: (row) => row.exit_price ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.exit_price === null ? '--' : formatNumber(row.original.exit_price) },
+    { id: 'qty', header: '数量', accessorFn: (row) => row.qty, cell: ({ row }) => formatNumber(row.original.qty) },
+    { id: 'net_pnl', header: '净收益', accessorFn: (row) => row.net_pnl, cell: ({ row }) => formatNumber(row.original.net_pnl) },
+    { id: 'return_pct', header: '收益率', accessorFn: (row) => row.return_pct, cell: ({ row }) => formatPct(row.original.return_pct) },
+    { id: 'holding_bars', header: '持仓K线', accessorFn: (row) => row.holding_bars, cell: ({ row }) => row.original.holding_bars },
+    { id: 'entry_reason', header: '开仓原因', accessorFn: (row) => row.entry_reason || '', cell: ({ row }) => row.original.entry_reason || '--' },
+    { id: 'exit_reason', header: '平仓原因', accessorFn: (row) => row.exit_reason || '', cell: ({ row }) => row.original.exit_reason || '--' },
   ], []);
 
   const warningColumns = useMemo<ColumnDef<RunAnalysisView['warning_rows'][number]>[]>(() => [
@@ -783,6 +1138,32 @@ function AnalysisView({
     { header: '代码', accessorKey: 'warning_code' },
     { header: '消息', accessorKey: 'message' },
   ], []);
+
+  const tradeRows = selectedRun?.trade_rows ?? [];
+  const tradeSideOptions = Array.from(new Set(tradeRows.map((row) => row.side))).sort();
+  const filteredTradeRows = useMemo(
+    () => tradeRows
+      .filter((row) => {
+        if (tradeSideFilter !== 'all' && row.side !== tradeSideFilter) {
+          return false;
+        }
+        if (tradeOutcomeFilter === 'win' && row.net_pnl <= 0) {
+          return false;
+        }
+        if (tradeOutcomeFilter === 'loss' && row.net_pnl >= 0) {
+          return false;
+        }
+        if (tradeOutcomeFilter === 'open' && row.exit_time !== null) {
+          return false;
+        }
+        const query = tradeReasonQuery.trim().toLowerCase();
+        if (!query) {
+          return true;
+        }
+        return [row.trade_id, row.entry_reason, row.exit_reason, row.symbol].join(' ').toLowerCase().includes(query);
+      }),
+    [tradeRows, tradeOutcomeFilter, tradeReasonQuery, tradeSideFilter],
+  );
 
   if (!runs.length) {
     return <Alert type="info" showIcon message="当前没有可分析的 run" />;
@@ -801,15 +1182,27 @@ function AnalysisView({
         <Card
           title="单次分析"
           extra={(
-            <Select
-              value={selectedRunId}
-              style={{ minWidth: 360 }}
-              onChange={setSelectedRunId}
-              options={runs.map((run) => ({
-                label: `${shortRunId(run.run_id)} · ${run.symbol}`,
-                value: run.run_id,
-              }))}
-            />
+            <Space wrap>
+              <Select
+                value={selectedRunId}
+                style={{ minWidth: 360 }}
+                onChange={setSelectedRunId}
+                options={runs.map((run) => ({
+                  label: `${shortRunId(run.run_id)} · ${run.symbol}`,
+                  value: run.run_id,
+                }))}
+              />
+              <Popconfirm
+                title="删除当前回测？"
+                description={`run_id: ${selectedRun.run_id}`}
+                okText="删除"
+                cancelText="取消"
+                okButtonProps={{ danger: true, loading: deletingRunId === selectedRun.run_id }}
+                onConfirm={() => onDeleteRun(selectedRun.run_id)}
+              >
+                <Button danger>删除当前回测</Button>
+              </Popconfirm>
+            </Space>
           )}
         >
           <Row gutter={[16, 16]}>
@@ -822,7 +1215,10 @@ function AnalysisView({
       </Col>
 
       <Col span={24}>
-        <Card title="权益曲线">
+        <Card title="资金曲线">
+          <Paragraph type="secondary">
+            仅展示当前策略账户权益随时间的变化，便于单次 run 的资金演进查看。
+          </Paragraph>
           <LazyPlot
             data={[
               {
@@ -830,16 +1226,9 @@ function AnalysisView({
                 y: selectedRun.equity_rows.map((row) => row.strategy_equity),
                 type: 'scatter',
                 mode: 'lines',
-                name: 'Strategy',
+                name: '资金曲线',
+                line: { color: '#1677ff', width: 3.5 },
               },
-              ...(selectedRun.benchmark ? [{
-                x: selectedRun.equity_rows.map((row) => row.timestamp),
-                y: selectedRun.equity_rows.map((row) => row.benchmark_equity),
-                type: 'scatter',
-                mode: 'lines',
-                name: 'Benchmark',
-                line: { dash: 'dash' },
-              }] : []),
             ] as never}
             layout={{
               autosize: true,
@@ -847,6 +1236,14 @@ function AnalysisView({
               margin: { l: 40, r: 20, t: 20, b: 40 },
               paper_bgcolor: '#ffffff',
               plot_bgcolor: '#ffffff',
+              hovermode: 'x unified',
+              xaxis: { title: '时间（UTC）' },
+              yaxis: { title: '资金' },
+              legend: {
+                orientation: 'h',
+                y: 1.12,
+                title: { text: '图例' },
+              },
             } as never}
             config={{ displayModeBar: false, responsive: true }}
             style={{ width: '100%' }}
@@ -858,10 +1255,10 @@ function AnalysisView({
       <Col xs={24} xl={12}>
         <Card title="运行上下文">
           <Descriptions column={1} size="small">
-            <Descriptions.Item label="Strategy Version">{selectedRun.manifest.strategy_version}</Descriptions.Item>
-            <Descriptions.Item label="Execution Policy">{selectedRun.manifest.execution_policy_id}</Descriptions.Item>
-            <Descriptions.Item label="Metric Policy">{selectedRun.manifest.metric_policy_id}</Descriptions.Item>
-            <Descriptions.Item label="Feature Artifact">{selectedRun.manifest.feature_artifact_id}</Descriptions.Item>
+            <Descriptions.Item label="策略版本">{selectedRun.manifest.strategy_version}</Descriptions.Item>
+            <Descriptions.Item label="执行策略">{selectedRun.manifest.execution_policy_id}</Descriptions.Item>
+            <Descriptions.Item label="指标策略">{selectedRun.manifest.metric_policy_id}</Descriptions.Item>
+            <Descriptions.Item label="特征产物">{selectedRun.manifest.feature_artifact_id}</Descriptions.Item>
           </Descriptions>
         </Card>
       </Col>
@@ -870,18 +1267,63 @@ function AnalysisView({
         <Card title="策略参数与执行约束">
           <Descriptions column={1} size="small">
             {Object.entries(strategyParams ?? {}).map(([key, value]) => (
-              <Descriptions.Item key={key} label={key}>{String(value)}</Descriptions.Item>
+              <Descriptions.Item key={key} label={labelAnalysisField(key)}>
+                {formatAnalysisFieldValue(value)}
+              </Descriptions.Item>
             ))}
             {Object.entries(executionConstraints ?? {}).map(([key, value]) => (
-              <Descriptions.Item key={key} label={key}>{typeof value === 'object' ? JSON.stringify(value) : String(value)}</Descriptions.Item>
+              <Descriptions.Item key={key} label={labelAnalysisField(key)}>
+                {formatAnalysisFieldValue(value)}
+              </Descriptions.Item>
             ))}
           </Descriptions>
         </Card>
       </Col>
 
       <Col span={24}>
-        <Card title="交易记录">
-          <DataTable columns={tradeColumns} data={selectedRun.trade_rows} initialPageSize={12} pageSizeOptions={[12, 24, 50]} />
+        <Card
+          title="交易记录"
+          extra={(
+            <Space wrap size={12}>
+              <Select
+                value={tradeSideFilter}
+                style={{ width: 120 }}
+                onChange={setTradeSideFilter}
+                options={[
+                  { label: '全部方向', value: 'all' },
+                  ...tradeSideOptions.map((side) => ({ label: side, value: side })),
+                ]}
+              />
+              <Select
+                value={tradeOutcomeFilter}
+                style={{ width: 140 }}
+                onChange={setTradeOutcomeFilter}
+                options={[
+                  { label: '全部结果', value: 'all' },
+                  { label: '仅盈利', value: 'win' },
+                  { label: '仅亏损', value: 'loss' },
+                  { label: '未平仓', value: 'open' },
+                ]}
+              />
+              <Input
+                value={tradeReasonQuery}
+                onChange={(event) => setTradeReasonQuery(event.target.value)}
+                placeholder="搜索交易ID / 原因 / 标的"
+                style={{ width: 220 }}
+              />
+            </Space>
+          )}
+        >
+          <Paragraph type="secondary">
+            当前显示 {filteredTradeRows.length} / {selectedRun.trade_rows.length} 笔交易。可直接点击表头右侧上下按钮排序。
+          </Paragraph>
+          <DataTable
+            columns={tradeColumns}
+            data={filteredTradeRows}
+            initialPageSize={12}
+            pageSizeOptions={[12, 24, 50]}
+            initialSorting={[{ id: 'entry_time', desc: true }]}
+          />
         </Card>
       </Col>
 

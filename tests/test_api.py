@@ -127,6 +127,74 @@ def test_workspace_api_split_read_endpoints_return_expected_sections(tmp_path: P
     assert parameters_response["parameter_lab"]["rows"][0]["run_id"] == "run-api-003"
 
 
+def test_workspace_api_delete_run_removes_persisted_run(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-004")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        _request_json(
+            server,
+            "/api/run-ema",
+            payload={
+                "snapshot_id": "snapshot-api-004",
+                "run_id": "run-api-004",
+                "fast_period": 2,
+                "slow_period": 3,
+                "qty_policy_ref": "fixed_1",
+                "qty": 0.01,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.0,
+                "slippage_bps": 0.0,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+            },
+        )
+        delete_response = _request_json(server, "/api/runs/run-api-004", method="DELETE")
+        runs_response = _request_json(server, "/api/runs")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert delete_response["deleted"] is True
+    assert delete_response["run_id"] == "run-api-004"
+    assert runs_response["runs"] == []
+
+
+def test_workspace_api_delete_dataset_removes_snapshot(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-005")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        delete_response = _request_json(server, "/api/datasets/snapshot-api-005", method="DELETE")
+        datasets_response = _request_json(server, "/api/datasets")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert delete_response["deleted"] is True
+    assert delete_response["dataset_snapshot_id"] == "snapshot-api-005"
+    assert datasets_response["datasets"] == []
+
+
 def test_workspace_api_ingest_endpoint_delegates_to_workflow(monkeypatch, tmp_path: Path) -> None:
     recorded: dict[str, object] = {}
 
@@ -211,18 +279,44 @@ def test_ui_server_serves_react_index_and_api(tmp_path: Path) -> None:
     assert workspace_response["datasets"][0]["dataset_snapshot_id"] == "snapshot-ui-001"
 
 
-def _request_json(server: api.WorkspaceApiServer, path: str, payload: dict[str, object] | None = None):
+def test_print_startup_banner_emits_success_marker(capsys, tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    try:
+        api._print_startup_banner(server=server, mode="api")
+    finally:
+        server.server_close()
+
+    captured = capsys.readouterr()
+    assert "=== CBW STARTED ===" in captured.out
+    assert "status: 启动成功" in captured.out
+    assert "health:" in captured.out
+
+
+def _request_json(
+    server: api.WorkspaceApiServer,
+    path: str,
+    payload: dict[str, object] | None = None,
+    method: str | None = None,
+):
     url = f"http://127.0.0.1:{server.server_address[1]}{path}"
-    if payload is None:
+    resolved_method = method or ("POST" if payload is not None else "GET")
+    if payload is None and resolved_method == "GET":
         with request.urlopen(url, timeout=2) as response:
             return json.loads(response.read().decode("utf-8"))
 
-    body = json.dumps(payload).encode("utf-8")
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"} if payload is not None else {}
     http_request = request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        headers=headers,
+        method=resolved_method,
     )
     with request.urlopen(http_request, timeout=2) as response:
         return json.loads(response.read().decode("utf-8"))

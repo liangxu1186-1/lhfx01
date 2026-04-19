@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -59,6 +60,9 @@ class RunRepository(Protocol):
 
     def load_benchmark(self, run_id: str) -> BuyAndHoldBenchmarkOutput | None:
         """Load persisted benchmark output if present."""
+
+    def delete_run(self, run_id: str) -> None:
+        """Delete a persisted run and all associated artifacts."""
 
 
 class FileRunRepository:
@@ -372,6 +376,12 @@ class FileRunRepository:
             equity_points=tuple(equity_points),
             daily_returns=tuple(daily_returns),
         )
+
+    def delete_run(self, run_id: str) -> None:
+        directory = self._run_dir(run_id)
+        if not directory.exists():
+            raise FileNotFoundError(f"Run not found: {run_id}")
+        shutil.rmtree(directory)
 
     def _run_dir(self, run_id: str) -> Path:
         return self.base_dir / "runs" / run_id
