@@ -29,7 +29,7 @@ import {
 } from 'antd';
 import { DataTable } from './components/DataTable';
 import { LazyPlot } from './components/LazyPlot';
-import { deleteDataset, deleteRun, loadDatasets, loadOverview, loadParameterExperimentDetail, loadParameterExperiments, loadParameters, loadRunDetail, loadRuns, postIngest, postParameterExperiment, postRunEma } from './lib/api';
+import { deleteDataset, deleteRun, loadDatasets, loadParameterExperimentDetail, loadParameterExperiments, loadParameters, loadRunDetail, loadRuns, postIngest, postParameterExperiment, postRunEma } from './lib/api';
 import { formatDateRange, formatDateTime, formatNumber, formatPct, shortRunId } from './lib/format';
 import type {
   DatasetSnapshotView,
@@ -39,7 +39,6 @@ import type {
   RunAnalysisView,
   RunSummaryView,
   SensitivityRow,
-  WorkspaceOverview,
   WorkspaceParameterLab,
   WorkspaceSource,
 } from './types';
@@ -63,6 +62,8 @@ const TAB_OPTIONS = [
   { label: '单次分析', value: 'analysis' },
   { label: '参数实验', value: 'parameters' },
 ] satisfies Array<{ label: string; value: TabId }>;
+
+const ALL_EXPERIMENTS = '__all__';
 
 const ANALYSIS_FIELD_LABELS: Record<string, string> = {
   strategy_version: '策略版本',
@@ -143,6 +144,22 @@ function experimentStatusColor(status: string | undefined): string {
 
 function experimentSearchTypeLabel(searchType: string | undefined): string {
   return searchType === 'grid' ? '网格搜索' : '随机搜索';
+}
+
+function pickChartSamples<T>(rows: T[], maxPoints = 1200): T[] {
+  if (rows.length <= maxPoints) {
+    return rows;
+  }
+  const step = Math.ceil(rows.length / maxPoints);
+  const sampled: T[] = [];
+  for (let index = 0; index < rows.length; index += step) {
+    sampled.push(rows[index]);
+  }
+  const lastRow = rows[rows.length - 1];
+  if (sampled[sampled.length - 1] !== lastRow) {
+    sampled.push(lastRow);
+  }
+  return sampled;
 }
 
 function normalizeDateValue(value: unknown): string | undefined {
@@ -244,12 +261,12 @@ function WorkspaceShell() {
   const [generatedAt, setGeneratedAt] = useState<string | null>(null);
   const [datasets, setDatasets] = useState<DatasetSnapshotView[]>([]);
   const [runs, setRuns] = useState<RunSummaryView[]>([]);
-  const [overview, setOverview] = useState<WorkspaceOverview | null>(null);
   const [parameterLab, setParameterLab] = useState<WorkspaceParameterLab | null>(null);
   const [parameterExperiments, setParameterExperiments] = useState<ParameterExperimentSummary[]>([]);
-  const [selectedExperimentId, setSelectedExperimentId] = useState('');
+  const [selectedExperimentId, setSelectedExperimentId] = useState(ALL_EXPERIMENTS);
   const [selectedExperimentDetail, setSelectedExperimentDetail] = useState<ParameterExperimentDetail | null>(null);
   const [selectedRun, setSelectedRun] = useState<RunAnalysisView | null>(null);
+  const [runDetailCache, setRunDetailCache] = useState<Record<string, RunAnalysisView>>({});
   const [error, setError] = useState<string | null>(null);
   const [shellLoading, setShellLoading] = useState(true);
   const [sectionLoading, setSectionLoading] = useState(false);
@@ -275,12 +292,12 @@ function WorkspaceShell() {
   }
 
   function invalidateDerivedData() {
-    setOverview(null);
     setParameterLab(null);
     setParameterExperiments([]);
-    setSelectedExperimentId('');
+    setSelectedExperimentId(ALL_EXPERIMENTS);
     setSelectedExperimentDetail(null);
     setSelectedRun(null);
+    setRunDetailCache({});
   }
 
   async function refreshShell() {
@@ -345,33 +362,33 @@ function WorkspaceShell() {
   }, [runs, selectedRunId]);
 
   useEffect(() => {
-    if (!overview) {
+    if (!runs.length) {
       return;
     }
-    const availableRunIds = new Set(overview.summaries.map((entry) => entry.run_id));
+    const availableRunIds = new Set(runs.map((entry) => entry.run_id));
     const validRunIds = compareRunIds.filter((runId) => availableRunIds.has(runId));
-    if (!validRunIds.length && overview.summaries.length) {
-      setCompareRunIds(overview.summaries.slice(0, 3).map((entry) => entry.run_id));
+    if (!validRunIds.length && runs.length) {
+      setCompareRunIds(runs.slice(0, 3).map((entry) => entry.run_id));
       return;
     }
     if (validRunIds.length !== compareRunIds.length) {
       setCompareRunIds(validRunIds);
     }
-  }, [overview, compareRunIds]);
+  }, [compareRunIds, runs]);
 
   useEffect(() => {
     if (activeTab !== 'parameters') {
       return;
     }
     if (!parameterExperiments.length) {
-      if (selectedExperimentId) {
-        setSelectedExperimentId('');
+      if (selectedExperimentId !== ALL_EXPERIMENTS) {
+        setSelectedExperimentId(ALL_EXPERIMENTS);
       }
       setSelectedExperimentDetail(null);
       return;
     }
-    if (!parameterExperiments.some((experiment) => experiment.experiment_id === selectedExperimentId)) {
-      setSelectedExperimentId(parameterExperiments[0].experiment_id);
+    if (selectedExperimentId !== ALL_EXPERIMENTS && !parameterExperiments.some((experiment) => experiment.experiment_id === selectedExperimentId)) {
+      setSelectedExperimentId(ALL_EXPERIMENTS);
     }
   }, [activeTab, parameterExperiments, selectedExperimentId]);
 
@@ -397,6 +414,12 @@ function WorkspaceShell() {
             setSelectedRun(null);
             return;
           }
+          const cachedRun = runDetailCache[selectedRunId];
+          if (cachedRun) {
+            setSelectedRun(cachedRun);
+            setError(null);
+            return;
+          }
           if (selectedRun?.run_id === selectedRunId) {
             return;
           }
@@ -407,6 +430,7 @@ function WorkspaceShell() {
           }
           applyPayloadMeta(payload);
           setSelectedRun(payload.run);
+          setRunDetailCache((current) => ({ ...current, [payload.run.run_id]: payload.run }));
           setError(null);
           return;
         }
@@ -452,10 +476,11 @@ function WorkspaceShell() {
     return () => {
       cancelled = true;
     };
-  }, [activeTab, overview, parameterLab, selectedRun, selectedRunId]);
+  }, [activeTab, overview, parameterLab, runDetailCache, selectedRun, selectedRunId]);
 
   useEffect(() => {
-    if (activeTab !== 'parameters' || !selectedExperimentId) {
+    if (activeTab !== 'parameters' || selectedExperimentId === ALL_EXPERIMENTS) {
+      setSelectedExperimentDetail(null);
       return;
     }
     let cancelled = false;
@@ -464,16 +489,12 @@ function WorkspaceShell() {
       try {
         setSelectedExperimentDetail(null);
         setExperimentDetailLoading(true);
-        const [detailPayload, parameterPayload] = await Promise.all([
-          loadParameterExperimentDetail(selectedExperimentId),
-          loadParameters(),
-        ]);
+        const detailPayload = await loadParameterExperimentDetail(selectedExperimentId);
         if (cancelled) {
           return;
         }
         applyPayloadMeta(detailPayload);
         setSelectedExperimentDetail(detailPayload.parameter_experiment);
-        setParameterLab(parameterPayload.parameter_lab);
         setError(null);
       } catch (loadError: unknown) {
         if (!cancelled) {
@@ -500,17 +521,16 @@ function WorkspaceShell() {
       return;
     }
     const timer = window.setInterval(() => {
-      void Promise.all([loadParameterExperiments(), loadParameters()])
-        .then(([experimentPayload, parameterPayload]) => {
+      void loadParameterExperiments()
+        .then((experimentPayload) => {
           applyPayloadMeta(experimentPayload);
           setParameterExperiments(experimentPayload.parameter_experiments);
-          setParameterLab(parameterPayload.parameter_lab);
           setError(null);
         })
         .catch((loadError: unknown) => {
           setError(loadError instanceof Error ? loadError.message : '参数实验状态刷新失败');
         });
-    }, 1500);
+    }, 3000);
     return () => window.clearInterval(timer);
   }, [activeTab, parameterExperiments]);
 
@@ -520,26 +540,65 @@ function WorkspaceShell() {
   );
 
   useEffect(() => {
-    if (activeTab !== 'parameters' || !selectedExperimentId) {
+    if (activeTab !== 'parameters' || selectedExperimentId === ALL_EXPERIMENTS) {
       return;
     }
     if (selectedExperimentSummary?.status !== 'pending' && selectedExperimentSummary?.status !== 'running') {
       return;
     }
     const timer = window.setInterval(() => {
-      void Promise.all([loadParameterExperimentDetail(selectedExperimentId), loadParameters()])
-        .then(([detailPayload, parameterPayload]) => {
+      void loadParameterExperimentDetail(selectedExperimentId)
+        .then((detailPayload) => {
           applyPayloadMeta(detailPayload);
           setSelectedExperimentDetail(detailPayload.parameter_experiment);
-          setParameterLab(parameterPayload.parameter_lab);
           setError(null);
         })
         .catch((loadError: unknown) => {
           setError(loadError instanceof Error ? loadError.message : '参数实验详情刷新失败');
         });
-    }, 1500);
+    }, 3000);
     return () => window.clearInterval(timer);
   }, [activeTab, selectedExperimentId, selectedExperimentSummary?.status]);
+
+  useEffect(() => {
+    if (activeTab !== 'parameters' || parameterLab === null || selectedExperimentDetail === null) {
+      return;
+    }
+    const runIds = selectedExperimentDetail.execution.run_ids ?? [];
+    if (!runIds.length) {
+      return;
+    }
+    const knownRunIds = new Set(parameterLab.rows.map((row) => row.run_id));
+    const hasMissingRows = runIds.some((runId) => !knownRunIds.has(runId));
+    const isTerminal = selectedExperimentDetail.execution.status === 'success' || selectedExperimentDetail.execution.status === 'failed';
+    if (!hasMissingRows || !isTerminal) {
+      return;
+    }
+    let cancelled = false;
+    setSectionLoading(true);
+    void loadParameters()
+      .then((payload) => {
+        if (cancelled) {
+          return;
+        }
+        applyPayloadMeta(payload);
+        setParameterLab(payload.parameter_lab);
+        setError(null);
+      })
+      .catch((loadError: unknown) => {
+        if (!cancelled) {
+          setError(loadError instanceof Error ? loadError.message : '参数实验结果刷新失败');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setSectionLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, parameterLab, selectedExperimentDetail]);
 
   async function handleRefresh() {
     invalidateDerivedData();
@@ -656,7 +715,7 @@ function WorkspaceShell() {
       const experimentsPayload = await loadParameterExperiments();
       applyPayloadMeta(experimentsPayload);
       setParameterExperiments(experimentsPayload.parameter_experiments);
-      setSelectedExperimentId(experimentId);
+      setSelectedExperimentId(ALL_EXPERIMENTS);
       setError(null);
     } catch (submitError: unknown) {
       const text = submitError instanceof Error ? submitError.message : '参数实验提交失败';
@@ -837,7 +896,7 @@ function WorkspaceShell() {
                 applyPayloadMeta(experimentPayload);
                 setParameterExperiments(experimentPayload.parameter_experiments);
                 setParameterLab(parameterPayload.parameter_lab);
-                if (selectedExperimentId) {
+                if (selectedExperimentId !== ALL_EXPERIMENTS) {
                   const detailPayload = await loadParameterExperimentDetail(selectedExperimentId);
                   applyPayloadMeta(detailPayload);
                   setSelectedExperimentDetail(detailPayload.parameter_experiment);
@@ -1487,6 +1546,10 @@ function AnalysisView({
   ], []);
 
   const tradeRows = selectedRun?.trade_rows ?? [];
+  const equityChartRows = useMemo(
+    () => pickChartSamples(selectedRun?.equity_rows ?? [], 1500),
+    [selectedRun],
+  );
   const tradeSideOptions = Array.from(new Set(tradeRows.map((row) => row.side))).sort();
   const tradeSummaryStats = useMemo(() => {
     const closedTrades = tradeRows.filter((row) => row.exit_time !== null);
@@ -1602,14 +1665,14 @@ function AnalysisView({
       <Col span={24}>
         <Card title="资金曲线">
           <Paragraph type="secondary">
-            仅展示当前策略账户权益随时间的变化，便于单次 run 的资金演进查看。
+            仅展示当前策略账户权益随时间的变化，便于单次 run 的资金演进查看。大样本会自动抽样显示，减轻切换卡顿。
           </Paragraph>
           <LazyPlot
             data={[
               {
-                x: selectedRun.equity_rows.map((row) => row.timestamp),
-                y: selectedRun.equity_rows.map((row) => row.strategy_equity),
-                type: 'scatter',
+                x: equityChartRows.map((row) => row.timestamp),
+                y: equityChartRows.map((row) => row.strategy_equity),
+                type: equityChartRows.length > 1000 ? 'scattergl' : 'scatter',
                 mode: 'lines',
                 name: '资金曲线',
                 line: { color: '#1677ff', width: 3.5 },
@@ -1844,10 +1907,15 @@ function ParametersView({
   ], []);
 
   const selectedExperimentSummary = useMemo(
-    () => experiments.find((experiment) => experiment.experiment_id === selectedExperimentId) ?? null,
+    () => (selectedExperimentId === ALL_EXPERIMENTS
+      ? null
+      : experiments.find((experiment) => experiment.experiment_id === selectedExperimentId) ?? null),
     [experiments, selectedExperimentId],
   );
   const selectedExperimentRows = useMemo(() => {
+    if (selectedExperimentId === ALL_EXPERIMENTS) {
+      return allRows;
+    }
     const runIds = selectedExperimentDetail?.execution.run_ids ?? [];
     if (!runIds.length) {
       return [];
@@ -1856,7 +1924,7 @@ function ParametersView({
     return runIds
       .map((runId) => rowsByRunId.get(runId))
       .filter((row): row is ParameterLabRow => row !== undefined);
-  }, [allRows, selectedExperimentDetail]);
+  }, [allRows, selectedExperimentDetail, selectedExperimentId]);
   const filteredExperimentRows = useMemo(() => {
     const query = experimentRunQuery.trim().toLowerCase();
     if (!query) {
@@ -1968,14 +2036,17 @@ function ParametersView({
           extra={(
             <Space wrap>
               <Select
-                value={selectedExperimentId || undefined}
+                value={selectedExperimentId}
                 style={{ minWidth: 360 }}
-                placeholder="选择一个参数实验"
+                placeholder="选择参数实验范围"
                 onChange={setSelectedExperimentId}
-                options={experiments.map((experiment) => ({
-                  label: `${experiment.experiment_id} · ${experimentSearchTypeLabel(experiment.search_type)} · ${experiment.status}`,
-                  value: experiment.experiment_id,
-                }))}
+                options={[
+                  { label: '全部实验', value: ALL_EXPERIMENTS },
+                  ...experiments.map((experiment) => ({
+                    label: `${experiment.experiment_id} · ${experimentSearchTypeLabel(experiment.search_type)} · ${experiment.status}`,
+                    value: experiment.experiment_id,
+                  })),
+                ]}
               />
               {selectedExperimentSummary ? (
                 <Tag color={experimentStatusColor(selectedExperimentSummary.status)}>{selectedExperimentSummary.status}</Tag>
@@ -1983,29 +2054,33 @@ function ParametersView({
             </Space>
           )}
         >
-          {!selectedExperimentId ? (
+          {!experiments.length ? (
             <Alert type="info" showIcon message="当前还没有可查看的参数实验" />
           ) : (
             <Spin spinning={experimentDetailLoading}>
               <Space direction="vertical" size={16} style={{ width: '100%' }}>
                 <Paragraph type="secondary" style={{ marginBottom: 0 }}>
-                  这里直接消费实验详情与子 run 结果，方便按指标排序后快速跳转到单次分析。
+                  {selectedExperimentId === ALL_EXPERIMENTS
+                    ? '当前展示全部实验的汇总结果，适合先整体排序筛选，再进入单次分析。'
+                    : '这里直接消费实验详情与子 run 结果，方便按指标排序后快速跳转到单次分析。'}
                 </Paragraph>
                 <Row gutter={[12, 12]}>
-                  <Col xs={12} md={6}><Card size="small"><Statistic title="计划组合" value={selectedExperimentDetail?.execution.planned_run_count ?? selectedExperimentSummary?.planned_run_count ?? 0} /></Card></Col>
-                  <Col xs={12} md={6}><Card size="small"><Statistic title="已生成 Run" value={selectedExperimentDetail?.execution.run_ids?.length ?? selectedExperimentSummary?.run_count ?? 0} /></Card></Col>
-                  <Col xs={12} md={6}><Card size="small"><Statistic title="失败子任务" value={failedChildTaskIds.length || selectedExperimentSummary?.failed_run_count || 0} /></Card></Col>
-                  <Col xs={12} md={6}><Card size="small"><Statistic title="最近更新" value={selectedExperimentDetail?.execution.updated_at ? formatDateTime(selectedExperimentDetail.execution.updated_at) : '--'} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="实验数" value={selectedExperimentId === ALL_EXPERIMENTS ? experiments.length : 1} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="计划组合" value={selectedExperimentId === ALL_EXPERIMENTS ? experiments.reduce((sum, experiment) => sum + experiment.planned_run_count, 0) : (selectedExperimentDetail?.execution.planned_run_count ?? selectedExperimentSummary?.planned_run_count ?? 0)} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="已生成 Run" value={selectedExperimentId === ALL_EXPERIMENTS ? selectedExperimentRows.length : (selectedExperimentDetail?.execution.run_ids?.length ?? selectedExperimentSummary?.run_count ?? 0)} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="失败子任务" value={selectedExperimentId === ALL_EXPERIMENTS ? experiments.reduce((sum, experiment) => sum + experiment.failed_run_count, 0) : (failedChildTaskIds.length || selectedExperimentSummary?.failed_run_count || 0)} /></Card></Col>
                 </Row>
-                <Descriptions size="small" column={{ xs: 1, md: 2 }}>
-                  <Descriptions.Item label="实验 ID">{selectedExperimentDetail?.experiment.experiment_id ?? selectedExperimentId}</Descriptions.Item>
-                  <Descriptions.Item label="搜索方式">{experimentSearchTypeLabel(selectedExperimentDetail?.experiment.search_type ?? selectedExperimentSummary?.search_type)}</Descriptions.Item>
-                  <Descriptions.Item label="数据集">{selectedExperimentDetail?.experiment.dataset_bundle_id ?? selectedExperimentSummary?.dataset_bundle_id ?? '--'}</Descriptions.Item>
-                  <Descriptions.Item label="父任务">{selectedExperimentDetail?.execution.task_id ?? selectedExperimentSummary?.task_id ?? '--'}</Descriptions.Item>
-                  <Descriptions.Item label="提交时间">{selectedExperimentDetail?.experiment.created_at ? formatDateTime(selectedExperimentDetail.experiment.created_at) : (selectedExperimentSummary ? formatDateTime(selectedExperimentSummary.created_at) : '--')}</Descriptions.Item>
-                  <Descriptions.Item label="随机种子策略">{selectedExperimentDetail?.experiment.seed_policy ?? '--'}</Descriptions.Item>
-                </Descriptions>
-                {failedChildTaskIds.length ? (
+                {selectedExperimentId !== ALL_EXPERIMENTS ? (
+                  <Descriptions size="small" column={{ xs: 1, md: 2 }}>
+                    <Descriptions.Item label="实验 ID">{selectedExperimentDetail?.experiment.experiment_id ?? selectedExperimentId}</Descriptions.Item>
+                    <Descriptions.Item label="搜索方式">{experimentSearchTypeLabel(selectedExperimentDetail?.experiment.search_type ?? selectedExperimentSummary?.search_type)}</Descriptions.Item>
+                    <Descriptions.Item label="数据集">{selectedExperimentDetail?.experiment.dataset_bundle_id ?? selectedExperimentSummary?.dataset_bundle_id ?? '--'}</Descriptions.Item>
+                    <Descriptions.Item label="父任务">{selectedExperimentDetail?.execution.task_id ?? selectedExperimentSummary?.task_id ?? '--'}</Descriptions.Item>
+                    <Descriptions.Item label="提交时间">{selectedExperimentDetail?.experiment.created_at ? formatDateTime(selectedExperimentDetail.experiment.created_at) : (selectedExperimentSummary ? formatDateTime(selectedExperimentSummary.created_at) : '--')}</Descriptions.Item>
+                    <Descriptions.Item label="随机种子策略">{selectedExperimentDetail?.experiment.seed_policy ?? '--'}</Descriptions.Item>
+                  </Descriptions>
+                ) : null}
+                {selectedExperimentId !== ALL_EXPERIMENTS && failedChildTaskIds.length ? (
                   <Alert
                     type="warning"
                     showIcon
