@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from crypto_backtest_workbench.domain.models import (
     BacktestRun,
@@ -56,6 +56,7 @@ class SingleRunResult:
     execution: ExecutionResult
     metrics: RunMetrics
     validation_view: ValidationView | None = None
+    validation_summary: dict[str, object] | None = None
     benchmark_output: BuyAndHoldBenchmarkOutput | None = None
 
 
@@ -96,7 +97,7 @@ class SingleRunOrchestrator:
         if validation_split is not None:
             validation_view = build_validation_view(candles=candles, split=validation_split)
             execution_candles = list(validation_view.is_segment.analysis_candles)
-            execution_signals = _filter_signals_for_segment(signals, validation_view)
+            execution_signals = _filter_signals_for_segment(signals, validation_view.is_segment.analysis_candles)
 
         execution = simulate_signals(
             candles=execution_candles,
@@ -112,6 +113,15 @@ class SingleRunOrchestrator:
             request=request,
             candles=execution_candles,
             initial_equity=constraints.initial_cash,
+        )
+        validation_summary = _build_validation_summary(
+            request=request,
+            validation_view=validation_view,
+            signals=signals,
+            constraints=constraints,
+            is_execution=execution,
+            is_metrics=metrics,
+            is_benchmark=benchmark_output,
         )
         run = BacktestRun(
             run_id=request.run_id,
@@ -140,6 +150,7 @@ class SingleRunOrchestrator:
             execution=execution,
             metrics=metrics,
             validation_view=validation_view,
+            validation_summary=validation_summary,
             benchmark_output=benchmark_output,
         )
 
@@ -184,10 +195,78 @@ def _config_hash(payload: dict[str, object]) -> str:
 
 def _filter_signals_for_segment(
     signals: list[SignalIntent],
-    validation_view: ValidationView,
+    analysis_candles: tuple[CanonicalCandle, ...],
 ) -> list[SignalIntent]:
-    allowed_timestamps = {candle.timestamp for candle in validation_view.is_segment.analysis_candles}
+    allowed_timestamps = {candle.timestamp for candle in analysis_candles}
     return [signal for signal in signals if signal.timestamp in allowed_timestamps]
+
+
+def _build_validation_summary(
+    *,
+    request: SingleRunRequest,
+    validation_view: ValidationView | None,
+    signals: list[SignalIntent],
+    constraints: ExecutionConstraints,
+    is_execution: ExecutionResult,
+    is_metrics: RunMetrics,
+    is_benchmark: BuyAndHoldBenchmarkOutput | None,
+) -> dict[str, object] | None:
+    if validation_view is None:
+        return None
+
+    oos_signals = _filter_signals_for_segment(signals, validation_view.oos_segment.analysis_candles)
+    oos_execution = simulate_signals(
+        candles=list(validation_view.oos_segment.analysis_candles),
+        signals=oos_signals,
+        constraints=constraints,
+    )
+    oos_metrics = compute_run_metrics(
+        initial_equity=constraints.initial_cash,
+        final_equity=oos_execution.account.equity,
+        trades=oos_execution.trades,
+    )
+    oos_benchmark = _compute_benchmark_output(
+        request=request,
+        candles=list(validation_view.oos_segment.analysis_candles),
+        initial_equity=constraints.initial_cash,
+    )
+    return {
+        "validation_split_id": request.validation_split_id,
+        "is_segment": _segment_summary_payload(
+            segment=validation_view.is_segment,
+            metrics=is_metrics,
+            benchmark_output=is_benchmark,
+        ),
+        "oos_segment": _segment_summary_payload(
+            segment=validation_view.oos_segment,
+            metrics=oos_metrics,
+            benchmark_output=oos_benchmark,
+        ),
+    }
+
+
+def _segment_summary_payload(
+    *,
+    segment,
+    metrics: RunMetrics,
+    benchmark_output: BuyAndHoldBenchmarkOutput | None,
+) -> dict[str, object]:
+    benchmark_return = benchmark_output.result.return_pct if benchmark_output is not None else None
+    excess_return = metrics.total_return - benchmark_return if benchmark_return is not None else None
+    analysis_start = segment.analysis_candles[0].timestamp if segment.analysis_candles else None
+    analysis_end = segment.analysis_candles[-1].timestamp if segment.analysis_candles else None
+    return {
+        "name": segment.name,
+        "warmup_bars": len(segment.warmup_candles),
+        "analysis_bar_count": len(segment.analysis_candles),
+        "window_bar_count": len(segment.window_candles),
+        "warmup_complete": segment.warmup_complete,
+        "analysis_start": analysis_start.isoformat() if analysis_start is not None else None,
+        "analysis_end": analysis_end.isoformat() if analysis_end is not None else None,
+        "metrics": asdict(metrics),
+        "benchmark_return": benchmark_return,
+        "excess_return": excess_return,
+    }
 
 
 def _compute_benchmark_output(

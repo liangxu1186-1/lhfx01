@@ -61,6 +61,12 @@ class RunRepository(Protocol):
     def load_benchmark(self, run_id: str) -> BuyAndHoldBenchmarkOutput | None:
         """Load persisted benchmark output if present."""
 
+    def load_validation_summary(self, run_id: str) -> dict[str, object] | None:
+        """Load persisted validation summary if present."""
+
+    def count_execution_items(self, run_id: str) -> dict[str, int]:
+        """Load lightweight execution counts without hydrating full execution payloads."""
+
     def delete_run(self, run_id: str) -> None:
         """Delete a persisted run and all associated artifacts."""
 
@@ -76,6 +82,10 @@ class FileRunRepository:
         benchmark_paths = None
         if result.benchmark_output is not None:
             benchmark_paths = self.save_benchmark(run_id=run_id, output=result.benchmark_output)
+        validation_summary_path = self.save_validation_summary(
+            run_id=run_id,
+            summary=result.validation_summary,
+        )
 
         return {
             "manifest": self.save_manifest(result.manifest),
@@ -83,6 +93,7 @@ class FileRunRepository:
             "execution": self.save_execution(run_id=run_id, execution=result.execution),
             "metrics": self.save_metrics(run_id=run_id, metrics=result.metrics),
             "benchmark": benchmark_paths,
+            "validation_summary": validation_summary_path,
         }
 
     def list_run_ids(self) -> list[str]:
@@ -377,6 +388,34 @@ class FileRunRepository:
             daily_returns=tuple(daily_returns),
         )
 
+    def save_validation_summary(self, *, run_id: str, summary: dict[str, object] | None) -> Path | None:
+        if summary is None:
+            return None
+        path = self._run_dir(run_id) / "validation_summary.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(_json_ready(summary), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return path
+
+    def load_validation_summary(self, run_id: str) -> dict[str, object] | None:
+        path = self._run_dir(run_id) / "validation_summary.json"
+        if not path.exists():
+            return None
+        payload = self._read_json(path)
+        if isinstance(payload, list):
+            raise TypeError("validation_summary.json must contain an object")
+        return payload
+
+    def count_execution_items(self, run_id: str) -> dict[str, int]:
+        execution_dir = self._execution_dir(run_id)
+        return {
+            "warning_count": self._count_json_list_items(execution_dir / "warnings.json"),
+            "order_count": self._count_csv_rows(execution_dir / "orders.csv"),
+            "fill_count": self._count_csv_rows(execution_dir / "fills.csv"),
+        }
+
     def delete_run(self, run_id: str) -> None:
         directory = self._run_dir(run_id)
         if not directory.exists():
@@ -480,6 +519,21 @@ class FileRunRepository:
             entry["created_at"] = _parse_iso_datetime(entry["created_at"])
             warnings.append(StructuredWarning(**entry))
         return warnings
+
+    def _count_csv_rows(self, path: Path) -> int:
+        if not path.exists():
+            return 0
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            next(handle, None)
+            return sum(1 for _ in handle)
+
+    def _count_json_list_items(self, path: Path) -> int:
+        if not path.exists():
+            return 0
+        payload = self._read_json(path)
+        if not isinstance(payload, list):
+            raise ValueError(f"{path.name} must contain a list")
+        return len(payload)
 
     def _load_benchmark_equity_points(self, path: Path) -> list[BenchmarkEquityPoint]:
         rows = self._load_csv_rows(path)

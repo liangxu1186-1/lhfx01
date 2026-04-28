@@ -32,12 +32,19 @@ class RunSummaryView:
     created_at: datetime
     validation_split_id: str
     total_return: float
+    max_drawdown: float
     final_equity: float
     trade_count: int
     win_rate: float
     profit_factor: float | None
     benchmark_return: float | None
     excess_return: float | None
+    is_total_return: float | None
+    is_excess_return: float | None
+    oos_total_return: float | None
+    oos_excess_return: float | None
+    oos_trade_count: int | None
+    oos_win_rate: float | None
     warning_count: int
     order_count: int
     fill_count: int
@@ -55,6 +62,7 @@ class RunDetailView:
     metrics: RunMetrics
     execution: ExecutionResult
     benchmark: BuyAndHoldBenchmarkOutput | None
+    validation_summary: dict[str, object] | None
 
 
 @dataclass(slots=True, frozen=True)
@@ -90,13 +98,16 @@ def list_run_summary_views(run_repository: RunRepository) -> list[RunSummaryView
         run = run_repository.load_run(run_id)
         metrics = run_repository.load_metrics(run_id)
         benchmark = run_repository.load_benchmark(run_id)
-        execution = run_repository.load_execution(run_id)
+        validation_summary = run_repository.load_validation_summary(run_id)
+        execution_counts = run_repository.count_execution_items(run_id)
         strategy_params = manifest.resolved_config_json.get("strategy_params") or {}
         execution_constraints = manifest.resolved_config_json.get("execution_constraints") or {}
         benchmark_return = benchmark.result.return_pct if benchmark is not None else None
         excess_return = None
         if benchmark_return is not None:
             excess_return = metrics.total_return - benchmark_return
+        is_segment = _load_validation_segment(validation_summary, "is_segment")
+        oos_segment = _load_validation_segment(validation_summary, "oos_segment")
         summaries.append(
             RunSummaryView(
                 run_id=run.run_id,
@@ -111,15 +122,22 @@ def list_run_summary_views(run_repository: RunRepository) -> list[RunSummaryView
                 created_at=run.created_at,
                 validation_split_id=run.validation_split_id,
                 total_return=metrics.total_return,
+                max_drawdown=_max_drawdown(run_repository.load_execution(run_id).equity_curve),
                 final_equity=metrics.final_equity,
                 trade_count=metrics.trade_count,
                 win_rate=metrics.win_rate,
                 profit_factor=_normalize_float(metrics.profit_factor),
                 benchmark_return=benchmark_return,
                 excess_return=excess_return,
-                warning_count=len(execution.warnings),
-                order_count=len(execution.orders),
-                fill_count=len(execution.fills),
+                is_total_return=_segment_metric_value(is_segment, "total_return"),
+                is_excess_return=_segment_numeric_value(is_segment, "excess_return"),
+                oos_total_return=_segment_metric_value(oos_segment, "total_return"),
+                oos_excess_return=_segment_numeric_value(oos_segment, "excess_return"),
+                oos_trade_count=_segment_metric_int_value(oos_segment, "trade_count"),
+                oos_win_rate=_segment_metric_value(oos_segment, "win_rate"),
+                warning_count=execution_counts["warning_count"],
+                order_count=execution_counts["order_count"],
+                fill_count=execution_counts["fill_count"],
             )
         )
     return sorted(summaries, key=lambda item: item.created_at, reverse=True)
@@ -132,6 +150,7 @@ def load_run_detail_view(run_repository: RunRepository, run_id: str) -> RunDetai
         metrics=run_repository.load_metrics(run_id),
         execution=run_repository.load_execution(run_id),
         benchmark=run_repository.load_benchmark(run_id),
+        validation_summary=run_repository.load_validation_summary(run_id),
     )
 
 
@@ -200,6 +219,23 @@ def build_run_comparison_views(details: list[RunDetailView]) -> list[RunComparis
             )
         )
     return comparison_rows
+
+
+def build_run_comparison_views_from_summaries(summaries: list[RunSummaryView]) -> list[RunComparisonView]:
+    return [
+        RunComparisonView(
+            run_id=summary.run_id,
+            strategy_name=summary.strategy_name,
+            total_return=summary.total_return,
+            benchmark_return=summary.benchmark_return,
+            excess_return=summary.excess_return,
+            final_equity=summary.final_equity,
+            trade_count=summary.trade_count,
+            win_rate=summary.win_rate,
+            profit_factor=summary.profit_factor if summary.profit_factor is not None else float("nan"),
+        )
+        for summary in summaries
+    ]
 
 
 def build_multi_run_equity_rows(details: list[RunDetailView]) -> list[dict[str, object]]:
@@ -327,6 +363,64 @@ def _warning_row(warning: StructuredWarning) -> dict[str, object]:
 
 
 def _normalize_float(value: float) -> float | None:
+    if isnan(value):
+        return None
+    return value
+
+
+def _max_drawdown(equity_curve: list[object]) -> float:
+    peak: float | None = None
+    max_drawdown = 0.0
+    for point in equity_curve:
+        equity = float(getattr(point, "equity"))
+        if peak is None or equity > peak:
+            peak = equity
+        if peak and peak > 0:
+            max_drawdown = max(max_drawdown, (peak - equity) / peak)
+    return max_drawdown
+
+
+def _load_validation_segment(
+    validation_summary: dict[str, object] | None,
+    segment_name: str,
+) -> dict[str, object] | None:
+    if validation_summary is None:
+        return None
+    segment = validation_summary.get(segment_name)
+    if not isinstance(segment, dict):
+        return None
+    return segment
+
+
+def _segment_metric_value(segment: dict[str, object] | None, metric_name: str) -> float | None:
+    if not segment:
+        return None
+    metrics = segment.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    value = metrics.get(metric_name)
+    if value is None:
+        return None
+    value = float(value)
+    if isnan(value):
+        return None
+    return value
+
+
+def _segment_metric_int_value(segment: dict[str, object] | None, metric_name: str) -> int | None:
+    value = _segment_metric_value(segment, metric_name)
+    if value is None:
+        return None
+    return int(value)
+
+
+def _segment_numeric_value(segment: dict[str, object] | None, field_name: str) -> float | None:
+    if not segment:
+        return None
+    value = segment.get(field_name)
+    if value is None:
+        return None
+    value = float(value)
     if isnan(value):
         return None
     return value

@@ -155,6 +155,7 @@ def test_workspace_api_split_read_endpoints_return_expected_sections(tmp_path: P
         )
         datasets_response = _request_json(server, "/api/datasets")
         overview_response = _request_json(server, "/api/overview")
+        overview_equity_response = _request_json(server, "/api/overview-equity?run_id=run-api-003")
         runs_response = _request_json(server, "/api/runs")
         tasks_response = _request_json(server, "/api/tasks")
         run_detail_response = _request_json(server, "/api/runs/run-api-003")
@@ -167,11 +168,73 @@ def test_workspace_api_split_read_endpoints_return_expected_sections(tmp_path: P
 
     assert datasets_response["datasets"][0]["dataset_snapshot_id"] == "snapshot-api-003"
     assert overview_response["overview"]["summaries"][0]["run_id"] == "run-api-003"
+    assert overview_response["overview"]["multi_run_equity"] == []
+    assert overview_equity_response["multi_run_equity"]
+    assert "run-api-003_equity" in overview_equity_response["multi_run_equity"][0]
     assert runs_response["runs"][0]["run_id"] == "run-api-003"
     assert tasks_response["tasks"][0]["task_id"] == "single-run:run-api-003"
     assert run_detail_response["run"]["run_id"] == "run-api-003"
     assert task_detail_response["task"]["task_id"] == "single-run:run-api-003"
     assert parameters_response["parameter_lab"]["rows"][0]["run_id"] == "run-api-003"
+
+
+def test_workspace_api_research_notes_can_be_created_and_read_from_run_detail(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-note-001")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        _request_json(
+            server,
+            "/api/run-ema",
+            payload={
+                "snapshot_id": "snapshot-api-note-001",
+                "run_id": "run-api-note-001",
+                "fast_period": 2,
+                "slow_period": 3,
+                "qty_policy_ref": "fixed_1",
+                "qty": 0.01,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.0,
+                "slippage_bps": 0.0,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+            },
+        )
+        create_response = _request_json(
+            server,
+            "/api/research-notes",
+            payload={
+                "target_type": "run",
+                "target_id": "run-api-note-001",
+                "author": "tester",
+                "labels": ["candidate", "review"],
+                "content": "样本外仍为正，先保留候选。",
+            },
+            method="POST",
+        )
+        notes_response = _request_json(
+            server,
+            "/api/research-notes?target_type=run&target_id=run-api-note-001",
+        )
+        run_detail_response = _request_json(server, "/api/runs/run-api-note-001")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert create_response["note"]["target_id"] == "run-api-note-001"
+    assert create_response["note"]["labels"] == ["candidate", "review"]
+    assert notes_response["research_notes"][0]["author"] == "tester"
+    assert run_detail_response["run"]["research_notes"][0]["content"] == "样本外仍为正，先保留候选。"
 
 
 def test_workspace_api_parameter_experiment_executes_in_background_and_is_queryable(tmp_path: Path) -> None:
@@ -328,6 +391,194 @@ def test_workspace_api_parameter_experiment_rejects_invalid_parameter_combinatio
     assert "fast_period < slow_period" in error_response["body"]["error"]["message"]
 
 
+def test_workspace_api_parameter_experiment_batch_executes_and_returns_recommendations(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-batch-001", timeframe="1h")
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-batch-002", timeframe="4h")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        submit_response = _request_json(
+            server,
+            "/api/parameter-experiment-batches",
+            payload={
+                "batch_id": "batch-api-001",
+                "snapshot_ids": ["snapshot-api-batch-001", "snapshot-api-batch-002"],
+                "search_type": "grid",
+                "fast_periods": [2, 3],
+                "slow_periods": [4],
+                "cash_allocation_pct": 100,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.0,
+                "slippage_bps": 0.0,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+            },
+            method="POST",
+        )
+        task_id = str(submit_response["task_id"])
+        task_response = _wait_for_task_status(server, task_id, expected_status="success")
+        batches_response = _request_json(server, "/api/parameter-experiment-batches")
+        batch_detail_response = _request_json(server, "/api/parameter-experiment-batches/batch-api-001")
+        group = batch_detail_response["parameter_experiment_batch"]["parameter_groups"][0]
+        group_target_id = f"batch-api-001:f{group['fast_period']}:s{group['slow_period']}:l{group['leverage']}"
+        batch_note_response = _request_json(
+            server,
+            "/api/research-notes",
+            payload={
+                "target_type": "parameter_experiment_batch",
+                "target_id": "batch-api-001",
+                "author": "tester",
+                "labels": ["candidate"],
+                "content": "批次整体进入候选观察。",
+            },
+            method="POST",
+        )
+        group_note_response = _request_json(
+            server,
+            "/api/research-notes",
+            payload={
+                "target_type": "parameter_group",
+                "target_id": group_target_id,
+                "author": "tester",
+                "labels": ["baseline"],
+                "content": "参数组作为基准组。",
+            },
+            method="POST",
+        )
+        group_notes_response = _request_json(
+            server,
+            f"/api/research-notes?target_type=parameter_group&target_id={group_target_id}",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert submit_response["batch_id"] == "batch-api-001"
+    assert submit_response["planned_experiment_count"] == 2
+    assert submit_response["planned_run_count"] == 4
+    assert task_response["task"]["status"] == "success"
+    assert batches_response["parameter_experiment_batches"][0]["batch_id"] == "batch-api-001"
+    assert batch_detail_response["parameter_experiment_batch"]["batch"]["batch_id"] == "batch-api-001"
+    assert len(batch_detail_response["parameter_experiment_batch"]["experiments"]) == 2
+    assert len(batch_detail_response["parameter_experiment_batch"]["run_rows"]) == 4
+    assert "robust_candidates" in batch_detail_response["parameter_experiment_batch"]["recommendations"]
+    assert "robust_candidate" in batch_detail_response["parameter_experiment_batch"]["scoring_rules"]
+    assert "相邻参数稳定度 >= 50%，且至少有 1 个稳定邻居" in batch_detail_response["parameter_experiment_batch"]["scoring_rules"]["robust_candidate"]["thresholds"]
+    assert "neighbor_stability_score" in batch_detail_response["parameter_experiment_batch"]["parameter_groups"][0]
+    assert "score" in batch_detail_response["parameter_experiment_batch"]["parameter_groups"][0]
+    assert "confidence" in batch_detail_response["parameter_experiment_batch"]["parameter_groups"][0]
+    assert batch_note_response["note"]["target_type"] == "parameter_experiment_batch"
+    assert group_note_response["note"]["target_id"] == group_target_id
+    assert group_notes_response["research_notes"][0]["content"] == "参数组作为基准组。"
+
+
+def test_workspace_api_delete_parameter_experiment_removes_runs_and_metadata(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-delete-experiment-001")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        submit_response = _request_json(
+            server,
+            "/api/parameter-experiments",
+            payload={
+                "experiment_id": "experiment-api-delete-001",
+                "snapshot_id": "snapshot-api-delete-experiment-001",
+                "search_type": "grid",
+                "fast_periods": [2, 3],
+                "slow_periods": [4],
+                "cash_allocation_pct": 100,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.0,
+                "slippage_bps": 0.0,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+            },
+            method="POST",
+        )
+        _wait_for_task_status(server, str(submit_response["task_id"]), expected_status="success")
+        delete_response = _request_json(server, "/api/parameter-experiments/experiment-api-delete-001", method="DELETE")
+        experiments_response = _request_json(server, "/api/parameter-experiments")
+        runs_response = _request_json(server, "/api/runs")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert delete_response["deleted"] is True
+    assert delete_response["experiment_id"] == "experiment-api-delete-001"
+    assert experiments_response["parameter_experiments"] == []
+    assert runs_response["runs"] == []
+
+
+def test_workspace_api_delete_parameter_experiment_batch_removes_child_experiments_and_runs(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-delete-batch-001", timeframe="1h")
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-delete-batch-002", timeframe="4h")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        submit_response = _request_json(
+            server,
+            "/api/parameter-experiment-batches",
+            payload={
+                "batch_id": "batch-api-delete-001",
+                "snapshot_ids": ["snapshot-api-delete-batch-001", "snapshot-api-delete-batch-002"],
+                "search_type": "grid",
+                "fast_periods": [2],
+                "slow_periods": [4],
+                "cash_allocation_pct": 100,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.0,
+                "slippage_bps": 0.0,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+            },
+            method="POST",
+        )
+        _wait_for_task_status(server, str(submit_response["task_id"]), expected_status="success")
+        delete_response = _request_json(server, "/api/parameter-experiment-batches/batch-api-delete-001", method="DELETE")
+        batches_response = _request_json(server, "/api/parameter-experiment-batches")
+        experiments_response = _request_json(server, "/api/parameter-experiments")
+        runs_response = _request_json(server, "/api/runs")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert delete_response["deleted"] is True
+    assert delete_response["batch_id"] == "batch-api-delete-001"
+    assert batches_response["parameter_experiment_batches"] == []
+    assert experiments_response["parameter_experiments"] == []
+    assert runs_response["runs"] == []
+
+
 def test_workspace_api_delete_run_removes_persisted_run(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-004")
@@ -369,6 +620,72 @@ def test_workspace_api_delete_run_removes_persisted_run(tmp_path: Path) -> None:
     assert delete_response["deleted"] is True
     assert delete_response["run_id"] == "run-api-004"
     assert runs_response["runs"] == []
+
+
+def test_workspace_api_delete_run_prunes_parameter_experiment_and_batch_indexes(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-delete-run-batch-001", timeframe="1h")
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-delete-run-batch-002", timeframe="4h")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        submit_response = _request_json(
+            server,
+            "/api/parameter-experiment-batches",
+            payload={
+                "batch_id": "batch-api-delete-run-index-001",
+                "snapshot_ids": ["snapshot-api-delete-run-batch-001", "snapshot-api-delete-run-batch-002"],
+                "search_type": "grid",
+                "fast_periods": [2, 3],
+                "slow_periods": [4],
+                "cash_allocation_pct": 100,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.0,
+                "slippage_bps": 0.0,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+            },
+            method="POST",
+        )
+        _wait_for_task_status(server, str(submit_response["task_id"]), expected_status="success")
+        batch_detail_before = _request_json(server, "/api/parameter-experiment-batches/batch-api-delete-run-index-001")
+        experiment_id = str(batch_detail_before["parameter_experiment_batch"]["experiments"][0]["experiment"]["experiment_id"])
+        experiment_detail_before = _request_json(server, f"/api/parameter-experiments/{experiment_id}")
+        run_id = str(experiment_detail_before["parameter_experiment"]["execution"]["run_ids"][0])
+
+        delete_response = _request_json(server, f"/api/runs/{run_id}", method="DELETE")
+        batch_detail_after = _request_json(server, "/api/parameter-experiment-batches/batch-api-delete-run-index-001")
+        experiment_detail_after = _request_json(server, f"/api/parameter-experiments/{experiment_id}")
+        experiments_response = _request_json(server, "/api/parameter-experiments")
+        batches_response = _request_json(server, "/api/parameter-experiment-batches")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert delete_response["deleted"] is True
+    assert experiment_id in delete_response["experiment_ids"]
+    assert "batch-api-delete-run-index-001" in delete_response["batch_ids"]
+    assert len(experiment_detail_before["parameter_experiment"]["execution"]["run_ids"]) == 2
+    assert len(experiment_detail_after["parameter_experiment"]["execution"]["run_ids"]) == 1
+    assert len(batch_detail_before["parameter_experiment_batch"]["execution"]["run_ids"]) == 4
+    assert len(batch_detail_after["parameter_experiment_batch"]["execution"]["run_ids"]) == 3
+    experiment_summary = next(
+        item for item in experiments_response["parameter_experiments"] if item["experiment_id"] == experiment_id
+    )
+    batch_summary = next(
+        item for item in batches_response["parameter_experiment_batches"] if item["batch_id"] == "batch-api-delete-run-index-001"
+    )
+    assert experiment_summary["run_count"] == 1
+    assert batch_summary["run_count"] == 3
 
 
 def test_workspace_api_delete_dataset_removes_snapshot(tmp_path: Path) -> None:
@@ -568,16 +885,16 @@ def _wait_for_task_status(
     raise AssertionError(f"Timed out waiting for task {task_id} to reach {expected_status}")
 
 
-def _seed_snapshot(*, data_dir: Path, snapshot_id: str) -> None:
+def _seed_snapshot(*, data_dir: Path, snapshot_id: str, timeframe: str = "1h") -> None:
     dataset_repository = FileDatasetRepository(data_dir)
-    candles = _build_candles()
+    candles = _build_candles(timeframe=timeframe)
     snapshot = DatasetSnapshot(
         dataset_snapshot_id=snapshot_id,
         source="binanceusdm",
         exchange="binanceusdm",
         market_type=MarketType.LINEAR_USDT_PERPETUAL,
         symbol="BTC/USDT:USDT",
-        timeframe="1h",
+        timeframe=timeframe,
         time_range_start=candles[0].timestamp,
         time_range_end=candles[-1].timestamp,
         row_count=len(candles),
@@ -591,7 +908,7 @@ def _seed_snapshot(*, data_dir: Path, snapshot_id: str) -> None:
     dataset_repository.save_candles(snapshot_id, candles)
 
 
-def _build_candles() -> list[CanonicalCandle]:
+def _build_candles(*, timeframe: str = "1h") -> list[CanonicalCandle]:
     start = datetime(2024, 1, 1, tzinfo=UTC)
     close_prices = [100.0, 102.0, 101.0, 104.0, 103.0, 106.0]
     candles: list[CanonicalCandle] = []
@@ -603,7 +920,7 @@ def _build_candles() -> list[CanonicalCandle]:
                 symbol="BTC/USDT:USDT",
                 exchange="binanceusdm",
                 market_type=MarketType.LINEAR_USDT_PERPETUAL,
-                timeframe="1h",
+                timeframe=timeframe,
                 open=close - 1,
                 high=close + 1,
                 low=close - 2,

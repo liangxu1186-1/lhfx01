@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,9 @@ class ParameterExperimentRepository(Protocol):
 
     def list_experiment_ids(self) -> list[str]:
         """List persisted experiment identifiers."""
+
+    def delete_experiment(self, experiment_id: str) -> None:
+        """Delete one persisted experiment and its artifacts."""
 
 
 class FileParameterExperimentRepository:
@@ -80,6 +84,12 @@ class FileParameterExperimentRepository:
             if path.is_dir() and (path / "experiment.json").exists()
         ]
         return sorted(experiment_ids)
+
+    def delete_experiment(self, experiment_id: str) -> None:
+        directory = self._experiment_dir(experiment_id)
+        if not directory.exists():
+            raise FileNotFoundError(f"Parameter experiment not found: {experiment_id}")
+        shutil.rmtree(directory)
 
     def _experiment_dir(self, experiment_id: str) -> Path:
         return self.base_dir / "experiments" / experiment_id

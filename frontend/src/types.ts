@@ -41,6 +41,12 @@ export interface OverviewPayload {
   overview: WorkspaceOverview;
 }
 
+export interface OverviewEquityPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  multi_run_equity: MultiRunEquityRow[];
+}
+
 export interface RunIndexPayload {
   generated_at: string;
   source: WorkspaceSource;
@@ -65,10 +71,28 @@ export interface ParameterExperimentIndexPayload {
   parameter_experiments: ParameterExperimentSummary[];
 }
 
+export interface ParameterExperimentBatchIndexPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  parameter_experiment_batches: ParameterExperimentBatchSummary[];
+}
+
 export interface ParameterExperimentDetailPayload {
   generated_at: string;
   source: WorkspaceSource;
   parameter_experiment: ParameterExperimentDetail;
+}
+
+export interface ParameterExperimentBatchDetailPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  parameter_experiment_batch: ParameterExperimentBatchDetail;
+}
+
+export interface ResearchNotesPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  research_notes: ResearchNote[];
 }
 
 export interface DatasetSnapshotView {
@@ -102,12 +126,19 @@ export interface RunSummaryView {
   created_at: string;
   validation_split_id: string;
   total_return: number;
+  max_drawdown: number;
   final_equity: number;
   trade_count: number;
   win_rate: number;
   profit_factor: number | null;
   benchmark_return: number | null;
   excess_return: number | null;
+  is_total_return: number | null;
+  is_excess_return: number | null;
+  oos_total_return: number | null;
+  oos_excess_return: number | null;
+  oos_trade_count: number | null;
+  oos_win_rate: number | null;
   warning_count: number;
   order_count: number;
   fill_count: number;
@@ -167,6 +198,12 @@ export interface RunAnalysisView {
     equity_uri: string;
     daily_returns_uri: string | null;
   } | null;
+  validation: {
+    validation_split_id: string;
+    is_segment: ValidationSegmentSummary;
+    oos_segment: ValidationSegmentSummary;
+  } | null;
+  research_notes: ResearchNote[];
   execution_counts: {
     order_count: number;
     fill_count: number;
@@ -184,6 +221,37 @@ export interface EquityRow {
   benchmark_equity: number | null;
   strategy_cash: number;
   strategy_used_margin: number;
+}
+
+export interface ValidationSegmentSummary {
+  name: string;
+  warmup_bars: number;
+  analysis_bar_count: number;
+  window_bar_count: number;
+  warmup_complete: boolean;
+  analysis_start: string | null;
+  analysis_end: string | null;
+  metrics: {
+    initial_equity: number;
+    final_equity: number;
+    total_return: number;
+    trade_count: number;
+    win_rate: number;
+    profit_factor: number | null;
+    expectancy: number;
+  };
+  benchmark_return: number | null;
+  excess_return: number | null;
+}
+
+export interface ResearchNote {
+  note_id: string;
+  target_type: string;
+  target_id: string;
+  content: string;
+  author: string;
+  labels: string[];
+  created_at: string;
 }
 
 export interface TradeRow {
@@ -230,8 +298,15 @@ export interface ParameterLabRow {
   fee_rate: number | null;
   slippage_bps: number | null;
   total_return: number;
+  max_drawdown: number;
   benchmark_return: number | null;
   excess_return: number | null;
+  is_total_return: number | null;
+  is_excess_return: number | null;
+  oos_total_return: number | null;
+  oos_excess_return: number | null;
+  oos_trade_count: number | null;
+  oos_win_rate: number | null;
   final_equity: number;
   trade_count: number;
   win_rate: number;
@@ -286,5 +361,99 @@ export interface ParameterExperimentDetail {
     failed_child_task_ids?: string[];
     planned_run_count?: number;
     updated_at?: string;
+  };
+}
+
+export interface ParameterExperimentBatchSummary {
+  batch_id: string;
+  strategy_name: string;
+  snapshot_count: number;
+  experiment_count: number;
+  search_type: string;
+  task_id: string | null;
+  status: string;
+  planned_experiment_count: number;
+  planned_run_count: number;
+  run_count: number;
+  failed_experiment_count: number;
+  created_at: string;
+}
+
+export interface ParameterGroupRecommendation {
+  fast_period: number | null;
+  slow_period: number | null;
+  leverage: number | null;
+  run_count: number;
+  snapshot_count: number;
+  timeframe_count: number;
+  avg_total_return: number;
+  avg_excess_return: number;
+  avg_oos_total_return: number;
+  avg_oos_excess_return: number;
+  avg_max_drawdown: number;
+  worst_max_drawdown: number;
+  return_over_drawdown: number;
+  best_total_return: number;
+  min_trade_count: number | null;
+  min_oos_trade_count: number | null;
+  positive_ratio: number;
+  oos_available_count: number;
+  oos_positive_ratio: number | null;
+  neighbor_count: number;
+  stable_neighbor_count: number;
+  neighbor_stability_score: number | null;
+  score: number;
+  confidence: number;
+  run_ids: string[];
+  reason: string;
+}
+
+export interface ParameterScoringRule {
+  label: string;
+  summary: string;
+  thresholds: string[];
+}
+
+export interface ParameterExperimentBatchDetail {
+  batch: {
+    batch_id: string;
+    strategy_name: string;
+    dataset_snapshot_ids: string[];
+    validation_split_id: string;
+    metric_policy_id: string;
+    benchmark_policy_version: string;
+    search_type: string;
+    search_space_json: Record<string, unknown>;
+    base_config_uri: string;
+    seed_policy: string;
+    seed: number | null;
+    experiment_ids: string[];
+    created_at: string;
+  };
+  execution: {
+    batch_id?: string;
+    task_id?: string;
+    status?: string;
+    dataset_snapshot_ids?: string[];
+    experiment_ids?: string[];
+    run_ids?: string[];
+    child_task_ids?: string[];
+    failed_experiment_ids?: string[];
+    planned_experiment_count?: number;
+    planned_run_count?: number;
+    updated_at?: string;
+  };
+  experiments: ParameterExperimentDetail[];
+  run_rows: ParameterLabRow[];
+  parameter_groups: Array<Omit<ParameterGroupRecommendation, 'reason'>>;
+  recommendations: {
+    robust_candidates: ParameterGroupRecommendation[];
+    high_return_candidates: ParameterGroupRecommendation[];
+    excluded_combinations: ParameterGroupRecommendation[];
+  };
+  scoring_rules: {
+    robust_candidate: ParameterScoringRule;
+    high_return_candidate: ParameterScoringRule;
+    excluded_combination: ParameterScoringRule;
   };
 }

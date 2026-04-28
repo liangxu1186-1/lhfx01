@@ -40,6 +40,24 @@
 -> 保存实验结果与研究结论
 ```
 
+### 2.2.1 当前实现状态补充
+
+截至当前实现，v1 研究闭环已经落地到以下层级：
+
+- React 页面已覆盖执行台、运行总览、单次分析和参数实验
+- 参数实验支持多快照批次、`grid/random search`、`fast/slow/leverage` 组合维度
+- run / parameter readmodel 已透出 IS/OOS、benchmark、`max_drawdown`
+- 批次聚合结果已按 `fast_period + slow_period + leverage` 聚合
+- 批次评分已包含收益、样本外表现、回撤、收益回撤比、置信度和邻域稳定度
+- Research Note 已从 run 级备注扩展到批次和参数组级研究决策
+
+因此后续工程重点从“页面替换和基础执行”转向：
+
+- 研究决策如何参与筛选和复盘
+- 批次评分规则如何模块化、可测试和可解释
+- 大 workspace 下读模型和筛选如何下推到服务端
+- 任务执行如何从进程内后台线程演进为更稳的本地执行器
+
 ### 2.3 v1 不解决的问题
 
 以下能力明确后置，不进入 v1：
@@ -621,6 +639,25 @@ load markets
 -> 页面在 Parameter Lab 查看结果分布与稳健性
 ```
 
+当研究者希望一次面向多个 `DatasetSnapshot` 或多个周期同时发起实验时，
+v1 不要求把这些快照直接塞进同一个 `ParameterExperiment`。
+
+推荐工程落地方式是：
+
+```text
+页面多选 DatasetSnapshot
+-> 创建一个 ExperimentBatch
+-> batch fan-out 为多个单快照 ParameterExperiment
+-> 每个 experiment 各自产生一批 run
+-> 页面在 Parameter Lab 查看批次汇总、实验结果和推荐候选
+```
+
+这样做的目的：
+
+- 保持单个 `ParameterExperiment` 的结果口径清晰
+- 避免把多快照比较、参数搜索和结果汇总混成一个对象
+- 允许后续对批次层增加推荐、评分和研究结论沉淀
+
 ## 9. 主执行语义
 
 ### 9.1 默认执行语义
@@ -887,6 +924,16 @@ v1 只要求：
 - 无效组合数
 - 被过滤组合数
 - OOS 空交易组合数
+- 多快照批次汇总
+- 推荐候选区
+
+补充说明：
+
+- `Parameter Lab` 的主目标不是给出一个“唯一最优参数”
+- 页面应优先帮助研究者识别：
+  - 哪些参数在单个快照内较稳健
+  - 哪些参数在多个快照 / 多个周期下重复表现较好
+  - 哪些结果只是单点高收益但不具备稳定性
 
 ## 13. 核心对象模型
 
@@ -1146,6 +1193,53 @@ v1 中该对象只有一种默认值，但对象必须存在。
 - `shared_feature_artifact_ids`
 - `created_at`
 
+说明：
+
+- `ParameterExperiment` 负责表达一次参数搜索任务本身
+- v1 当前工程切片建议保持其结果口径收敛：
+  - 一个 `ParameterExperiment` 对应一个可明确追踪的数据口径
+  - 不把多快照直接混入同一个 experiment 结果表
+- 若用户一次多选多个 `DatasetSnapshot` 发起实验，应由上层批次对象协调，而不是改变 experiment 本身的职责
+
+### 13.12.1 `ExperimentBatch`
+
+表示一次面向多个数据快照的批量实验提交。
+
+字段建议：
+
+- `batch_id`
+- `strategy_name`
+- `dataset_snapshot_ids`
+- `validation_split_id`
+- `metric_policy_id`
+- `benchmark_policy_version`
+- `search_type`
+- `search_space_json`
+- `base_config_uri`
+- `seed_policy`
+- `seed`
+- `experiment_ids`
+- `status`
+- `recommendation_version`
+- `created_at`
+
+职责说明：
+
+- `ExperimentBatch` 不直接替代 `ParameterExperiment`
+- 它的职责是：
+  - 记录一次多快照发起动作
+  - fan-out 为多个已有 `ParameterExperiment`
+  - 汇总多实验结果
+  - 承载批次级推荐与自动评估结果
+
+v1 对 `ExperimentBatch` 的自动评估要求先收敛为规则驱动，不引入黑盒模型。
+
+推荐输出至少分为三类：
+
+- 稳健候选
+- 高收益候选
+- 需排除组合
+
 ### 13.13 `ParameterResult`
 
 字段建议：
@@ -1212,6 +1306,7 @@ v1 中该对象只有一种默认值，但对象必须存在。
 - `target_id`
 - `content`
 - `author`
+- `labels`（v1 可选，用于保存基准 / 候选 / 排除等轻量研究标记）
 - `created_at`
 
 ## 14. 存储设计
@@ -1499,6 +1594,7 @@ v1 不使用抽象产品语言，采用朴素工程规则。
 - `BacktestRun` 绑定单个 `DatasetSnapshot`
 - `ParameterExperiment` 绑定 `DatasetBundle`
 - `ValidationSplit` 可绑定 `DatasetSnapshot` 或 `DatasetBundle`
+- `ExperimentBatch` 绑定多个 `DatasetSnapshot`，并协调多个 `ParameterExperiment`
 
 ## 20. 附录 C：账户与计量规范
 

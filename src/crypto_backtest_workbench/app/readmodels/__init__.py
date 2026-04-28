@@ -27,6 +27,7 @@ from crypto_backtest_workbench.app.readmodels.runs import (
 from crypto_backtest_workbench.app.readmodels.workspace import (
     build_workspace_datasets,
     build_workspace_overview,
+    build_workspace_overview_equity,
     build_workspace_parameter_lab,
     build_workspace_run_detail,
     build_workspace_run_index,
@@ -53,6 +54,7 @@ __all__ = [
     "build_warning_rows",
     "build_workspace_datasets",
     "build_workspace_overview",
+    "build_workspace_overview_equity",
     "build_workspace_parameter_lab",
     "build_workspace_run_detail",
     "build_workspace_run_index",

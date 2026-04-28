@@ -38,6 +38,7 @@ from crypto_backtest_workbench.domain.models.features import (
 )
 from crypto_backtest_workbench.domain.models.run import (
     BacktestRun,
+    ExperimentBatch,
     MetricPolicy,
     ParameterExperiment,
     ResearchNote,
@@ -53,6 +54,7 @@ __all__ = [
     "DatasetBundle",
     "DatasetSnapshot",
     "ExecutionPolicy",
+    "ExperimentBatch",
     "FailureCode",
     "FeatureArtifact",
     "FeatureCacheKey",

@@ -27,6 +27,9 @@ class TaskRepository(Protocol):
     def list_tasks(self) -> list[TaskRecord]:
         """List persisted task records."""
 
+    def delete_task(self, task_id: str) -> None:
+        """Delete one persisted task record."""
+
 
 class FileTaskRepository:
     """Filesystem-backed task repository."""
@@ -67,6 +70,12 @@ class FileTaskRepository:
     def list_tasks(self) -> list[TaskRecord]:
         tasks = [self.load_task(task_id) for task_id in self.list_task_ids()]
         return sorted(tasks, key=lambda item: item.created_at, reverse=True)
+
+    def delete_task(self, task_id: str) -> None:
+        path = self._task_path(task_id)
+        if not path.exists():
+            raise FileNotFoundError(f"Task not found: {task_id}")
+        path.unlink()
 
     def _task_path(self, task_id: str) -> Path:
         return self.base_dir / "tasks" / f"{task_id}.json"

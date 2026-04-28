@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Button, Empty, Pagination, Select, Space, Typography } from 'antd';
+import { Button, Checkbox, Empty, Pagination, Select, Space, Typography } from 'antd';
 import {
   flexRender,
   getCoreRowModel,
@@ -19,6 +19,10 @@ interface DataTableProps<T extends object> {
   initialPageSize?: number;
   pageSizeOptions?: number[];
   initialSorting?: SortingState;
+  tableClassName?: string;
+  getRowId?: (row: T) => string;
+  selectedRowIds?: string[];
+  onSelectedRowIdsChange?: (rowIds: string[]) => void;
 }
 
 export function DataTable<T extends object>({
@@ -27,12 +31,17 @@ export function DataTable<T extends object>({
   initialPageSize = 10,
   pageSizeOptions = [10, 20, 50],
   initialSorting = [],
+  tableClassName,
+  getRowId,
+  selectedRowIds,
+  onSelectedRowIdsChange,
 }: DataTableProps<T>) {
   const [pagination, setPagination] = useState<PaginationState>({
     pageIndex: 0,
     pageSize: initialPageSize,
   });
   const [sorting, setSorting] = useState<SortingState>(initialSorting);
+  const selectionEnabled = Boolean(getRowId && selectedRowIds && onSelectedRowIdsChange);
 
   const table = useReactTable({
     data,
@@ -52,6 +61,11 @@ export function DataTable<T extends object>({
     }
   }, [data.length, pagination.pageIndex, pagination.pageSize]);
 
+  const selectedRowIdSet = new Set(selectedRowIds ?? []);
+  const allSelectableRowIds = selectionEnabled ? data.map((row) => getRowId!(row)) : [];
+  const allRowsSelected = selectionEnabled && allSelectableRowIds.length > 0 && allSelectableRowIds.every((rowId) => selectedRowIdSet.has(rowId));
+  const someRowsSelected = selectionEnabled && allSelectableRowIds.some((rowId) => selectedRowIdSet.has(rowId));
+
   if (!data.length) {
     return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无数据" />;
   }
@@ -59,12 +73,35 @@ export function DataTable<T extends object>({
   return (
     <div className="cbw-table-panel">
       <div className="cbw-table-shell">
-        <table className="cbw-data-table">
+        <table className={tableClassName ? `cbw-data-table ${tableClassName}` : 'cbw-data-table'}>
           <thead>
             {table.getHeaderGroups().map((headerGroup) => (
               <tr key={headerGroup.id}>
+                {selectionEnabled ? (
+                  <th style={{ width: 48, minWidth: 48 }}>
+                    <div className="cbw-th-checkbox">
+                      <Checkbox
+                        checked={allRowsSelected}
+                        indeterminate={!allRowsSelected && someRowsSelected}
+                        onChange={(event) => {
+                          if (event.target.checked) {
+                            onSelectedRowIdsChange!(allSelectableRowIds);
+                            return;
+                          }
+                          onSelectedRowIdsChange!([]);
+                        }}
+                      />
+                    </div>
+                  </th>
+                ) : null}
                 {headerGroup.headers.map((header) => (
-                  <th key={header.id}>
+                  <th
+                    key={header.id}
+                    style={{
+                      width: header.column.columnDef.size,
+                      minWidth: header.column.columnDef.minSize,
+                    }}
+                  >
                     {header.isPlaceholder ? null : (
                       <div className="cbw-th-content">
                         <span>{flexRender(header.column.columnDef.header, header.getContext())}</span>
@@ -94,8 +131,31 @@ export function DataTable<T extends object>({
           <tbody>
             {table.getRowModel().rows.map((row) => (
               <tr key={row.id}>
+                {selectionEnabled ? (
+                  <td style={{ width: 48, minWidth: 48 }}>
+                    <div className="cbw-td-checkbox">
+                      <Checkbox
+                        checked={selectedRowIdSet.has(getRowId!(row.original))}
+                        onChange={(event) => {
+                          const rowId = getRowId!(row.original);
+                          if (event.target.checked) {
+                            onSelectedRowIdsChange!([...selectedRowIdSet, rowId]);
+                            return;
+                          }
+                          onSelectedRowIdsChange!(selectedRowIds!.filter((value) => value !== rowId));
+                        }}
+                      />
+                    </div>
+                  </td>
+                ) : null}
                 {row.getVisibleCells().map((cell) => (
-                  <td key={cell.id}>
+                  <td
+                    key={cell.id}
+                    style={{
+                      width: cell.column.columnDef.size,
+                      minWidth: cell.column.columnDef.minSize,
+                    }}
+                  >
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
                   </td>
                 ))}

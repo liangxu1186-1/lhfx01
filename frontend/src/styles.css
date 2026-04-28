@@ -136,6 +136,13 @@ body {
   white-space: nowrap;
 }
 
+.cbw-th-checkbox,
+.cbw-td-checkbox {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .cbw-th-sorter {
   display: inline-flex;
   align-items: center;
@@ -182,6 +189,32 @@ body {
 .cbw-summary-stat .ant-statistic-content {
   font-size: 22px;
   line-height: 1.2;
+}
+
+.cbw-note-card.ant-card .ant-card-body {
+  padding: 14px 16px;
+}
+
+.cbw-parameter-meta-table,
+.cbw-parameter-group-table,
+.cbw-parameter-result-table {
+  min-width: max-content;
+}
+
+.cbw-parameter-meta-table th,
+.cbw-parameter-meta-table td,
+.cbw-parameter-group-table th,
+.cbw-parameter-group-table td,
+.cbw-parameter-result-table th,
+.cbw-parameter-result-table td {
+  white-space: nowrap;
+}
+
+.cbw-parameter-meta-table th:first-child,
+.cbw-parameter-meta-table td:first-child,
+.cbw-parameter-result-table th:first-child,
+.cbw-parameter-result-table td:first-child {
+  white-space: normal;
 }
 
 @media (min-width: 1600px) {

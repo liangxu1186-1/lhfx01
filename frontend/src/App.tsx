@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useMemo, useState } from 'react';
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import type { ColumnDef } from '@tanstack/react-table';
 import dayjs from 'dayjs';
 import {
@@ -24,22 +24,48 @@ import {
   Spin,
   Statistic,
   Tag,
+  Tooltip,
   Typography,
   theme,
 } from 'antd';
 import { DataTable } from './components/DataTable';
 import { LazyPlot } from './components/LazyPlot';
-import { deleteDataset, deleteRun, loadDatasets, loadParameterExperimentDetail, loadParameterExperiments, loadParameters, loadRunDetail, loadRuns, postIngest, postParameterExperiment, postRunEma } from './lib/api';
+import {
+  deleteDataset,
+  deleteParameterExperiment,
+  deleteParameterExperimentBatch,
+  deleteRun,
+  loadDatasets,
+  loadParameterExperimentBatchDetail,
+  loadParameterExperimentBatches,
+  loadParameterExperimentDetail,
+  loadParameterExperiments,
+  loadOverview,
+  loadOverviewEquity,
+  loadParameters,
+  loadResearchNotes,
+  loadRunDetail,
+  loadRuns,
+  postIngest,
+  postParameterExperimentBatch,
+  postResearchNote,
+  postRunEma,
+} from './lib/api';
 import { formatDateRange, formatDateTime, formatNumber, formatPct, shortRunId } from './lib/format';
 import type {
   DatasetSnapshotView,
+  ParameterExperimentBatchDetail,
+  ParameterExperimentBatchSummary,
   ParameterExperimentDetail,
   ParameterExperimentSummary,
   ParameterLabRow,
+  ResearchNote,
   RunAnalysisView,
   RunSummaryView,
   SensitivityRow,
+  MultiRunEquityRow,
   WorkspaceParameterLab,
+  WorkspaceOverview,
   WorkspaceSource,
 } from './types';
 
@@ -56,6 +82,11 @@ interface UrlState {
   parameterQuery: string;
 }
 
+interface AutoLabelInfo {
+  label: string;
+  reason: string;
+}
+
 const TAB_OPTIONS = [
   { label: '执行台', value: 'execution' },
   { label: '运行总览', value: 'overview' },
@@ -64,6 +95,28 @@ const TAB_OPTIONS = [
 ] satisfies Array<{ label: string; value: TabId }>;
 
 const ALL_EXPERIMENTS = '__all__';
+const ALL_BATCHES = '__all_batches__';
+const RESEARCH_LABEL_OPTIONS = [
+  { label: '基准', value: 'baseline' },
+  { label: '候选', value: 'candidate' },
+  { label: '稳健候选', value: 'robust_candidate' },
+  { label: '高收益候选', value: 'high_return_candidate' },
+  { label: '待复核', value: 'review' },
+  { label: '排除', value: 'excluded' },
+];
+const RESEARCH_LABEL_TEXT: Record<string, string> = {
+  baseline: '基准',
+  candidate: '候选',
+  robust_candidate: '稳健候选',
+  high_return_candidate: '高收益候选',
+  review: '待复核',
+  excluded: '排除',
+};
+const AUTO_GROUP_MEMBERSHIP_LABEL_TEXT: Record<string, string> = {
+  auto_robust_candidate: '所属稳健参数组',
+  auto_high_return_candidate: '所属高收益参数组',
+  auto_excluded: '所属排除参数组',
+};
 
 const ANALYSIS_FIELD_LABELS: Record<string, string> = {
   strategy_version: '策略版本',
@@ -146,6 +199,10 @@ function experimentSearchTypeLabel(searchType: string | undefined): string {
   return searchType === 'grid' ? '网格搜索' : '随机搜索';
 }
 
+function researchLabelText(value: string): string {
+  return RESEARCH_LABEL_TEXT[value] ?? value;
+}
+
 function pickChartSamples<T>(rows: T[], maxPoints = 1200): T[] {
   if (rows.length <= maxPoints) {
     return rows;
@@ -191,10 +248,21 @@ function buildDatasetGroupLabel(snapshot: DatasetSnapshotView): string {
   return `${snapshot.exchange} · ${snapshot.symbol}`;
 }
 
+function buildParameterGroupTargetId(batchId: string, group: { fast_period: number | null; slow_period: number | null; leverage: number | null }): string {
+  return `${batchId}:f${group.fast_period ?? 'na'}:s${group.slow_period ?? 'na'}:l${group.leverage ?? 'na'}`;
+}
+
 function parseIntegerList(value: unknown): number[] {
   return String(value ?? '')
     .split(',')
     .map((entry) => Number.parseInt(entry.trim(), 10))
+    .filter((entry) => Number.isFinite(entry) && entry > 0);
+}
+
+function parsePositiveNumberList(value: unknown): number[] {
+  return String(value ?? '')
+    .split(',')
+    .map((entry) => Number.parseFloat(entry.trim()))
     .filter((entry) => Number.isFinite(entry) && entry > 0);
 }
 
@@ -210,6 +278,25 @@ function validateIntegerListInput(value: unknown, fieldLabel: string): string | 
   const parsed = parts.map((entry) => Number.parseInt(entry, 10));
   if (parsed.some((entry) => !Number.isFinite(entry) || entry <= 0)) {
     return `${fieldLabel}必须是逗号分隔的正整数`;
+  }
+  if (new Set(parsed).size !== parsed.length) {
+    return `${fieldLabel}不能包含重复值`;
+  }
+  return null;
+}
+
+function validatePositiveNumberListInput(value: unknown, fieldLabel: string): string | null {
+  const raw = String(value ?? '').trim();
+  if (!raw) {
+    return `请输入${fieldLabel}`;
+  }
+  const parts = raw.split(',').map((entry) => entry.trim()).filter(Boolean);
+  if (!parts.length) {
+    return `请输入${fieldLabel}`;
+  }
+  const parsed = parts.map((entry) => Number.parseFloat(entry));
+  if (parsed.some((entry) => !Number.isFinite(entry) || entry <= 0)) {
+    return `${fieldLabel}必须是逗号分隔的正数`;
   }
   if (new Set(parsed).size !== parsed.length) {
     return `${fieldLabel}不能包含重复值`;
@@ -261,8 +348,14 @@ function WorkspaceShell() {
   const [generatedAt, setGeneratedAt] = useState<string | null>(null);
   const [datasets, setDatasets] = useState<DatasetSnapshotView[]>([]);
   const [runs, setRuns] = useState<RunSummaryView[]>([]);
+  const [overview, setOverview] = useState<WorkspaceOverview | null>(null);
+  const [overviewEquityRows, setOverviewEquityRows] = useState<MultiRunEquityRow[]>([]);
   const [parameterLab, setParameterLab] = useState<WorkspaceParameterLab | null>(null);
   const [parameterExperiments, setParameterExperiments] = useState<ParameterExperimentSummary[]>([]);
+  const [parameterExperimentBatches, setParameterExperimentBatches] = useState<ParameterExperimentBatchSummary[]>([]);
+  const [researchNotes, setResearchNotes] = useState<ResearchNote[]>([]);
+  const [selectedBatchId, setSelectedBatchId] = useState(ALL_BATCHES);
+  const [selectedBatchDetail, setSelectedBatchDetail] = useState<ParameterExperimentBatchDetail | null>(null);
   const [selectedExperimentId, setSelectedExperimentId] = useState(ALL_EXPERIMENTS);
   const [selectedExperimentDetail, setSelectedExperimentDetail] = useState<ParameterExperimentDetail | null>(null);
   const [selectedRun, setSelectedRun] = useState<RunAnalysisView | null>(null);
@@ -271,15 +364,23 @@ function WorkspaceShell() {
   const [shellLoading, setShellLoading] = useState(true);
   const [sectionLoading, setSectionLoading] = useState(false);
   const [experimentDetailLoading, setExperimentDetailLoading] = useState(false);
+  const [overviewEquityLoading, setOverviewEquityLoading] = useState(false);
   const [activeTab, setActiveTab] = useState<TabId>(initialState.tab);
   const [selectedRunId, setSelectedRunId] = useState<string>(initialState.run);
   const [compareRunIds, setCompareRunIds] = useState<string[]>(initialState.compare);
+  const [selectedOverviewRunIds, setSelectedOverviewRunIds] = useState<string[]>([]);
+  const [overviewLabelFilter, setOverviewLabelFilter] = useState<string[]>([]);
   const [overviewQuery, setOverviewQuery] = useState(initialState.overviewQuery);
   const [parameterQuery, setParameterQuery] = useState(initialState.parameterQuery);
   const [lastActionResult, setLastActionResult] = useState('');
   const [submitting, setSubmitting] = useState<'ingest' | 'run' | 'experiment' | null>(null);
   const [deletingDatasetId, setDeletingDatasetId] = useState<string | null>(null);
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+  const [bulkDeletingRuns, setBulkDeletingRuns] = useState(false);
+  const [deletingExperimentId, setDeletingExperimentId] = useState<string | null>(null);
+  const [deletingBatchId, setDeletingBatchId] = useState<string | null>(null);
+  const [savingResearchNote, setSavingResearchNote] = useState(false);
+  const attemptedParameterResultRefreshKeysRef = useRef<Set<string>>(new Set());
   const [ingestForm] = Form.useForm();
   const [runForm] = Form.useForm();
   const [experimentForm] = Form.useForm();
@@ -292,7 +393,15 @@ function WorkspaceShell() {
   }
 
   function invalidateDerivedData() {
+    setOverview(null);
+    setOverviewEquityRows([]);
+    setSelectedOverviewRunIds([]);
+    attemptedParameterResultRefreshKeysRef.current.clear();
+    setResearchNotes([]);
     setParameterLab(null);
+    setParameterExperimentBatches([]);
+    setSelectedBatchId(ALL_BATCHES);
+    setSelectedBatchDetail(null);
     setParameterExperiments([]);
     setSelectedExperimentId(ALL_EXPERIMENTS);
     setSelectedExperimentDetail(null);
@@ -303,15 +412,45 @@ function WorkspaceShell() {
   async function refreshShell() {
     setShellLoading(true);
     try {
-      const [datasetsPayload, runsPayload] = await Promise.all([loadDatasets(), loadRuns()]);
+      const [datasetsPayload, runsPayload, researchNotesPayload] = await Promise.all([loadDatasets(), loadRuns(), loadResearchNotes()]);
       setDatasets(datasetsPayload.datasets);
       setRuns(runsPayload.runs);
+      setResearchNotes(researchNotesPayload.research_notes);
       applyPayloadMeta(runsPayload);
       setError(null);
     } catch (loadError: unknown) {
       setError(loadError instanceof Error ? loadError.message : '工作台加载失败');
     } finally {
       setShellLoading(false);
+    }
+  }
+
+  async function refreshParameterWorkspaceMeta() {
+    if (
+      parameterLab === null
+      && !parameterExperiments.length
+      && !parameterExperimentBatches.length
+      && selectedExperimentDetail === null
+      && selectedBatchDetail === null
+    ) {
+      return;
+    }
+
+    const [experimentPayload, batchPayload] = await Promise.all([
+      loadParameterExperiments(),
+      loadParameterExperimentBatches(),
+    ]);
+    setParameterExperiments(experimentPayload.parameter_experiments);
+    setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
+
+    if (selectedBatchId !== ALL_BATCHES) {
+      const batchDetailPayload = await loadParameterExperimentBatchDetail(selectedBatchId);
+      setSelectedBatchDetail(batchDetailPayload.parameter_experiment_batch);
+    }
+
+    if (selectedExperimentId !== ALL_EXPERIMENTS) {
+      const detailPayload = await loadParameterExperimentDetail(selectedExperimentId);
+      setSelectedExperimentDetail(detailPayload.parameter_experiment);
     }
   }
 
@@ -380,6 +519,22 @@ function WorkspaceShell() {
     if (activeTab !== 'parameters') {
       return;
     }
+    if (!parameterExperimentBatches.length) {
+      if (selectedBatchId !== ALL_BATCHES) {
+        setSelectedBatchId(ALL_BATCHES);
+      }
+      setSelectedBatchDetail(null);
+      return;
+    }
+    if (selectedBatchId !== ALL_BATCHES && !parameterExperimentBatches.some((batch) => batch.batch_id === selectedBatchId)) {
+      setSelectedBatchId(ALL_BATCHES);
+    }
+  }, [activeTab, parameterExperimentBatches, selectedBatchId]);
+
+  useEffect(() => {
+    if (activeTab !== 'parameters') {
+      return;
+    }
     if (!parameterExperiments.length) {
       if (selectedExperimentId !== ALL_EXPERIMENTS) {
         setSelectedExperimentId(ALL_EXPERIMENTS);
@@ -405,6 +560,7 @@ function WorkspaceShell() {
           }
           applyPayloadMeta(payload);
           setOverview(payload.overview);
+          setOverviewEquityRows([]);
           setError(null);
           return;
         }
@@ -437,9 +593,10 @@ function WorkspaceShell() {
 
         if (activeTab === 'parameters' && parameterLab === null) {
           setSectionLoading(true);
-          const [parameterPayload, experimentPayload] = await Promise.all([
+          const [parameterPayload, experimentPayload, batchPayload] = await Promise.all([
             loadParameters(),
             loadParameterExperiments(),
+            loadParameterExperimentBatches(),
           ]);
           if (cancelled) {
             return;
@@ -447,18 +604,23 @@ function WorkspaceShell() {
           applyPayloadMeta(parameterPayload);
           setParameterLab(parameterPayload.parameter_lab);
           setParameterExperiments(experimentPayload.parameter_experiments);
+          setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
           setError(null);
           return;
         }
 
-        if (activeTab === 'parameters' && parameterLab !== null && !parameterExperiments.length) {
+        if (activeTab === 'parameters' && parameterLab !== null && (!parameterExperiments.length || !parameterExperimentBatches.length)) {
           setSectionLoading(true);
-          const payload = await loadParameterExperiments();
+          const [experimentPayload, batchPayload] = await Promise.all([
+            loadParameterExperiments(),
+            loadParameterExperimentBatches(),
+          ]);
           if (cancelled) {
             return;
           }
-          applyPayloadMeta(payload);
-          setParameterExperiments(payload.parameter_experiments);
+          applyPayloadMeta(experimentPayload);
+          setParameterExperiments(experimentPayload.parameter_experiments);
+          setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
           setError(null);
         }
       } catch (loadError: unknown) {
@@ -476,7 +638,80 @@ function WorkspaceShell() {
     return () => {
       cancelled = true;
     };
-  }, [activeTab, overview, parameterLab, runDetailCache, selectedRun, selectedRunId]);
+  }, [activeTab, overview, parameterExperimentBatches.length, parameterLab, parameterExperiments.length, runDetailCache, selectedRun, selectedRunId]);
+
+  useEffect(() => {
+    if (activeTab !== 'overview' || overview === null) {
+      return;
+    }
+    const availableRunIds = new Set(overview.summaries.map((summary) => summary.run_id));
+    const requestedRunIds = compareRunIds.filter((runId) => availableRunIds.has(runId));
+    if (!requestedRunIds.length) {
+      setOverviewEquityRows([]);
+      return;
+    }
+
+    let cancelled = false;
+    setOverviewEquityLoading(true);
+    void loadOverviewEquity(requestedRunIds)
+      .then((payload) => {
+        if (cancelled) {
+          return;
+        }
+        applyPayloadMeta(payload);
+        setOverviewEquityRows(payload.multi_run_equity);
+        setError(null);
+      })
+      .catch((loadError: unknown) => {
+        if (!cancelled) {
+          setError(loadError instanceof Error ? loadError.message : '资金曲线加载失败');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setOverviewEquityLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, compareRunIds, overview]);
+
+  useEffect(() => {
+    if (activeTab !== 'parameters' || selectedBatchId === ALL_BATCHES) {
+      setSelectedBatchDetail(null);
+      return;
+    }
+    let cancelled = false;
+
+    async function loadSelectedBatchDetail() {
+      try {
+        setSelectedBatchDetail(null);
+        setExperimentDetailLoading(true);
+        const detailPayload = await loadParameterExperimentBatchDetail(selectedBatchId);
+        if (cancelled) {
+          return;
+        }
+        applyPayloadMeta(detailPayload);
+        setSelectedBatchDetail(detailPayload.parameter_experiment_batch);
+        setError(null);
+      } catch (loadError: unknown) {
+        if (!cancelled) {
+          setError(loadError instanceof Error ? loadError.message : '参数实验批次详情加载失败');
+        }
+      } finally {
+        if (!cancelled) {
+          setExperimentDetailLoading(false);
+        }
+      }
+    }
+
+    void loadSelectedBatchDetail();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, selectedBatchId]);
 
   useEffect(() => {
     if (activeTab !== 'parameters' || selectedExperimentId === ALL_EXPERIMENTS) {
@@ -517,14 +752,17 @@ function WorkspaceShell() {
     if (activeTab !== 'parameters') {
       return;
     }
-    if (!parameterExperiments.some((experiment) => experiment.status === 'pending' || experiment.status === 'running')) {
+    const hasRunningExperiments = parameterExperiments.some((experiment) => experiment.status === 'pending' || experiment.status === 'running');
+    const hasRunningBatches = parameterExperimentBatches.some((batch) => batch.status === 'pending' || batch.status === 'running');
+    if (!hasRunningExperiments && !hasRunningBatches) {
       return;
     }
     const timer = window.setInterval(() => {
-      void loadParameterExperiments()
-        .then((experimentPayload) => {
+      void Promise.all([loadParameterExperiments(), loadParameterExperimentBatches()])
+        .then(([experimentPayload, batchPayload]) => {
           applyPayloadMeta(experimentPayload);
           setParameterExperiments(experimentPayload.parameter_experiments);
+          setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
           setError(null);
         })
         .catch((loadError: unknown) => {
@@ -532,12 +770,38 @@ function WorkspaceShell() {
         });
     }, 3000);
     return () => window.clearInterval(timer);
-  }, [activeTab, parameterExperiments]);
+  }, [activeTab, parameterExperimentBatches, parameterExperiments]);
 
   const selectedExperimentSummary = useMemo(
     () => parameterExperiments.find((experiment) => experiment.experiment_id === selectedExperimentId) ?? null,
     [parameterExperiments, selectedExperimentId],
   );
+
+  const selectedBatchSummary = useMemo(
+    () => parameterExperimentBatches.find((batch) => batch.batch_id === selectedBatchId) ?? null,
+    [parameterExperimentBatches, selectedBatchId],
+  );
+
+  useEffect(() => {
+    if (activeTab !== 'parameters' || selectedBatchId === ALL_BATCHES) {
+      return;
+    }
+    if (selectedBatchSummary?.status !== 'pending' && selectedBatchSummary?.status !== 'running') {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void loadParameterExperimentBatchDetail(selectedBatchId)
+        .then((detailPayload) => {
+          applyPayloadMeta(detailPayload);
+          setSelectedBatchDetail(detailPayload.parameter_experiment_batch);
+          setError(null);
+        })
+        .catch((loadError: unknown) => {
+          setError(loadError instanceof Error ? loadError.message : '参数实验批次详情刷新失败');
+        });
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [activeTab, selectedBatchId, selectedBatchSummary?.status]);
 
   useEffect(() => {
     if (activeTab !== 'parameters' || selectedExperimentId === ALL_EXPERIMENTS) {
@@ -574,6 +838,16 @@ function WorkspaceShell() {
     if (!hasMissingRows || !isTerminal) {
       return;
     }
+    const refreshKey = [
+      selectedExperimentDetail.experiment.experiment_id,
+      selectedExperimentDetail.execution.status,
+      selectedExperimentDetail.execution.updated_at ?? '',
+      ...runIds,
+    ].join('|');
+    if (attemptedParameterResultRefreshKeysRef.current.has(refreshKey)) {
+      return;
+    }
+    attemptedParameterResultRefreshKeysRef.current.add(refreshKey);
     let cancelled = false;
     setSectionLoading(true);
     void loadParameters()
@@ -693,28 +967,39 @@ function WorkspaceShell() {
   async function handleSubmitParameterExperiment(values: Record<string, unknown>) {
     setSubmitting('experiment');
     try {
-      const result = await postParameterExperiment({
-        experiment_id: values.experiment_id,
-        snapshot_id: values.snapshot_id,
+      const snapshotIds = Array.isArray(values.snapshot_ids)
+        ? values.snapshot_ids.map((value) => String(value)).filter(Boolean)
+        : [];
+      if (!snapshotIds.length) {
+        throw new Error('请至少选择一个数据快照');
+      }
+      const result = await postParameterExperimentBatch({
+        batch_id: values.batch_id,
+        snapshot_ids: snapshotIds,
         search_type: values.search_type,
         fast_periods: parseIntegerList(values.fast_periods),
         slow_periods: parseIntegerList(values.slow_periods),
+        leverage_candidates: parsePositiveNumberList(values.leverage_candidates),
         max_samples: values.max_samples,
         qty_policy_ref: 'percent_of_cash',
-        cash_allocation_pct: 100,
-        initial_cash: 10000,
-        leverage: 1,
-        fee_rate: 0,
-        slippage_bps: 0,
-        min_notional: 0,
+        cash_allocation_pct: values.cash_allocation_pct,
+        initial_cash: values.initial_cash,
+        fee_rate: values.fee_rate,
+        slippage_bps: values.slippage_bps,
+        min_notional: values.min_notional,
         benchmark: 'buy_and_hold',
       });
-      const experimentId = String(result.experiment_id ?? '');
-      setLastActionResult(`参数实验已提交：${experimentId}`);
-      message.success(`参数实验已提交：${experimentId}`);
-      const experimentsPayload = await loadParameterExperiments();
-      applyPayloadMeta(experimentsPayload);
+      const batchId = String(result.batch_id ?? '');
+      setLastActionResult(`参数实验批次已提交：${batchId}`);
+      message.success(`参数实验批次已提交：${batchId}`);
+      const [batchPayload, experimentsPayload] = await Promise.all([
+        loadParameterExperimentBatches(),
+        loadParameterExperiments(),
+      ]);
+      applyPayloadMeta(batchPayload);
+      setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
       setParameterExperiments(experimentsPayload.parameter_experiments);
+      setSelectedBatchId(batchId || ALL_BATCHES);
       setSelectedExperimentId(ALL_EXPERIMENTS);
       setError(null);
     } catch (submitError: unknown) {
@@ -730,20 +1015,157 @@ function WorkspaceShell() {
     setDeletingRunId(runId);
     try {
       await deleteRun(runId);
+      setParameterLab((current) => (
+        current === null
+          ? current
+          : {
+            ...current,
+            rows: current.rows.filter((row) => row.run_id !== runId),
+          }
+      ));
+      setSelectedExperimentDetail((current) => {
+        if (current === null) {
+          return current;
+        }
+        const nextRunIds = (current.execution.run_ids ?? []).filter((value) => value !== runId);
+        if (nextRunIds.length === (current.execution.run_ids ?? []).length) {
+          return current;
+        }
+        return {
+          ...current,
+          execution: {
+            ...current.execution,
+            run_ids: nextRunIds,
+          },
+        };
+      });
+      setSelectedBatchDetail((current) => {
+        if (current === null) {
+          return current;
+        }
+        const nextRunIds = (current.execution.run_ids ?? []).filter((value) => value !== runId);
+        if (nextRunIds.length === (current.execution.run_ids ?? []).length) {
+          return current;
+        }
+        return {
+          ...current,
+          execution: {
+            ...current.execution,
+            run_ids: nextRunIds,
+          },
+          run_rows: current.run_rows.filter((row) => row.run_id !== runId),
+          parameter_groups: current.parameter_groups.map((group) => ({
+            ...group,
+            run_ids: group.run_ids.filter((value) => value !== runId),
+            run_count: Math.max(0, group.run_count - (group.run_ids.includes(runId) ? 1 : 0)),
+          })),
+          recommendations: {
+            robust_candidates: current.recommendations.robust_candidates.map((group) => ({
+              ...group,
+              run_ids: group.run_ids.filter((value) => value !== runId),
+              run_count: Math.max(0, group.run_count - (group.run_ids.includes(runId) ? 1 : 0)),
+            })),
+            high_return_candidates: current.recommendations.high_return_candidates.map((group) => ({
+              ...group,
+              run_ids: group.run_ids.filter((value) => value !== runId),
+              run_count: Math.max(0, group.run_count - (group.run_ids.includes(runId) ? 1 : 0)),
+            })),
+            excluded_combinations: current.recommendations.excluded_combinations.map((group) => ({
+              ...group,
+              run_ids: group.run_ids.filter((value) => value !== runId),
+              run_count: Math.max(0, group.run_count - (group.run_ids.includes(runId) ? 1 : 0)),
+            })),
+          },
+        };
+      });
       setLastActionResult(`已删除回测：${runId}`);
       message.success(`已删除回测：${runId}`);
       if (selectedRunId === runId) {
         setSelectedRunId('');
       }
-      invalidateDerivedData();
       await refreshShell();
-      setActiveTab('overview');
+      await refreshParameterWorkspaceMeta();
     } catch (submitError: unknown) {
       const text = submitError instanceof Error ? submitError.message : '删除回测失败';
       setLastActionResult(text);
       message.error(text);
     } finally {
       setDeletingRunId(null);
+    }
+  }
+
+  async function handleDeleteRuns(runIds: string[]) {
+    if (!runIds.length) {
+      return;
+    }
+    setBulkDeletingRuns(true);
+    try {
+      const runIdSet = new Set(runIds);
+      for (const runId of runIds) {
+        await deleteRun(runId);
+        if (selectedRunId === runId) {
+          setSelectedRunId('');
+        }
+      }
+      setParameterLab((current) => (
+        current === null
+          ? current
+          : {
+            ...current,
+            rows: current.rows.filter((row) => !runIdSet.has(row.run_id)),
+          }
+      ));
+      setSelectedExperimentDetail((current) => {
+        if (current === null) {
+          return current;
+        }
+        return {
+          ...current,
+          execution: {
+            ...current.execution,
+            run_ids: (current.execution.run_ids ?? []).filter((value) => !runIdSet.has(value)),
+          },
+        };
+      });
+      setSelectedBatchDetail((current) => {
+        if (current === null) {
+          return current;
+        }
+        const shrinkGroup = <T extends { run_ids: string[]; run_count: number }>(group: T): T => {
+          const removedCount = group.run_ids.filter((value) => runIdSet.has(value)).length;
+          return {
+            ...group,
+            run_ids: group.run_ids.filter((value) => !runIdSet.has(value)),
+            run_count: Math.max(0, group.run_count - removedCount),
+          };
+        };
+        return {
+          ...current,
+          execution: {
+            ...current.execution,
+            run_ids: (current.execution.run_ids ?? []).filter((value) => !runIdSet.has(value)),
+          },
+          run_rows: current.run_rows.filter((row) => !runIdSet.has(row.run_id)),
+          parameter_groups: current.parameter_groups.map((group) => shrinkGroup(group)),
+          recommendations: {
+            robust_candidates: current.recommendations.robust_candidates.map((group) => shrinkGroup(group)),
+            high_return_candidates: current.recommendations.high_return_candidates.map((group) => shrinkGroup(group)),
+            excluded_combinations: current.recommendations.excluded_combinations.map((group) => shrinkGroup(group)),
+          },
+        };
+      });
+      setSelectedOverviewRunIds([]);
+      setLastActionResult(`已批量删除 ${runIds.length} 个回测`);
+      message.success(`已批量删除 ${runIds.length} 个回测`);
+      await refreshShell();
+      await refreshParameterWorkspaceMeta();
+      setActiveTab('overview');
+    } catch (submitError: unknown) {
+      const text = submitError instanceof Error ? submitError.message : '批量删除回测失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setBulkDeletingRuns(false);
     }
   }
 
@@ -763,16 +1185,105 @@ function WorkspaceShell() {
     }
   }
 
+  async function handleDeleteParameterExperiment(experimentId: string) {
+    setDeletingExperimentId(experimentId);
+    try {
+      await deleteParameterExperiment(experimentId);
+      setLastActionResult(`已删除参数实验：${experimentId}`);
+      message.success(`已删除参数实验：${experimentId}`);
+      invalidateDerivedData();
+      await refreshShell();
+      setActiveTab('parameters');
+    } catch (submitError: unknown) {
+      const text = submitError instanceof Error ? submitError.message : '删除参数实验失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setDeletingExperimentId(null);
+    }
+  }
+
+  async function handleDeleteParameterExperimentBatch(batchId: string) {
+    setDeletingBatchId(batchId);
+    try {
+      await deleteParameterExperimentBatch(batchId);
+      setLastActionResult(`已删除实验批次：${batchId}`);
+      message.success(`已删除实验批次：${batchId}`);
+      invalidateDerivedData();
+      await refreshShell();
+      setActiveTab('parameters');
+    } catch (submitError: unknown) {
+      const text = submitError instanceof Error ? submitError.message : '删除实验批次失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setDeletingBatchId(null);
+    }
+  }
+
+  async function handleSaveTargetResearchNote(targetType: string, targetId: string, values: Record<string, unknown>) {
+    setSavingResearchNote(true);
+    try {
+      await postResearchNote({
+        target_type: targetType,
+        target_id: targetId,
+        author: String(values.author ?? 'local').trim() || 'local',
+        content: String(values.content ?? '').trim(),
+        labels: Array.isArray(values.labels) ? values.labels : [],
+      });
+      const notesPayload = await loadResearchNotes(targetType, targetId);
+      setResearchNotes((current) => {
+        const retained = current.filter((note) => !(note.target_type === targetType && note.target_id === targetId));
+        return [...notesPayload.research_notes, ...retained];
+      });
+      setLastActionResult(`研究备注已保存：${targetId}`);
+      setError(null);
+      message.success('研究备注已保存');
+    } catch (submitError: unknown) {
+      const text = submitError instanceof Error ? submitError.message : '研究备注保存失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setSavingResearchNote(false);
+    }
+  }
+
+  async function handleSaveResearchNote(runId: string, values: Record<string, unknown>) {
+    await handleSaveTargetResearchNote('run', runId, values);
+    const payload = await loadRunDetail(runId);
+    applyPayloadMeta(payload);
+    setSelectedRun(payload.run);
+    setRunDetailCache((current) => ({ ...current, [payload.run.run_id]: payload.run }));
+  }
+
+  const manualLabelsByRunId = useMemo(() => {
+    const labelMap = new Map<string, string[]>();
+    for (const note of researchNotes) {
+      if (note.target_type !== 'run') {
+        continue;
+      }
+      const current = labelMap.get(note.target_id) ?? [];
+      labelMap.set(note.target_id, Array.from(new Set([...current, ...(note.labels ?? [])])));
+    }
+    return labelMap;
+  }, [researchNotes]);
+
   const filteredSummaries = useMemo(() => {
     const rows = overview?.summaries ?? [];
     const query = deferredOverviewQuery.trim().toLowerCase();
-    if (!query) {
-      return rows;
-    }
-    return rows.filter((row) => (
-      [row.run_id, row.dataset_snapshot_id, row.symbol, row.strategy_name, row.timeframe].join(' ').toLowerCase().includes(query)
-    ));
-  }, [overview, deferredOverviewQuery]);
+    return rows.filter((row) => {
+      if (query && ![row.run_id, row.dataset_snapshot_id, row.symbol, row.strategy_name, row.timeframe].join(' ').toLowerCase().includes(query)) {
+        return false;
+      }
+      if (overviewLabelFilter.length) {
+        const labels = manualLabelsByRunId.get(row.run_id) ?? [];
+        if (!overviewLabelFilter.some((label) => labels.includes(label))) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }, [overview, deferredOverviewQuery, manualLabelsByRunId, overviewLabelFilter]);
 
   const filteredParameterRows = useMemo(() => {
     const rows = parameterLab?.rows ?? [];
@@ -786,6 +1297,11 @@ function WorkspaceShell() {
   }, [parameterLab, deferredParameterQuery]);
 
   const overviewStats = buildOverviewStats(filteredSummaries);
+
+  useEffect(() => {
+    const availableRunIds = new Set(filteredSummaries.map((summary) => summary.run_id));
+    setSelectedOverviewRunIds((current) => current.filter((runId) => availableRunIds.has(runId)));
+  }, [filteredSummaries]);
   const loading = shellLoading || sectionLoading;
   const datasetCount = source?.dataset_count ?? datasets.length;
   const runCount = source?.run_count ?? runs.length;
@@ -847,14 +1363,23 @@ function WorkspaceShell() {
           {activeTab === 'overview' && overview && (
             <OverviewView
               overview={overview}
+              overviewEquityRows={overviewEquityRows}
+              overviewEquityLoading={overviewEquityLoading}
               filteredSummaries={filteredSummaries}
+              manualLabelsByRunId={manualLabelsByRunId}
+              overviewLabelFilter={overviewLabelFilter}
+              setOverviewLabelFilter={setOverviewLabelFilter}
+              selectedOverviewRunIds={selectedOverviewRunIds}
+              setSelectedOverviewRunIds={setSelectedOverviewRunIds}
               compareRunIds={compareRunIds}
               setCompareRunIds={setCompareRunIds}
               overviewQuery={overviewQuery}
               setOverviewQuery={setOverviewQuery}
               overviewStats={overviewStats}
               deletingRunId={deletingRunId}
+              bulkDeletingRuns={bulkDeletingRuns}
               onDeleteRun={handleDeleteRun}
+              onDeleteRuns={handleDeleteRuns}
             />
           )}
           {activeTab === 'analysis' && (
@@ -865,6 +1390,8 @@ function WorkspaceShell() {
               setSelectedRunId={setSelectedRunId}
               deletingRunId={deletingRunId}
               onDeleteRun={handleDeleteRun}
+              onSaveResearchNote={handleSaveResearchNote}
+              savingResearchNote={savingResearchNote}
             />
           )}
           {activeTab === 'parameters' && parameterLab && (
@@ -872,13 +1399,21 @@ function WorkspaceShell() {
               datasets={datasets}
               rows={filteredParameterRows}
               allRows={parameterLab.rows}
+              researchNotes={researchNotes}
+              manualLabelsByRunId={manualLabelsByRunId}
               fastRows={parameterLab.fast_period_total_return}
               slowRows={parameterLab.slow_period_total_return}
+              batches={parameterExperimentBatches}
+              selectedBatchId={selectedBatchId}
+              setSelectedBatchId={setSelectedBatchId}
+              selectedBatchDetail={selectedBatchDetail}
               experiments={parameterExperiments}
               selectedExperimentId={selectedExperimentId}
               setSelectedExperimentId={setSelectedExperimentId}
               selectedExperimentDetail={selectedExperimentDetail}
               experimentDetailLoading={experimentDetailLoading}
+              deletingExperimentId={deletingExperimentId}
+              deletingBatchId={deletingBatchId}
               parameterQuery={parameterQuery}
               setParameterQuery={setParameterQuery}
               experimentForm={experimentForm}
@@ -888,14 +1423,26 @@ function WorkspaceShell() {
                 setSelectedRunId(runId);
                 setActiveTab('analysis');
               }}
+              onDeleteRun={handleDeleteRun}
+              onDeleteExperiment={handleDeleteParameterExperiment}
+              onDeleteBatch={handleDeleteParameterExperimentBatch}
+              onSaveResearchNote={handleSaveTargetResearchNote}
+              savingResearchNote={savingResearchNote}
               onRefreshExperiments={async () => {
-                const [experimentPayload, parameterPayload] = await Promise.all([
+                const [experimentPayload, batchPayload, parameterPayload] = await Promise.all([
                   loadParameterExperiments(),
+                  loadParameterExperimentBatches(),
                   loadParameters(),
                 ]);
                 applyPayloadMeta(experimentPayload);
                 setParameterExperiments(experimentPayload.parameter_experiments);
+                setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
                 setParameterLab(parameterPayload.parameter_lab);
+                if (selectedBatchId !== ALL_BATCHES) {
+                  const batchDetailPayload = await loadParameterExperimentBatchDetail(selectedBatchId);
+                  applyPayloadMeta(batchDetailPayload);
+                  setSelectedBatchDetail(batchDetailPayload.parameter_experiment_batch);
+                }
                 if (selectedExperimentId !== ALL_EXPERIMENTS) {
                   const detailPayload = await loadParameterExperimentDetail(selectedExperimentId);
                   applyPayloadMeta(detailPayload);
@@ -1354,24 +1901,42 @@ function ExecutionView({
 
 function OverviewView({
   overview,
+  overviewEquityRows,
+  overviewEquityLoading,
   filteredSummaries,
+  manualLabelsByRunId,
+  overviewLabelFilter,
+  setOverviewLabelFilter,
+  selectedOverviewRunIds,
+  setSelectedOverviewRunIds,
   compareRunIds,
   setCompareRunIds,
   overviewQuery,
   setOverviewQuery,
   overviewStats,
   deletingRunId,
+  bulkDeletingRuns,
   onDeleteRun,
+  onDeleteRuns,
 }: {
   overview: WorkspaceOverview;
+  overviewEquityRows: MultiRunEquityRow[];
+  overviewEquityLoading: boolean;
   filteredSummaries: RunSummaryView[];
+  manualLabelsByRunId: Map<string, string[]>;
+  overviewLabelFilter: string[];
+  setOverviewLabelFilter: (value: string[]) => void;
+  selectedOverviewRunIds: string[];
+  setSelectedOverviewRunIds: (value: string[]) => void;
   compareRunIds: string[];
   setCompareRunIds: (value: string[]) => void;
   overviewQuery: string;
   setOverviewQuery: (value: string) => void;
   overviewStats: Array<{ title: string; value: string }>;
   deletingRunId: string | null;
+  bulkDeletingRuns: boolean;
   onDeleteRun: (runId: string) => Promise<void>;
+  onDeleteRuns: (runIds: string[]) => Promise<void>;
 }) {
   const columns = useMemo<ColumnDef<RunSummaryView>[]>(() => [
     {
@@ -1395,6 +1960,26 @@ function OverviewView({
     { header: '快 / 慢', cell: ({ row }) => `${row.original.fast_period ?? '--'} / ${row.original.slow_period ?? '--'}` },
     { header: '杠杆', cell: ({ row }) => row.original.leverage ?? '--' },
     { header: '收益率', cell: ({ row }) => formatPct(row.original.total_return) },
+    {
+      id: 'labels',
+      header: '人工标签',
+      enableSorting: false,
+      cell: ({ row }) => {
+        const labels = manualLabelsByRunId.get(row.original.run_id) ?? [];
+        if (!labels.length) {
+          return <Text type="secondary">--</Text>;
+        }
+        return (
+          <Space size={[4, 4]} wrap>
+            {labels.map((label) => (
+              <Tag color={label === 'excluded' ? 'red' : label === 'baseline' ? 'gold' : 'default'} key={`${row.original.run_id}-${label}`}>
+                {RESEARCH_LABEL_TEXT[label] ?? label}
+              </Tag>
+            ))}
+          </Space>
+        );
+      },
+    },
     { header: '基准', cell: ({ row }) => formatPct(row.original.benchmark_return) },
     { header: '交易', accessorKey: 'trade_count' },
     { header: '告警', accessorKey: 'warning_count' },
@@ -1415,11 +2000,15 @@ function OverviewView({
         </Popconfirm>
       ),
     },
-  ], []);
+  ], [manualLabelsByRunId]);
 
-  const plotRows = overview.multi_run_equity;
+  const plotRows = overviewEquityRows;
   const chartOptions = filteredSummaries.length ? filteredSummaries : overview.summaries;
   const summaryByRunId = new Map(overview.summaries.map((summary) => [summary.run_id, summary] as const));
+  const availableOverviewLabels = useMemo(
+    () => Array.from(new Set(overview.summaries.flatMap((summary) => manualLabelsByRunId.get(summary.run_id) ?? []))),
+    [manualLabelsByRunId, overview.summaries],
+  );
   const plotSeries = compareRunIds.map((runId) => ({
     x: plotRows.map((row) => row.timestamp),
     y: plotRows.map((row) => {
@@ -1454,6 +2043,18 @@ function OverviewView({
               />
               <Select
                 mode="multiple"
+                allowClear
+                value={overviewLabelFilter}
+                style={{ minWidth: 220 }}
+                placeholder="按人工标签筛选"
+                onChange={setOverviewLabelFilter}
+                options={availableOverviewLabels.map((label) => ({
+                  label: RESEARCH_LABEL_TEXT[label] ?? label,
+                  value: label,
+                }))}
+              />
+              <Select
+                mode="multiple"
                 value={compareRunIds}
                 style={{ minWidth: 320 }}
                 onChange={setCompareRunIds}
@@ -1465,29 +2066,60 @@ function OverviewView({
             </Space>
           )}
         >
-          <LazyPlot
-            data={plotSeries as never}
-            layout={{
-              autosize: true,
-              height: 360,
-              margin: { l: 40, r: 20, t: 20, b: 40 },
-              paper_bgcolor: '#ffffff',
-              plot_bgcolor: '#ffffff',
-              hovermode: 'x unified',
-              xaxis: { title: '时间（北京时间）' },
-              yaxis: { title: '权益' },
-              legend: { orientation: 'h', title: { text: '每条线代表一个 run 的策略权益' } },
-            } as never}
-            config={{ displayModeBar: false, responsive: true }}
-            style={{ width: '100%' }}
-            useResizeHandler
-          />
+          <Spin spinning={overviewEquityLoading}>
+            <LazyPlot
+              data={plotSeries as never}
+              layout={{
+                autosize: true,
+                height: 360,
+                margin: { l: 40, r: 20, t: 20, b: 40 },
+                paper_bgcolor: '#ffffff',
+                plot_bgcolor: '#ffffff',
+                hovermode: 'x unified',
+                xaxis: { title: '时间（北京时间）' },
+                yaxis: { title: '权益' },
+                legend: { orientation: 'h', title: { text: '每条线代表一个 run 的策略权益' } },
+              } as never}
+              config={{ displayModeBar: false, responsive: true }}
+              style={{ width: '100%' }}
+              useResizeHandler
+            />
+          </Spin>
         </Card>
       </Col>
 
       <Col span={24}>
         <Card title="运行总览表">
-          <DataTable columns={columns} data={filteredSummaries} initialPageSize={10} />
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Flex justify="space-between" align="center" wrap="wrap" gap={12}>
+              <Text type="secondary">
+                {selectedOverviewRunIds.length
+                  ? `已选中 ${selectedOverviewRunIds.length} 条回测`
+                  : '可勾选多条回测后批量删除'}
+              </Text>
+              <Popconfirm
+                title="批量删除选中的回测？"
+                description={`将删除 ${selectedOverviewRunIds.length} 条回测记录`}
+                okText="批量删除"
+                cancelText="取消"
+                okButtonProps={{ danger: true, loading: bulkDeletingRuns }}
+                onConfirm={() => onDeleteRuns(selectedOverviewRunIds)}
+                disabled={!selectedOverviewRunIds.length}
+              >
+                <Button danger disabled={!selectedOverviewRunIds.length} loading={bulkDeletingRuns}>
+                  批量删除
+                </Button>
+              </Popconfirm>
+            </Flex>
+            <DataTable
+              columns={columns}
+              data={filteredSummaries}
+              initialPageSize={10}
+              getRowId={(row) => row.run_id}
+              selectedRowIds={selectedOverviewRunIds}
+              onSelectedRowIdsChange={setSelectedOverviewRunIds}
+            />
+          </Space>
         </Card>
       </Col>
     </Row>
@@ -1501,6 +2133,8 @@ function AnalysisView({
   setSelectedRunId,
   deletingRunId,
   onDeleteRun,
+  onSaveResearchNote,
+  savingResearchNote,
 }: {
   runs: RunSummaryView[];
   selectedRun: RunAnalysisView | null;
@@ -1508,10 +2142,13 @@ function AnalysisView({
   setSelectedRunId: (value: string) => void;
   deletingRunId: string | null;
   onDeleteRun: (runId: string) => Promise<void>;
+  onSaveResearchNote: (runId: string, values: Record<string, unknown>) => Promise<void>;
+  savingResearchNote: boolean;
 }) {
   const [tradeSideFilter, setTradeSideFilter] = useState<string>('all');
   const [tradeOutcomeFilter, setTradeOutcomeFilter] = useState<'all' | 'win' | 'loss' | 'open'>('all');
   const [tradeReasonQuery, setTradeReasonQuery] = useState('');
+  const [researchNoteForm] = Form.useForm();
 
   const tradeColumns = useMemo<ColumnDef<RunAnalysisView['trade_rows'][number]>[]>(() => [
     {
@@ -1546,6 +2183,7 @@ function AnalysisView({
   ], []);
 
   const tradeRows = selectedRun?.trade_rows ?? [];
+  const researchNotes = selectedRun?.research_notes ?? [];
   const equityChartRows = useMemo(
     () => pickChartSamples(selectedRun?.equity_rows ?? [], 1500),
     [selectedRun],
@@ -1623,6 +2261,23 @@ function AnalysisView({
 
   const strategyParams = selectedRun.manifest.resolved_config_json.strategy_params as Record<string, unknown> | undefined;
   const executionConstraints = selectedRun.manifest.resolved_config_json.execution_constraints as Record<string, unknown> | undefined;
+  const validationSummary = selectedRun.validation;
+  const latestResearchNote = researchNotes[0] ?? null;
+  const aggregatedLabels = Array.from(new Set(researchNotes.flatMap((note) => note.labels ?? [])));
+  const validationSegments = validationSummary
+    ? [
+      {
+        key: 'is',
+        title: '样本内 IS',
+        segment: validationSummary.is_segment,
+      },
+      {
+        key: 'oos',
+        title: '样本外 OOS',
+        segment: validationSummary.oos_segment,
+      },
+    ]
+    : [];
 
   return (
     <Row gutter={[16, 16]}>
@@ -1735,6 +2390,154 @@ function AnalysisView({
       </Col>
 
       <Col span={24}>
+        <Card title="样本内 / 样本外研究">
+          {validationSummary ? (
+            <Space direction="vertical" size={16} style={{ width: '100%' }}>
+              <Paragraph type="secondary" style={{ marginBottom: 0 }}>
+                当前主 run 结果仍保持样本内口径；这里额外展示同一份 validation split 下的样本内 / 样本外摘要，用来判断参数是否过拟合。
+              </Paragraph>
+              <Descriptions size="small" column={{ xs: 1, md: 2 }}>
+                <Descriptions.Item label="切分 ID">{validationSummary.validation_split_id}</Descriptions.Item>
+                <Descriptions.Item label="主结果口径">样本内 IS</Descriptions.Item>
+              </Descriptions>
+              <Row gutter={[16, 16]}>
+                {validationSegments.map(({ key, title, segment }) => (
+                  <Col xs={24} xl={12} key={key}>
+                    <Card size="small" title={title}>
+                      <Row gutter={[12, 12]}>
+                        <Col xs={12} md={8}><Statistic title="收益率" value={formatPct(segment.metrics.total_return)} /></Col>
+                        <Col xs={12} md={8}><Statistic title="超额收益" value={formatPct(segment.excess_return)} /></Col>
+                        <Col xs={12} md={8}><Statistic title="成交笔数" value={segment.metrics.trade_count} /></Col>
+                        <Col xs={12} md={8}><Statistic title="胜率" value={formatPct(segment.metrics.win_rate)} /></Col>
+                        <Col xs={12} md={8}><Statistic title="基准收益" value={formatPct(segment.benchmark_return)} /></Col>
+                        <Col xs={12} md={8}><Statistic title="最终权益" value={formatNumber(segment.metrics.final_equity)} /></Col>
+                      </Row>
+                      <Descriptions size="small" column={1} style={{ marginTop: 16 }}>
+                        <Descriptions.Item label="分析区间">
+                          {segment.analysis_start && segment.analysis_end
+                            ? `${formatDateTime(segment.analysis_start)} ~ ${formatDateTime(segment.analysis_end)}`
+                            : '--'}
+                        </Descriptions.Item>
+                        <Descriptions.Item label="K 线 / 预热">
+                          {`${segment.analysis_bar_count} / ${segment.warmup_bars}`}
+                        </Descriptions.Item>
+                        <Descriptions.Item label="预热完整">
+                          {segment.warmup_complete ? '是' : '否'}
+                        </Descriptions.Item>
+                      </Descriptions>
+                    </Card>
+                  </Col>
+                ))}
+              </Row>
+            </Space>
+          ) : (
+            <Alert type="info" showIcon message="当前 run 没有配置 validation split，暂时没有样本内 / 样本外研究摘要。" />
+          )}
+        </Card>
+      </Col>
+
+      <Col span={24}>
+        <Card title="研究备注与标记">
+          <Row gutter={[16, 16]}>
+            <Col xs={24} xl={10}>
+              <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                <Paragraph type="secondary" style={{ marginBottom: 0 }}>
+                  给当前 run 留下结论、候选状态和复盘备注。标签用于快速筛出基准、候选和排除项，备注保留具体判断依据。
+                </Paragraph>
+                <Space wrap size={[8, 8]}>
+                  {aggregatedLabels.length ? aggregatedLabels.map((label) => (
+                    <Tag color={label === 'excluded' ? 'red' : label === 'baseline' ? 'gold' : 'blue'} key={label}>
+                      {researchLabelText(label)}
+                    </Tag>
+                  )) : <Text type="secondary">当前还没有标签</Text>}
+                </Space>
+                <Descriptions size="small" column={1}>
+                  <Descriptions.Item label="备注数">{researchNotes.length}</Descriptions.Item>
+                  <Descriptions.Item label="最近更新">
+                    {latestResearchNote ? formatDateTime(latestResearchNote.created_at) : '--'}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="最近作者">
+                    {latestResearchNote?.author ?? '--'}
+                  </Descriptions.Item>
+                </Descriptions>
+              </Space>
+            </Col>
+            <Col xs={24} xl={14}>
+              <Form
+                form={researchNoteForm}
+                layout="vertical"
+                initialValues={{ author: 'local', labels: [] }}
+                onFinish={async (values) => {
+                  await onSaveResearchNote(selectedRun.run_id, values);
+                  researchNoteForm.setFieldsValue({
+                    author: values.author,
+                    labels: values.labels ?? [],
+                    content: '',
+                  });
+                }}
+              >
+                <Row gutter={[12, 12]}>
+                  <Col xs={24} md={8}>
+                    <Form.Item name="author" label="作者" rules={[{ required: true, whitespace: true, message: '请输入作者' }]}>
+                      <Input placeholder="local" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={16}>
+                    <Form.Item name="labels" label="标签">
+                      <Select
+                        mode="multiple"
+                        options={RESEARCH_LABEL_OPTIONS}
+                        placeholder="选择标签"
+                        optionFilterProp="label"
+                      />
+                    </Form.Item>
+                  </Col>
+                </Row>
+                <Form.Item
+                  name="content"
+                  label="研究备注"
+                  rules={[{ required: true, whitespace: true, message: '请输入备注内容' }]}
+                >
+                  <Input.TextArea rows={3} placeholder="例如：样本外收益仍为正，可作为下一轮重点复核候选。" />
+                </Form.Item>
+                <Flex justify="flex-end">
+                  <Button type="primary" htmlType="submit" loading={savingResearchNote}>
+                    保存备注
+                  </Button>
+                </Flex>
+              </Form>
+            </Col>
+            <Col span={24}>
+              <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                {researchNotes.length ? researchNotes.map((note) => (
+                  <Card size="small" className="cbw-note-card" key={note.note_id}>
+                    <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                      <Flex justify="space-between" align="center" wrap="wrap" gap={8}>
+                        <Space wrap size={[8, 8]}>
+                          <Text strong>{note.author}</Text>
+                          <Text type="secondary">{formatDateTime(note.created_at)}</Text>
+                        </Space>
+                        <Space wrap size={[8, 8]}>
+                          {note.labels.map((label) => (
+                            <Tag color={label === 'excluded' ? 'red' : label === 'baseline' ? 'gold' : 'blue'} key={`${note.note_id}-${label}`}>
+                              {researchLabelText(label)}
+                            </Tag>
+                          ))}
+                        </Space>
+                      </Flex>
+                      <Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>{note.content}</Paragraph>
+                    </Space>
+                  </Card>
+                )) : (
+                  <Alert type="info" showIcon message="当前 run 还没有研究备注。" />
+                )}
+              </Space>
+            </Col>
+          </Row>
+        </Card>
+      </Col>
+
+      <Col span={24}>
         <Card title="交易统计汇总">
           <Paragraph type="secondary" style={{ marginBottom: 12 }}>
             基于当前 run 的全部交易记录计算。
@@ -1822,41 +2625,76 @@ function ParametersView({
   datasets,
   rows,
   allRows,
+  researchNotes,
+  manualLabelsByRunId,
   fastRows,
   slowRows,
+  batches,
+  selectedBatchId,
+  setSelectedBatchId,
+  selectedBatchDetail,
   experiments,
   selectedExperimentId,
   setSelectedExperimentId,
   selectedExperimentDetail,
   experimentDetailLoading,
+  deletingExperimentId,
+  deletingBatchId,
   parameterQuery,
   setParameterQuery,
   experimentForm,
   submitting,
   onSubmitExperiment,
   onOpenRun,
+  onDeleteRun,
+  onDeleteExperiment,
+  onDeleteBatch,
+  onSaveResearchNote,
+  savingResearchNote,
   onRefreshExperiments,
 }: {
   datasets: DatasetSnapshotView[];
   rows: ParameterLabRow[];
   allRows: ParameterLabRow[];
+  researchNotes: ResearchNote[];
+  manualLabelsByRunId: Map<string, string[]>;
   fastRows: SensitivityRow[];
   slowRows: SensitivityRow[];
+  batches: ParameterExperimentBatchSummary[];
+  selectedBatchId: string;
+  setSelectedBatchId: (value: string) => void;
+  selectedBatchDetail: ParameterExperimentBatchDetail | null;
   experiments: ParameterExperimentSummary[];
   selectedExperimentId: string;
   setSelectedExperimentId: (value: string) => void;
   selectedExperimentDetail: ParameterExperimentDetail | null;
   experimentDetailLoading: boolean;
+  deletingExperimentId: string | null;
+  deletingBatchId: string | null;
   parameterQuery: string;
   setParameterQuery: (value: string) => void;
   experimentForm: ReturnType<typeof Form.useForm>[0];
   submitting: 'ingest' | 'run' | 'experiment' | null;
   onSubmitExperiment: (values: Record<string, unknown>) => Promise<void>;
   onOpenRun: (runId: string) => void;
+  onDeleteRun: (runId: string) => Promise<void>;
+  onDeleteExperiment: (experimentId: string) => Promise<void>;
+  onDeleteBatch: (batchId: string) => Promise<void>;
+  onSaveResearchNote: (targetType: string, targetId: string, values: Record<string, unknown>) => Promise<void>;
+  savingResearchNote: boolean;
   onRefreshExperiments: () => Promise<void>;
 }) {
   const experimentSearchType = Form.useWatch('search_type', experimentForm) as string | undefined;
-  const [experimentRunQuery, setExperimentRunQuery] = useState('');
+  const [workspaceMode, setWorkspaceMode] = useState<'batch' | 'experiment' | 'sensitivity'>('batch');
+  const [manualLabelFilter, setManualLabelFilter] = useState<string[]>([]);
+  const [autoLabelFilter, setAutoLabelFilter] = useState<string[]>([]);
+  const [minScoreFilter, setMinScoreFilter] = useState<number | null>(null);
+  const [minConfidenceFilter, setMinConfidenceFilter] = useState<number | null>(null);
+  const [maxDrawdownFilter, setMaxDrawdownFilter] = useState<number | null>(null);
+  const [minReturnDrawdownFilter, setMinReturnDrawdownFilter] = useState<number | null>(null);
+  const [topNFilter, setTopNFilter] = useState<number | null>(null);
+  const [decisionTarget, setDecisionTarget] = useState<{ targetType: string; targetId: string; title: string } | null>(null);
+  const [decisionForm] = Form.useForm();
   const datasetOptions = useMemo(
     () => datasets.map((snapshot) => ({
       label: `${snapshot.dataset_snapshot_id} · ${snapshot.symbol} · ${snapshot.timeframe.toUpperCase()}`,
@@ -1866,11 +2704,11 @@ function ParametersView({
   );
 
   useEffect(() => {
-    if (!experimentForm.getFieldValue('snapshot_id') && datasets[0]?.dataset_snapshot_id) {
-      experimentForm.setFieldValue('snapshot_id', datasets[0].dataset_snapshot_id);
+    if (!experimentForm.getFieldValue('snapshot_ids') && datasets[0]?.dataset_snapshot_id) {
+      experimentForm.setFieldValue('snapshot_ids', [datasets[0].dataset_snapshot_id]);
     }
-    if (!experimentForm.getFieldValue('experiment_id')) {
-      experimentForm.setFieldValue('experiment_id', `experiment-${dayjs().format('YYYYMMDDHHmmss')}`);
+    if (!experimentForm.getFieldValue('batch_id')) {
+      experimentForm.setFieldValue('batch_id', `batch-${dayjs().format('YYYYMMDDHHmmss')}`);
     }
     if (!experimentForm.getFieldValue('search_type')) {
       experimentForm.setFieldValue('search_type', 'grid');
@@ -1881,6 +2719,24 @@ function ParametersView({
     if (!experimentForm.getFieldValue('slow_periods')) {
       experimentForm.setFieldValue('slow_periods', '13,21,34');
     }
+    if (experimentForm.getFieldValue('cash_allocation_pct') === undefined) {
+      experimentForm.setFieldValue('cash_allocation_pct', 100);
+    }
+    if (experimentForm.getFieldValue('initial_cash') === undefined) {
+      experimentForm.setFieldValue('initial_cash', 10000);
+    }
+    if (!experimentForm.getFieldValue('leverage_candidates')) {
+      experimentForm.setFieldValue('leverage_candidates', '1');
+    }
+    if (experimentForm.getFieldValue('fee_rate') === undefined) {
+      experimentForm.setFieldValue('fee_rate', 0);
+    }
+    if (experimentForm.getFieldValue('slippage_bps') === undefined) {
+      experimentForm.setFieldValue('slippage_bps', 0);
+    }
+    if (experimentForm.getFieldValue('min_notional') === undefined) {
+      experimentForm.setFieldValue('min_notional', 0);
+    }
   }, [datasets, experimentForm]);
 
   useEffect(() => {
@@ -1889,62 +2745,229 @@ function ParametersView({
     }
   }, [experimentForm, experimentSearchType]);
 
-  const columns = useMemo<ColumnDef<ParameterLabRow>[]>(() => [
-    {
-      header: 'Run',
-      cell: ({ row }) => (
-        <Space direction="vertical" size={0}>
-          <Text strong>{shortRunId(row.original.run_id)}</Text>
-          <Text type="secondary">{row.original.symbol}</Text>
-        </Space>
-      ),
-    },
-    { header: 'Fast / Slow', cell: ({ row }) => `${row.original.fast_period ?? '--'} / ${row.original.slow_period ?? '--'}` },
-    { header: 'Leverage', cell: ({ row }) => row.original.leverage ?? '--' },
-    { header: '收益率', cell: ({ row }) => formatPct(row.original.total_return) },
-    { header: '超额收益', cell: ({ row }) => formatPct(row.original.excess_return) },
-    { header: '交易', accessorKey: 'trade_count' },
-  ], []);
-
   const selectedExperimentSummary = useMemo(
     () => (selectedExperimentId === ALL_EXPERIMENTS
       ? null
       : experiments.find((experiment) => experiment.experiment_id === selectedExperimentId) ?? null),
     [experiments, selectedExperimentId],
   );
+  const visibleExperiments = useMemo(
+    () => experiments.filter((experiment) => experiment.run_count > 0 || experiment.failed_run_count > 0),
+    [experiments],
+  );
+  const selectedBatchSummary = useMemo(
+    () => (selectedBatchId === ALL_BATCHES
+      ? null
+      : batches.find((batch) => batch.batch_id === selectedBatchId) ?? null),
+    [batches, selectedBatchId],
+  );
+
+  useEffect(() => {
+    if (selectedExperimentId === ALL_EXPERIMENTS) {
+      return;
+    }
+    if (!visibleExperiments.some((experiment) => experiment.experiment_id === selectedExperimentId)) {
+      setSelectedExperimentId(ALL_EXPERIMENTS);
+    }
+  }, [selectedExperimentId, setSelectedExperimentId, visibleExperiments]);
+  useEffect(() => {
+    if (selectedBatchId !== ALL_BATCHES) {
+      return;
+    }
+    if (autoLabelFilter.length) {
+      setAutoLabelFilter([]);
+    }
+    if (minScoreFilter !== null) {
+      setMinScoreFilter(null);
+    }
+    if (minConfidenceFilter !== null) {
+      setMinConfidenceFilter(null);
+    }
+    if (maxDrawdownFilter !== null) {
+      setMaxDrawdownFilter(null);
+    }
+    if (minReturnDrawdownFilter !== null) {
+      setMinReturnDrawdownFilter(null);
+    }
+    if (topNFilter !== null) {
+      setTopNFilter(null);
+    }
+  }, [autoLabelFilter.length, maxDrawdownFilter, minConfidenceFilter, minReturnDrawdownFilter, minScoreFilter, selectedBatchId, topNFilter]);
+  const selectedBatchRows = useMemo(() => {
+    if (selectedBatchId === ALL_BATCHES) {
+      return rows;
+    }
+    const runIds = new Set(selectedBatchDetail?.execution.run_ids ?? []);
+    if (!runIds.size) {
+      return [];
+    }
+    return rows.filter((row) => runIds.has(row.run_id));
+  }, [rows, selectedBatchDetail, selectedBatchId]);
   const selectedExperimentRows = useMemo(() => {
     if (selectedExperimentId === ALL_EXPERIMENTS) {
-      return allRows;
+      return rows;
     }
     const runIds = selectedExperimentDetail?.execution.run_ids ?? [];
     if (!runIds.length) {
       return [];
     }
-    const rowsByRunId = new Map(allRows.map((row) => [row.run_id, row] as const));
+    const rowsByRunId = new Map(rows.map((row) => [row.run_id, row] as const));
     return runIds
       .map((runId) => rowsByRunId.get(runId))
       .filter((row): row is ParameterLabRow => row !== undefined);
-  }, [allRows, selectedExperimentDetail, selectedExperimentId]);
-  const filteredExperimentRows = useMemo(() => {
-    const query = experimentRunQuery.trim().toLowerCase();
-    if (!query) {
-      return selectedExperimentRows;
-    }
-    return selectedExperimentRows.filter((row) => (
-      [
-        row.run_id,
-        row.symbol,
-        row.timeframe,
-        row.dataset_snapshot_id,
-        row.fast_period,
-        row.slow_period,
-      ].join(' ').toLowerCase().includes(query)
-    ));
-  }, [experimentRunQuery, selectedExperimentRows]);
+  }, [rows, selectedExperimentDetail, selectedExperimentId]);
   const failedChildTaskIds = selectedExperimentDetail?.execution.failed_child_task_ids ?? [];
+  const autoLabelsByRunId = useMemo(() => {
+    const labelMap = new Map<string, AutoLabelInfo[]>();
+    if (!selectedBatchDetail) {
+      return labelMap;
+    }
+    const applyLabels = (runIds: string[], label: string, reason: string) => {
+      for (const runId of runIds) {
+        const current = labelMap.get(runId) ?? [];
+        if (!current.some((item) => item.label === label)) {
+          labelMap.set(runId, [...current, { label, reason }]);
+        }
+      }
+    };
+    for (const item of selectedBatchDetail.recommendations.robust_candidates) {
+      applyLabels(item.run_ids, 'auto_robust_candidate', item.reason);
+    }
+    for (const item of selectedBatchDetail.recommendations.high_return_candidates) {
+      applyLabels(item.run_ids, 'auto_high_return_candidate', item.reason);
+    }
+    for (const item of selectedBatchDetail.recommendations.excluded_combinations) {
+      applyLabels(item.run_ids, 'auto_excluded', item.reason);
+    }
+    return labelMap;
+  }, [selectedBatchDetail]);
+
+  const availableManualLabels = useMemo(
+    () => Array.from(new Set(rows.flatMap((row) => manualLabelsByRunId.get(row.run_id) ?? []))),
+    [manualLabelsByRunId, rows],
+  );
+  const availableAutoLabels = useMemo(
+    () => Array.from(new Set(rows.flatMap((row) => (autoLabelsByRunId.get(row.run_id) ?? []).map((item) => item.label)))),
+    [autoLabelsByRunId, rows],
+  );
+  const notesByTarget = useMemo(() => {
+    const noteMap = new Map<string, ResearchNote[]>();
+    for (const note of researchNotes) {
+      const key = `${note.target_type}:${note.target_id}`;
+      noteMap.set(key, [...(noteMap.get(key) ?? []), note]);
+    }
+    return noteMap;
+  }, [researchNotes]);
+  const autoLabelFilterDisabled = selectedBatchId === ALL_BATCHES;
+  const batchGroupLabelsByKey = useMemo(() => {
+    const labelMap = new Map<string, AutoLabelInfo[]>();
+    if (!selectedBatchDetail) {
+      return labelMap;
+    }
+    const groupKey = (fastPeriod: number | null | undefined, slowPeriod: number | null | undefined, leverage: number | null | undefined) => `${fastPeriod ?? 'na'}:${slowPeriod ?? 'na'}:${leverage ?? 'na'}`;
+    const applyLabel = (
+      groups: Array<{ fast_period: number | null; slow_period: number | null; leverage: number | null; reason: string }>,
+      label: string,
+    ) => {
+      for (const group of groups) {
+        const key = groupKey(group.fast_period, group.slow_period, group.leverage);
+        const current = labelMap.get(key) ?? [];
+        if (!current.some((item) => item.label === label)) {
+          labelMap.set(key, [...current, { label, reason: group.reason }]);
+        }
+      }
+    };
+    applyLabel(selectedBatchDetail.recommendations.robust_candidates, 'auto_robust_candidate');
+    applyLabel(selectedBatchDetail.recommendations.high_return_candidates, 'auto_high_return_candidate');
+    applyLabel(selectedBatchDetail.recommendations.excluded_combinations, 'auto_excluded');
+    return labelMap;
+  }, [selectedBatchDetail]);
+  const selectedBatchGroupMetricsByRunId = useMemo(() => {
+    const metrics = new Map<string, { score: number; confidence: number }>();
+    for (const group of selectedBatchDetail?.parameter_groups ?? []) {
+      for (const runId of group.run_ids) {
+        const current = metrics.get(runId);
+        if (!current || group.score > current.score) {
+          metrics.set(runId, { score: group.score, confidence: group.confidence });
+        }
+      }
+    }
+    return metrics;
+  }, [selectedBatchDetail]);
+
+  function matchesScoreFilters(
+    score: number | null | undefined,
+    confidence: number | null | undefined,
+    avgMaxDrawdown?: number | null,
+    returnOverDrawdown?: number | null,
+  ): boolean {
+    if (minScoreFilter !== null && (score ?? Number.NEGATIVE_INFINITY) < minScoreFilter) {
+      return false;
+    }
+    if (minConfidenceFilter !== null && (confidence ?? Number.NEGATIVE_INFINITY) < minConfidenceFilter) {
+      return false;
+    }
+    if (maxDrawdownFilter !== null && (avgMaxDrawdown ?? Number.POSITIVE_INFINITY) > maxDrawdownFilter / 100) {
+      return false;
+    }
+    if (minReturnDrawdownFilter !== null && (returnOverDrawdown ?? Number.NEGATIVE_INFINITY) < minReturnDrawdownFilter) {
+      return false;
+    }
+    return true;
+  }
+
+  function matchesRunLabelFilters(runId: string, options: { applyAutoLabelFilters: boolean; applyBatchScoreFilters: boolean }): boolean {
+    const manualLabels = manualLabelsByRunId.get(runId) ?? [];
+    const autoLabels = (autoLabelsByRunId.get(runId) ?? []).map((item) => item.label);
+    if (manualLabelFilter.length && !manualLabelFilter.some((label) => manualLabels.includes(label))) {
+      return false;
+    }
+    if (options.applyAutoLabelFilters && autoLabelFilter.length && !autoLabelFilter.some((label) => autoLabels.includes(label))) {
+      return false;
+    }
+    if (options.applyBatchScoreFilters && selectedBatchId !== ALL_BATCHES) {
+      const metrics = selectedBatchGroupMetricsByRunId.get(runId);
+      if (!matchesScoreFilters(metrics?.score, metrics?.confidence)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  const filteredBatchParameterGroups = useMemo(() => {
+    const groups = (selectedBatchDetail?.parameter_groups ?? []).filter((group) => matchesScoreFilters(group.score, group.confidence, group.avg_max_drawdown, group.return_over_drawdown));
+    const sortedGroups = [...groups].sort((left, right) => right.score - left.score);
+    return topNFilter ? sortedGroups.slice(0, topNFilter) : sortedGroups;
+  }, [maxDrawdownFilter, minConfidenceFilter, minReturnDrawdownFilter, minScoreFilter, selectedBatchDetail, topNFilter]);
+  const filteredBatchGroupRunIds = useMemo(
+    () => new Set(filteredBatchParameterGroups.flatMap((group) => group.run_ids)),
+    [filteredBatchParameterGroups],
+  );
+  const hasBatchGroupFilters = selectedBatchId !== ALL_BATCHES && (
+    minScoreFilter !== null
+    || minConfidenceFilter !== null
+    || maxDrawdownFilter !== null
+    || minReturnDrawdownFilter !== null
+    || topNFilter !== null
+  );
+  const filteredBatchRunRows = useMemo(
+    () => selectedBatchRows.filter((row) => (
+      matchesRunLabelFilters(row.run_id, { applyAutoLabelFilters: true, applyBatchScoreFilters: true })
+      && (!hasBatchGroupFilters || filteredBatchGroupRunIds.has(row.run_id))
+    )),
+    [autoLabelFilter, filteredBatchGroupRunIds, hasBatchGroupFilters, manualLabelFilter, selectedBatchRows, autoLabelsByRunId, manualLabelsByRunId, selectedBatchGroupMetricsByRunId, minScoreFilter, minConfidenceFilter],
+  );
+  const filteredExperimentRunRows = useMemo(
+    () => selectedExperimentRows.filter((row) => (
+      matchesRunLabelFilters(row.run_id, { applyAutoLabelFilters: false, applyBatchScoreFilters: false })
+    )),
+    [autoLabelFilter, manualLabelFilter, selectedExperimentRows, autoLabelsByRunId, manualLabelsByRunId],
+  );
   const experimentResultColumns = useMemo<ColumnDef<ParameterLabRow>[]>(() => [
     {
       header: 'Run',
+      size: 220,
+      minSize: 220,
       accessorKey: 'run_id',
       cell: ({ row }) => (
         <Space direction="vertical" size={0}>
@@ -1956,31 +2979,86 @@ function ParametersView({
     {
       id: 'timeframe',
       header: '周期',
+      size: 72,
+      minSize: 72,
       accessorFn: (row) => row.timeframe,
       cell: ({ row }) => row.original.timeframe.toUpperCase(),
     },
     {
       id: 'fast_slow',
       header: '快 / 慢',
+      size: 88,
+      minSize: 88,
       accessorFn: (row) => `${row.fast_period ?? ''}/${row.slow_period ?? ''}`,
       cell: ({ row }) => `${row.original.fast_period ?? '--'} / ${row.original.slow_period ?? '--'}`,
     },
-    { id: 'leverage', header: '杠杆', accessorFn: (row) => row.leverage ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.leverage ?? '--' },
-    { id: 'total_return', header: '收益率', accessorFn: (row) => row.total_return, cell: ({ row }) => formatPct(row.original.total_return) },
-    { id: 'excess_return', header: '超额收益', accessorFn: (row) => row.excess_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.excess_return) },
-    { id: 'final_equity', header: '最终权益', accessorFn: (row) => row.final_equity, cell: ({ row }) => formatNumber(row.original.final_equity) },
-    { id: 'trade_count', header: '交易数', accessorFn: (row) => row.trade_count, cell: ({ row }) => row.original.trade_count },
-    { id: 'win_rate', header: '胜率', accessorFn: (row) => row.win_rate, cell: ({ row }) => formatPct(row.original.win_rate) },
+    { id: 'leverage', header: '杠杆', size: 68, minSize: 68, accessorFn: (row) => row.leverage ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.leverage ?? '--' },
+    { id: 'total_return', header: '收益率', size: 104, minSize: 104, accessorFn: (row) => row.total_return, cell: ({ row }) => formatPct(row.original.total_return) },
+    { id: 'max_drawdown', header: '最大回撤', size: 104, minSize: 104, accessorFn: (row) => row.max_drawdown, cell: ({ row }) => formatPct(row.original.max_drawdown) },
+    { id: 'excess_return', header: '超额收益', size: 108, minSize: 108, accessorFn: (row) => row.excess_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.excess_return) },
+    { id: 'oos_total_return', header: '样本外收益', size: 120, minSize: 120, accessorFn: (row) => row.oos_total_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.oos_total_return) },
+    { id: 'oos_excess_return', header: '样本外超额', size: 120, minSize: 120, accessorFn: (row) => row.oos_excess_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.oos_excess_return) },
+    { id: 'final_equity', header: '最终权益', size: 120, minSize: 120, accessorFn: (row) => row.final_equity, cell: ({ row }) => formatNumber(row.original.final_equity) },
+    { id: 'trade_count', header: '交易数', size: 84, minSize: 84, accessorFn: (row) => row.trade_count, cell: ({ row }) => row.original.trade_count },
+    { id: 'win_rate', header: '胜率', size: 88, minSize: 88, accessorFn: (row) => row.win_rate, cell: ({ row }) => formatPct(row.original.win_rate) },
+    {
+      id: 'labels',
+      header: '标签',
+      size: 220,
+      minSize: 220,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const autoLabels = autoLabelsByRunId.get(row.original.run_id) ?? [];
+        const manualLabels = manualLabelsByRunId.get(row.original.run_id) ?? [];
+        if (!autoLabels.length && !manualLabels.length) {
+          return <Text type="secondary">--</Text>;
+        }
+        return (
+          <Space size={[4, 4]} wrap>
+            {autoLabels.map((item) => (
+              <Tooltip key={`${row.original.run_id}-${item.label}`} title={item.reason}>
+                <Tag color={item.label === 'auto_excluded' ? 'red' : item.label === 'auto_high_return_candidate' ? 'blue' : 'green'}>
+                  {AUTO_GROUP_MEMBERSHIP_LABEL_TEXT[item.label] ?? item.label}
+                </Tag>
+              </Tooltip>
+            ))}
+            {manualLabels.map((label) => (
+              <Tag color={label === 'excluded' ? 'red' : label === 'baseline' ? 'gold' : 'default'} key={`${row.original.run_id}-${label}`}>
+                {RESEARCH_LABEL_TEXT[label] ?? label}
+              </Tag>
+            ))}
+          </Space>
+        );
+      },
+    },
     {
       id: 'actions',
       header: '操作',
+      size: 160,
+      minSize: 160,
       enableSorting: false,
-      cell: ({ row }) => <Button size="small" onClick={() => onOpenRun(row.original.run_id)}>打开分析</Button>,
+      cell: ({ row }) => (
+        <Space>
+          <Button size="small" onClick={() => onOpenRun(row.original.run_id)}>打开分析</Button>
+          <Popconfirm
+            title="删除这个实验 Run？"
+            description={`run_id: ${row.original.run_id}`}
+            okText="删除"
+            cancelText="取消"
+            okButtonProps={{ danger: true }}
+            onConfirm={() => onDeleteRun(row.original.run_id)}
+          >
+            <Button size="small" danger>删除</Button>
+          </Popconfirm>
+        </Space>
+      ),
     },
-  ], [onOpenRun]);
+  ], [autoLabelsByRunId, manualLabelsByRunId, onDeleteRun, onOpenRun]);
   const experimentColumns = useMemo<ColumnDef<ParameterExperimentSummary>[]>(() => [
     {
       header: '实验 ID',
+      size: 360,
+      minSize: 300,
       cell: ({ row }) => (
         <Space direction="vertical" size={0}>
           <Text strong>{row.original.experiment_id}</Text>
@@ -1988,163 +3066,251 @@ function ParametersView({
         </Space>
       ),
     },
-    { header: '模式', cell: ({ row }) => experimentSearchTypeLabel(row.original.search_type) },
-    { header: '计划 / 已完成', cell: ({ row }) => `${row.original.planned_run_count} / ${row.original.run_count}` },
-    { header: '失败数', accessorKey: 'failed_run_count' },
+    { header: '模式', size: 88, minSize: 88, cell: ({ row }) => experimentSearchTypeLabel(row.original.search_type) },
+    { header: '计划 / 已完成', size: 108, minSize: 108, cell: ({ row }) => `${row.original.planned_run_count} / ${row.original.run_count}` },
+    { header: '失败数', size: 72, minSize: 72, accessorKey: 'failed_run_count' },
     {
       header: '状态',
+      size: 96,
+      minSize: 96,
       cell: ({ row }) => {
         const status = row.original.status;
         return <Tag color={experimentStatusColor(status)}>{status}</Tag>;
       },
     },
-    { id: 'created_at', header: '提交时间', accessorFn: (row) => row.created_at, cell: ({ row }) => formatDateTime(row.original.created_at) },
+    { id: 'created_at', header: '提交时间', size: 150, minSize: 150, accessorFn: (row) => row.created_at, cell: ({ row }) => formatDateTime(row.original.created_at) },
     {
       id: 'actions',
       header: '操作',
+      size: 180,
+      minSize: 180,
       enableSorting: false,
       cell: ({ row }) => (
-        <Button size="small" type={row.original.experiment_id === selectedExperimentId ? 'primary' : 'default'} onClick={() => setSelectedExperimentId(row.original.experiment_id)}>
-          查看结果
-        </Button>
+        <Space>
+          <Button size="small" type={row.original.experiment_id === selectedExperimentId ? 'primary' : 'default'} onClick={() => setSelectedExperimentId(row.original.experiment_id)}>
+            查看结果
+          </Button>
+          <Popconfirm
+            title="删除这个参数实验？"
+            description={`experiment_id: ${row.original.experiment_id}`}
+            okText="删除"
+            cancelText="取消"
+            okButtonProps={{ danger: true, loading: deletingExperimentId === row.original.experiment_id }}
+            onConfirm={() => onDeleteExperiment(row.original.experiment_id)}
+          >
+            <Button size="small" danger loading={deletingExperimentId === row.original.experiment_id}>删除</Button>
+          </Popconfirm>
+        </Space>
       ),
     },
-  ], [selectedExperimentId, setSelectedExperimentId]);
+  ], [deletingExperimentId, onDeleteExperiment, selectedExperimentId, setSelectedExperimentId]);
+  const batchColumns = useMemo<ColumnDef<ParameterExperimentBatchSummary>[]>(() => [
+    {
+      header: '批次 ID',
+      size: 320,
+      minSize: 280,
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Text strong>{row.original.batch_id}</Text>
+          <Text type="secondary">{row.original.task_id ?? '--'}</Text>
+        </Space>
+      ),
+    },
+    { header: '快照 / 实验', size: 100, minSize: 100, cell: ({ row }) => `${row.original.snapshot_count} / ${row.original.experiment_count}` },
+    { header: '计划 / 已完成', size: 110, minSize: 110, cell: ({ row }) => `${row.original.planned_run_count} / ${row.original.run_count}` },
+    { header: '失败实验', size: 84, minSize: 84, accessorKey: 'failed_experiment_count' },
+    {
+      header: '状态',
+      size: 96,
+      minSize: 96,
+      cell: ({ row }) => <Tag color={experimentStatusColor(row.original.status)}>{row.original.status}</Tag>,
+    },
+    { id: 'created_at', header: '提交时间', size: 150, minSize: 150, accessorFn: (row) => row.created_at, cell: ({ row }) => formatDateTime(row.original.created_at) },
+    {
+      id: 'actions',
+      header: '操作',
+      size: 180,
+      minSize: 180,
+      enableSorting: false,
+      cell: ({ row }) => (
+        <Space>
+          <Button size="small" type={row.original.batch_id === selectedBatchId ? 'primary' : 'default'} onClick={() => setSelectedBatchId(row.original.batch_id)}>
+            查看批次
+          </Button>
+          <Popconfirm
+            title="删除这个实验批次？"
+            description={`batch_id: ${row.original.batch_id}`}
+            okText="删除"
+            cancelText="取消"
+            okButtonProps={{ danger: true, loading: deletingBatchId === row.original.batch_id }}
+            onConfirm={() => onDeleteBatch(row.original.batch_id)}
+          >
+            <Button size="small" danger loading={deletingBatchId === row.original.batch_id}>删除</Button>
+          </Popconfirm>
+        </Space>
+      ),
+    },
+  ], [deletingBatchId, onDeleteBatch, selectedBatchId, setSelectedBatchId]);
+  function openDecisionModal(targetType: string, targetId: string, title: string) {
+    decisionForm.resetFields();
+    decisionForm.setFieldsValue({ author: 'local', labels: ['candidate'] });
+    setDecisionTarget({ targetType, targetId, title });
+  }
+
+  const batchParameterGroupColumns = useMemo<ColumnDef<NonNullable<ParameterExperimentBatchDetail['parameter_groups']>[number]>[]>(() => [
+    { id: 'fast_slow', header: '快 / 慢', accessorFn: (row) => `${row.fast_period ?? ''}/${row.slow_period ?? ''}`, cell: ({ row }) => `${row.original.fast_period ?? '--'} / ${row.original.slow_period ?? '--'}` },
+    { id: 'leverage', header: '杠杆', accessorFn: (row) => row.leverage ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.leverage ?? '--' },
+    {
+      id: 'labels',
+      header: '参数组推荐标签',
+      enableSorting: false,
+      size: 240,
+      minSize: 220,
+      cell: ({ row }) => {
+        const key = `${row.original.fast_period ?? 'na'}:${row.original.slow_period ?? 'na'}:${row.original.leverage ?? 'na'}`;
+        const autoLabels = batchGroupLabelsByKey.get(key) ?? [];
+        if (!autoLabels.length) {
+          return <Text type="secondary">--</Text>;
+        }
+        return (
+          <Space size={[4, 4]} wrap>
+            {autoLabels.map((item) => (
+              <Tooltip key={`${key}-${item.label}`} title={item.reason}>
+                <Tag color={item.label === 'auto_excluded' ? 'red' : item.label === 'auto_high_return_candidate' ? 'blue' : 'green'}>
+                  {item.label === 'auto_excluded'
+                    ? '自动排除'
+                    : item.label === 'auto_high_return_candidate'
+                      ? '自动高收益候选'
+                      : '自动稳健候选'}
+                </Tag>
+              </Tooltip>
+            ))}
+          </Space>
+        );
+      },
+    },
+    { id: 'snapshot_count', header: '覆盖快照', accessorFn: (row) => row.snapshot_count, cell: ({ row }) => row.original.snapshot_count },
+    { id: 'run_count', header: 'Run 数', accessorFn: (row) => row.run_count, cell: ({ row }) => row.original.run_count },
+    { id: 'score', header: '总分', accessorFn: (row) => row.score, cell: ({ row }) => formatNumber(row.original.score, 1) },
+    { id: 'confidence', header: '置信度', accessorFn: (row) => row.confidence, cell: ({ row }) => formatNumber(row.original.confidence, 1) },
+    { id: 'avg_total_return', header: '平均收益率', accessorFn: (row) => row.avg_total_return, cell: ({ row }) => formatPct(row.original.avg_total_return) },
+    { id: 'avg_max_drawdown', header: '平均最大回撤', accessorFn: (row) => row.avg_max_drawdown, cell: ({ row }) => formatPct(row.original.avg_max_drawdown) },
+    { id: 'worst_max_drawdown', header: '最差最大回撤', accessorFn: (row) => row.worst_max_drawdown, cell: ({ row }) => formatPct(row.original.worst_max_drawdown) },
+    { id: 'return_over_drawdown', header: '收益回撤比', accessorFn: (row) => row.return_over_drawdown, cell: ({ row }) => formatNumber(row.original.return_over_drawdown, 2) },
+    { id: 'avg_excess_return', header: '平均超额收益', accessorFn: (row) => row.avg_excess_return, cell: ({ row }) => formatPct(row.original.avg_excess_return) },
+    { id: 'avg_oos_total_return', header: '平均样本外收益', accessorFn: (row) => row.avg_oos_total_return, cell: ({ row }) => formatPct(row.original.avg_oos_total_return) },
+    { id: 'avg_oos_excess_return', header: '平均样本外超额', accessorFn: (row) => row.avg_oos_excess_return, cell: ({ row }) => formatPct(row.original.avg_oos_excess_return) },
+    { id: 'best_total_return', header: '最佳收益率', accessorFn: (row) => row.best_total_return, cell: ({ row }) => formatPct(row.original.best_total_return) },
+    { id: 'positive_ratio', header: '正收益占比', accessorFn: (row) => row.positive_ratio, cell: ({ row }) => formatPct(row.original.positive_ratio) },
+    { id: 'oos_positive_ratio', header: '样本外正收益占比', accessorFn: (row) => row.oos_positive_ratio ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.oos_positive_ratio) },
+    { id: 'neighbor_stability_score', header: '邻域稳定度', accessorFn: (row) => row.neighbor_stability_score ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.neighbor_stability_score) },
+    { id: 'stable_neighbor_count', header: '稳定邻居', accessorFn: (row) => row.stable_neighbor_count, cell: ({ row }) => `${row.original.stable_neighbor_count} / ${row.original.neighbor_count}` },
+    { id: 'min_trade_count', header: '最少交易数', accessorFn: (row) => row.min_trade_count ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.min_trade_count ?? '--' },
+    {
+      id: 'decision',
+      header: '研究决策',
+      enableSorting: false,
+      size: 150,
+      minSize: 140,
+      cell: ({ row }) => {
+        const targetId = selectedBatchDetail
+          ? buildParameterGroupTargetId(selectedBatchDetail.batch.batch_id, row.original)
+          : '';
+        const notes = notesByTarget.get(`parameter_group:${targetId}`) ?? [];
+        return (
+          <Space>
+            {notes.length ? <Tag color="blue">{notes.length} 条</Tag> : <Text type="secondary">--</Text>}
+            {targetId ? (
+              <Button
+                size="small"
+                onClick={() => openDecisionModal(
+                  'parameter_group',
+                  targetId,
+                  `参数组 快 ${row.original.fast_period ?? '--'} / 慢 ${row.original.slow_period ?? '--'} / 杠杆 ${row.original.leverage ?? '--'}`,
+                )}
+              >
+                记录
+              </Button>
+            ) : null}
+          </Space>
+        );
+      },
+    },
+  ], [batchGroupLabelsByKey, notesByTarget, selectedBatchDetail]);
+
+  const resultStats = useMemo(() => {
+    const sourceRows = workspaceMode === 'batch' ? filteredBatchRunRows : filteredExperimentRunRows;
+    const baseRows = workspaceMode === 'batch' ? selectedBatchRows : selectedExperimentRows;
+    const avgReturn = sourceRows.length
+      ? sourceRows.reduce((sum, row) => sum + row.total_return, 0) / sourceRows.length
+      : null;
+    const bestReturn = sourceRows.length
+      ? Math.max(...sourceRows.map((row) => row.total_return))
+      : null;
+    return {
+      runCount: sourceRows.length,
+      filteredCount: sourceRows.length,
+      baseCount: baseRows.length,
+      totalCount: allRows.length,
+      avgReturn,
+      bestReturn,
+    };
+  }, [allRows.length, filteredBatchRunRows, filteredExperimentRunRows, selectedBatchRows, selectedExperimentRows, workspaceMode]);
+
+  const batchRecommendationSections = selectedBatchDetail
+    ? [
+      {
+        key: 'robust',
+        title: '稳健候选',
+        type: 'success' as const,
+        items: selectedBatchDetail.recommendations.robust_candidates.filter((item) => matchesScoreFilters(item.score, item.confidence, item.avg_max_drawdown, item.return_over_drawdown)),
+        empty: '当前批次还没有满足规则的稳健候选。',
+        description: (item: ParameterExperimentBatchDetail['recommendations']['robust_candidates'][number]) => `${item.reason}；总分 ${formatNumber(item.score, 1)}，置信度 ${formatNumber(item.confidence, 1)}，平均收益 ${formatPct(item.avg_total_return)}，最大回撤 ${formatPct(item.avg_max_drawdown)}，收益回撤比 ${formatNumber(item.return_over_drawdown, 2)}。`,
+      },
+      {
+        key: 'high',
+        title: '高收益候选',
+        type: 'info' as const,
+        items: selectedBatchDetail.recommendations.high_return_candidates.filter((item) => matchesScoreFilters(item.score, item.confidence, item.avg_max_drawdown, item.return_over_drawdown)),
+        empty: '当前批次还没有可单独标记的高收益候选。',
+        description: (item: ParameterExperimentBatchDetail['recommendations']['high_return_candidates'][number]) => `${item.reason}；总分 ${formatNumber(item.score, 1)}，置信度 ${formatNumber(item.confidence, 1)}，最佳收益 ${formatPct(item.best_total_return)}，最大回撤 ${formatPct(item.avg_max_drawdown)}。`,
+      },
+      {
+        key: 'exclude',
+        title: '需排除组合',
+        type: 'warning' as const,
+        items: selectedBatchDetail.recommendations.excluded_combinations.filter((item) => matchesScoreFilters(item.score, item.confidence, item.avg_max_drawdown, item.return_over_drawdown)),
+        empty: '当前批次没有明显应排除的组合。',
+        description: (item: ParameterExperimentBatchDetail['recommendations']['excluded_combinations'][number]) => `${item.reason}；总分 ${formatNumber(item.score, 1)}，置信度 ${formatNumber(item.confidence, 1)}，平均收益 ${formatPct(item.avg_total_return)}，最差回撤 ${formatPct(item.worst_max_drawdown)}。`,
+      },
+    ]
+    : [];
 
   return (
+    <>
     <Row gutter={[16, 16]}>
-      <Col span={24}>
-        <Card
-          title="参数实验"
-          extra={(
-            <Input
-              placeholder="搜索 run / 数据集 / 标的"
-              value={parameterQuery}
-              onChange={(event) => setParameterQuery(event.target.value)}
-            />
-          )}
-        >
+      <Col xs={24} xl={8}>
+        <Card title="发起实验批次" extra={<Button onClick={() => void onRefreshExperiments()}>刷新状态</Button>}>
           <Paragraph type="secondary">
-            这个视图只负责参数敏感度、实验筛选和实验表，不再混入单次 run 详情，方便桌面和大屏长时间查看。
-          </Paragraph>
-        </Card>
-      </Col>
-
-      <Col span={24}>
-        <Card
-          title="实验结果查看"
-          extra={(
-            <Space wrap>
-              <Select
-                value={selectedExperimentId}
-                style={{ minWidth: 360 }}
-                placeholder="选择参数实验范围"
-                onChange={setSelectedExperimentId}
-                options={[
-                  { label: '全部实验', value: ALL_EXPERIMENTS },
-                  ...experiments.map((experiment) => ({
-                    label: `${experiment.experiment_id} · ${experimentSearchTypeLabel(experiment.search_type)} · ${experiment.status}`,
-                    value: experiment.experiment_id,
-                  })),
-                ]}
-              />
-              {selectedExperimentSummary ? (
-                <Tag color={experimentStatusColor(selectedExperimentSummary.status)}>{selectedExperimentSummary.status}</Tag>
-              ) : null}
-            </Space>
-          )}
-        >
-          {!experiments.length ? (
-            <Alert type="info" showIcon message="当前还没有可查看的参数实验" />
-          ) : (
-            <Spin spinning={experimentDetailLoading}>
-              <Space direction="vertical" size={16} style={{ width: '100%' }}>
-                <Paragraph type="secondary" style={{ marginBottom: 0 }}>
-                  {selectedExperimentId === ALL_EXPERIMENTS
-                    ? '当前展示全部实验的汇总结果，适合先整体排序筛选，再进入单次分析。'
-                    : '这里直接消费实验详情与子 run 结果，方便按指标排序后快速跳转到单次分析。'}
-                </Paragraph>
-                <Row gutter={[12, 12]}>
-                  <Col xs={12} md={6}><Card size="small"><Statistic title="实验数" value={selectedExperimentId === ALL_EXPERIMENTS ? experiments.length : 1} /></Card></Col>
-                  <Col xs={12} md={6}><Card size="small"><Statistic title="计划组合" value={selectedExperimentId === ALL_EXPERIMENTS ? experiments.reduce((sum, experiment) => sum + experiment.planned_run_count, 0) : (selectedExperimentDetail?.execution.planned_run_count ?? selectedExperimentSummary?.planned_run_count ?? 0)} /></Card></Col>
-                  <Col xs={12} md={6}><Card size="small"><Statistic title="已生成 Run" value={selectedExperimentId === ALL_EXPERIMENTS ? selectedExperimentRows.length : (selectedExperimentDetail?.execution.run_ids?.length ?? selectedExperimentSummary?.run_count ?? 0)} /></Card></Col>
-                  <Col xs={12} md={6}><Card size="small"><Statistic title="失败子任务" value={selectedExperimentId === ALL_EXPERIMENTS ? experiments.reduce((sum, experiment) => sum + experiment.failed_run_count, 0) : (failedChildTaskIds.length || selectedExperimentSummary?.failed_run_count || 0)} /></Card></Col>
-                </Row>
-                {selectedExperimentId !== ALL_EXPERIMENTS ? (
-                  <Descriptions size="small" column={{ xs: 1, md: 2 }}>
-                    <Descriptions.Item label="实验 ID">{selectedExperimentDetail?.experiment.experiment_id ?? selectedExperimentId}</Descriptions.Item>
-                    <Descriptions.Item label="搜索方式">{experimentSearchTypeLabel(selectedExperimentDetail?.experiment.search_type ?? selectedExperimentSummary?.search_type)}</Descriptions.Item>
-                    <Descriptions.Item label="数据集">{selectedExperimentDetail?.experiment.dataset_bundle_id ?? selectedExperimentSummary?.dataset_bundle_id ?? '--'}</Descriptions.Item>
-                    <Descriptions.Item label="父任务">{selectedExperimentDetail?.execution.task_id ?? selectedExperimentSummary?.task_id ?? '--'}</Descriptions.Item>
-                    <Descriptions.Item label="提交时间">{selectedExperimentDetail?.experiment.created_at ? formatDateTime(selectedExperimentDetail.experiment.created_at) : (selectedExperimentSummary ? formatDateTime(selectedExperimentSummary.created_at) : '--')}</Descriptions.Item>
-                    <Descriptions.Item label="随机种子策略">{selectedExperimentDetail?.experiment.seed_policy ?? '--'}</Descriptions.Item>
-                  </Descriptions>
-                ) : null}
-                {selectedExperimentId !== ALL_EXPERIMENTS && failedChildTaskIds.length ? (
-                  <Alert
-                    type="warning"
-                    showIcon
-                    message={`有 ${failedChildTaskIds.length} 个子任务失败`}
-                    description={`失败任务：${failedChildTaskIds.join('，')}`}
-                  />
-                ) : null}
-                <Card
-                  size="small"
-                  title="子 Run 结果"
-                  extra={(
-                    <Input
-                      placeholder="搜索 run / 标的 / 周期 / 参数"
-                      value={experimentRunQuery}
-                      onChange={(event) => setExperimentRunQuery(event.target.value)}
-                      style={{ width: 260 }}
-                    />
-                  )}
-                >
-                  <Paragraph type="secondary">
-                    当前显示 {filteredExperimentRows.length} / {selectedExperimentRows.length} 条已落盘 run。可按收益率、超额收益、最终权益、胜率直接排序。
-                  </Paragraph>
-                  <DataTable
-                    columns={experimentResultColumns}
-                    data={filteredExperimentRows}
-                    initialPageSize={8}
-                    pageSizeOptions={[8, 16, 32]}
-                    initialSorting={[{ id: 'total_return', desc: true }]}
-                  />
-                </Card>
-              </Space>
-            </Spin>
-          )}
-        </Card>
-      </Col>
-
-      <Col span={24}>
-        <Card title="发起参数实验" extra={<Button onClick={() => void onRefreshExperiments()}>刷新实验状态</Button>}>
-          <Paragraph type="secondary">
-            当前版本严格收敛在设计文档边界内：仅支持 EMA、单数据快照、`grid/random` 两种搜索方式。
+            这里只负责提交新的实验批次。右侧工作区负责查看批次结果、单实验明细和参数敏感度。
           </Paragraph>
           <Form form={experimentForm} layout="vertical" onFinish={(values) => void onSubmitExperiment(values as Record<string, unknown>)}>
-            <Row gutter={16}>
-              <Col xs={24} md={8}>
-                <Form.Item name="experiment_id" label="实验 ID" rules={[{ required: true, whitespace: true, message: '请输入实验 ID' }]}>
-                  <Input />
-                </Form.Item>
-              </Col>
-              <Col xs={24} md={8}>
-                <Form.Item name="snapshot_id" label="数据快照" rules={[{ required: true }]}>
-                  <Select options={datasetOptions} showSearch optionFilterProp="label" />
-                </Form.Item>
-              </Col>
-              <Col xs={24} md={8}>
-                <Form.Item name="search_type" label="搜索方式" rules={[{ required: true }]}>
-                  <Select
-                    options={[
-                      { label: '网格搜索', value: 'grid' },
-                      { label: '随机搜索', value: 'random' },
-                    ]}
-                  />
-                </Form.Item>
-              </Col>
-              <Col xs={24} md={8}>
+            <Form.Item name="batch_id" label="批次 ID" rules={[{ required: true, whitespace: true, message: '请输入批次 ID' }]}>
+              <Input />
+            </Form.Item>
+            <Form.Item name="snapshot_ids" label="数据快照" rules={[{ required: true, type: 'array', min: 1, message: '请至少选择一个数据快照' }]}>
+              <Select mode="multiple" options={datasetOptions} showSearch optionFilterProp="label" />
+            </Form.Item>
+            <Form.Item name="search_type" label="搜索方式" rules={[{ required: true }]}>
+              <Select
+                options={[
+                  { label: '网格搜索', value: 'grid' },
+                  { label: '随机搜索', value: 'random' },
+                ]}
+              />
+            </Form.Item>
+            <Row gutter={12}>
+              <Col span={24}>
                 <Form.Item
                   name="fast_periods"
                   label="快线候选"
@@ -2174,7 +3340,7 @@ function ParametersView({
                   <Input placeholder="例如 2,3,5,8" />
                 </Form.Item>
               </Col>
-              <Col xs={24} md={8}>
+              <Col span={24}>
                 <Form.Item
                   name="slow_periods"
                   label="慢线候选"
@@ -2204,7 +3370,7 @@ function ParametersView({
                   <Input placeholder="例如 13,21,34" />
                 </Form.Item>
               </Col>
-              <Col xs={24} md={8}>
+              <Col span={24}>
                 <Form.Item
                   name="max_samples"
                   label="随机搜索样本数"
@@ -2227,86 +3393,565 @@ function ParametersView({
                   <InputNumber min={1} disabled={experimentSearchType !== 'random'} style={{ width: '100%' }} placeholder="仅随机搜索时生效" />
                 </Form.Item>
               </Col>
+              <Col span={24}>
+                <Form.Item name="cash_allocation_pct" label="资金使用比例 (%)" rules={[{ required: true, message: '请输入资金使用比例' }]}>
+                  <InputNumber min={0.01} max={100} step={1} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
+                <Form.Item name="initial_cash" label="初始资金" rules={[{ required: true, message: '请输入初始资金' }]}>
+                  <InputNumber min={0.01} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
+                <Form.Item
+                  name="leverage_candidates"
+                  label="杠杆候选"
+                  rules={[
+                    {
+                      validator: async (_, value) => {
+                        const message = validatePositiveNumberListInput(value, '杠杆候选');
+                        if (message) {
+                          throw new Error(message);
+                        }
+                      },
+                    },
+                  ]}
+                >
+                  <Input placeholder="例如 1,2,3,5" />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item name="fee_rate" label="手续费率">
+                  <InputNumber min={0} step={0.0001} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item name="slippage_bps" label="滑点基点">
+                  <InputNumber min={0} step={0.1} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item name="min_notional" label="最小名义价值">
+                  <InputNumber min={0} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
             </Row>
-            <Button type="primary" htmlType="submit" loading={submitting === 'experiment'}>
-              提交参数实验
-            </Button>
+            <Space direction="vertical" size={12} style={{ width: '100%' }}>
+              <Alert
+                type="info"
+                showIcon
+                message="当前边界"
+                description="仍然只支持 EMA，多快照会拆成多个单快照实验，快线、慢线和杠杆候选会一起组成参数组合。"
+              />
+              <Button block type="primary" htmlType="submit" loading={submitting === 'experiment'}>
+                提交实验批次
+              </Button>
+            </Space>
           </Form>
         </Card>
       </Col>
 
-      <Col xs={24} xl={12}>
-        <Card title="Fast period 敏感度">
-          <LazyPlot
-            data={[
-              {
-                x: fastRows.map((row) => row.parameter_value),
-                y: fastRows.map((row) => row.avg_metric),
-                type: 'scatter',
-                mode: 'lines+markers',
-                name: 'Avg Return',
-              },
-              {
-                x: fastRows.map((row) => row.parameter_value),
-                y: fastRows.map((row) => row.best_metric),
-                type: 'scatter',
-                mode: 'lines+markers',
-                name: 'Best Return',
-              },
-            ] as never}
-            layout={{ autosize: true, height: 320, margin: { l: 40, r: 20, t: 20, b: 40 } } as never}
-            config={{ displayModeBar: false, responsive: true }}
-            style={{ width: '100%' }}
-            useResizeHandler
-          />
-        </Card>
-      </Col>
+      <Col xs={24} xl={16}>
+        <Card
+          title="参数实验工作区"
+          extra={(
+            <Input
+              placeholder="搜索 run / 数据集 / 标的"
+              value={parameterQuery}
+              onChange={(event) => setParameterQuery(event.target.value)}
+              style={{ width: 280 }}
+            />
+          )}
+        >
+          <Space direction="vertical" size={16} style={{ width: '100%' }}>
+            <Row gutter={[12, 12]}>
+              <Col xs={12} md={6}><Card size="small"><Statistic title="当前结果" value={resultStats.runCount} suffix={`/ ${resultStats.baseCount}`} /></Card></Col>
+              <Col xs={12} md={6}><Card size="small"><Statistic title="筛选命中" value={resultStats.filteredCount} /></Card></Col>
+              <Col xs={12} md={6}><Card size="small"><Statistic title="平均收益率" value={resultStats.avgReturn === null ? '--' : formatPct(resultStats.avgReturn)} /></Card></Col>
+              <Col xs={12} md={6}><Card size="small"><Statistic title="最佳收益率" value={resultStats.bestReturn === null ? '--' : formatPct(resultStats.bestReturn)} /></Card></Col>
+            </Row>
+            <Space wrap>
+              <Select
+                mode="multiple"
+                allowClear
+                disabled={autoLabelFilterDisabled}
+                value={autoLabelFilter}
+                style={{ minWidth: 260 }}
+                placeholder={autoLabelFilterDisabled ? '先选择单个批次后使用自动标签筛选' : '按自动标签筛选'}
+                onChange={setAutoLabelFilter}
+                options={availableAutoLabels.map((label) => ({
+                  label: AUTO_GROUP_MEMBERSHIP_LABEL_TEXT[label] ?? label,
+                  value: label,
+                }))}
+              />
+              <Select
+                mode="multiple"
+                allowClear
+                value={manualLabelFilter}
+                style={{ minWidth: 260 }}
+                placeholder="按人工标签筛选"
+                onChange={setManualLabelFilter}
+                options={availableManualLabels.map((label) => ({
+                  label: RESEARCH_LABEL_TEXT[label] ?? label,
+                  value: label,
+                }))}
+              />
+              <InputNumber
+                min={0}
+                max={100}
+                step={5}
+                style={{ width: 140 }}
+                disabled={selectedBatchId === ALL_BATCHES}
+                value={minScoreFilter}
+                placeholder="最小总分"
+                onChange={(value) => setMinScoreFilter(value === null ? null : Number(value))}
+              />
+              <InputNumber
+                min={0}
+                max={100}
+                step={5}
+                style={{ width: 140 }}
+                disabled={selectedBatchId === ALL_BATCHES}
+                value={minConfidenceFilter}
+                placeholder="最小置信度"
+                onChange={(value) => setMinConfidenceFilter(value === null ? null : Number(value))}
+              />
+              <InputNumber
+                min={0}
+                max={100}
+                step={5}
+                style={{ width: 150 }}
+                disabled={selectedBatchId === ALL_BATCHES}
+                value={maxDrawdownFilter}
+                placeholder="最大允许回撤%"
+                onChange={(value) => setMaxDrawdownFilter(value === null ? null : Number(value))}
+              />
+              <InputNumber
+                min={0}
+                step={0.1}
+                style={{ width: 150 }}
+                disabled={selectedBatchId === ALL_BATCHES}
+                value={minReturnDrawdownFilter}
+                placeholder="最小收益回撤比"
+                onChange={(value) => setMinReturnDrawdownFilter(value === null ? null : Number(value))}
+              />
+              <InputNumber
+                min={1}
+                max={100}
+                step={1}
+                style={{ width: 140 }}
+                disabled={selectedBatchId === ALL_BATCHES}
+                value={topNFilter}
+                placeholder="仅看 Top N"
+                onChange={(value) => setTopNFilter(value === null ? null : Number(value))}
+              />
+            </Space>
+            <Alert
+              showIcon
+              type="info"
+              message="自动标签来自当前批次评分规则"
+              description="悬停在自动标签上可查看命中原因。当前主要依据收益、回撤、样本外表现、覆盖快照数、正收益占比、最少交易数和邻域稳定度。在批次 Run 结果和单实验明细里，自动标签表示该 run 所属参数组的批次推荐，不代表该单条 run 自身单独通过了候选标准。总分 / 置信度 / 回撤 / 收益回撤比 / Top N 筛选在选中单个批次时生效。"
+            />
+            <Segmented<'batch' | 'experiment' | 'sensitivity'>
+              block
+              value={workspaceMode}
+              onChange={setWorkspaceMode}
+              options={[
+                { label: '批次结果', value: 'batch' },
+                { label: '单实验明细', value: 'experiment' },
+                { label: '参数敏感度', value: 'sensitivity' },
+              ]}
+            />
 
-      <Col xs={24} xl={12}>
-        <Card title="Slow period 敏感度">
-          <LazyPlot
-            data={[
-              {
-                x: slowRows.map((row) => row.parameter_value),
-                y: slowRows.map((row) => row.avg_metric),
-                type: 'scatter',
-                mode: 'lines+markers',
-                name: 'Avg Return',
-              },
-              {
-                x: slowRows.map((row) => row.parameter_value),
-                y: slowRows.map((row) => row.best_metric),
-                type: 'scatter',
-                mode: 'lines+markers',
-                name: 'Best Return',
-              },
-            ] as never}
-            layout={{ autosize: true, height: 320, margin: { l: 40, r: 20, t: 20, b: 40 } } as never}
-            config={{ displayModeBar: false, responsive: true }}
-            style={{ width: '100%' }}
-            useResizeHandler
-          />
-        </Card>
-      </Col>
+            {workspaceMode === 'batch' && (
+              <Spin spinning={experimentDetailLoading}>
+                <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                  <Space wrap style={{ width: '100%', justifyContent: 'space-between' }}>
+                    <Text type="secondary">
+                      批次视角优先看跨快照聚合后的推荐和参数稳定性，再决定是否进入单次 run 分析。
+                    </Text>
+                    <Space wrap>
+                      <Select
+                        value={selectedBatchId}
+                        style={{ minWidth: 320 }}
+                        placeholder="选择实验批次"
+                        onChange={(value) => {
+                          setSelectedBatchId(value);
+                          setWorkspaceMode('batch');
+                        }}
+                        options={[
+                          { label: '全部批次', value: ALL_BATCHES },
+                          ...batches.map((batch) => ({
+                            label: `${batch.batch_id} · ${batch.snapshot_count} 快照 · ${batch.status}`,
+                            value: batch.batch_id,
+                          })),
+                        ]}
+                      />
+                      {selectedBatchSummary ? (
+                        <Tag color={experimentStatusColor(selectedBatchSummary.status)}>{selectedBatchSummary.status}</Tag>
+                      ) : null}
+                      {selectedBatchId !== ALL_BATCHES ? (
+                        <Popconfirm
+                          title="删除当前实验批次？"
+                          description={`batch_id: ${selectedBatchId}`}
+                          okText="删除"
+                          cancelText="取消"
+                          okButtonProps={{ danger: true, loading: deletingBatchId === selectedBatchId }}
+                          onConfirm={() => onDeleteBatch(selectedBatchId)}
+                        >
+                          <Button danger loading={deletingBatchId === selectedBatchId}>删除当前批次</Button>
+                        </Popconfirm>
+                      ) : null}
+                    </Space>
+                  </Space>
 
-      <Col span={24}>
-        <Card title="实验表">
-          <DataTable columns={columns} data={rows} initialPageSize={12} pageSizeOptions={[12, 24, 50]} />
-        </Card>
-      </Col>
+                  {!batches.length ? (
+                    <Alert type="info" showIcon message="当前还没有可查看的实验批次" />
+                  ) : selectedBatchId === ALL_BATCHES ? (
+                    <>
+                      <DataTable
+                        columns={batchColumns}
+                        data={batches}
+                        tableClassName="cbw-parameter-meta-table"
+                        initialPageSize={6}
+                        pageSizeOptions={[6, 12, 24]}
+                        initialSorting={[{ id: 'created_at', desc: true }]}
+                      />
+                      <Card size="small" title="全部批次结果">
+                        <Paragraph type="secondary">
+                          当前显示 {filteredBatchRunRows.length} 条 run。先整体排序筛掉明显差的组合，再进入具体批次查看推荐。
+                        </Paragraph>
+                        <DataTable
+                          columns={experimentResultColumns}
+                          data={filteredBatchRunRows}
+                          tableClassName="cbw-parameter-result-table"
+                          initialPageSize={8}
+                          pageSizeOptions={[8, 16, 32]}
+                          initialSorting={[{ id: 'total_return', desc: true }]}
+                        />
+                      </Card>
+                    </>
+                  ) : (
+                    <>
+                      <Descriptions size="small" column={{ xs: 1, md: 2 }}>
+                        <Descriptions.Item label="批次 ID">{selectedBatchDetail?.batch.batch_id ?? selectedBatchId}</Descriptions.Item>
+                        <Descriptions.Item label="搜索方式">{experimentSearchTypeLabel(selectedBatchDetail?.batch.search_type ?? selectedBatchSummary?.search_type)}</Descriptions.Item>
+                        <Descriptions.Item label="快照数">{selectedBatchDetail?.batch.dataset_snapshot_ids.length ?? selectedBatchSummary?.snapshot_count ?? 0}</Descriptions.Item>
+                        <Descriptions.Item label="实验数">{selectedBatchDetail?.batch.experiment_ids.length ?? selectedBatchSummary?.experiment_count ?? 0}</Descriptions.Item>
+                        <Descriptions.Item label="父任务">{selectedBatchDetail?.execution.task_id ?? selectedBatchSummary?.task_id ?? '--'}</Descriptions.Item>
+                        <Descriptions.Item label="提交时间">{selectedBatchDetail?.batch.created_at ? formatDateTime(selectedBatchDetail.batch.created_at) : (selectedBatchSummary ? formatDateTime(selectedBatchSummary.created_at) : '--')}</Descriptions.Item>
+                      </Descriptions>
+                      {selectedBatchDetail ? (
+                        <Card
+                          size="small"
+                          title="批次研究决策"
+                          extra={(
+                            <Button
+                              size="small"
+                              onClick={() => openDecisionModal(
+                                'parameter_experiment_batch',
+                                selectedBatchDetail.batch.batch_id,
+                                `批次 ${selectedBatchDetail.batch.batch_id}`,
+                              )}
+                            >
+                              记录批次结论
+                            </Button>
+                          )}
+                        >
+                          <Space size={[6, 6]} wrap>
+                            {(notesByTarget.get(`parameter_experiment_batch:${selectedBatchDetail.batch.batch_id}`) ?? []).length ? (
+                              (notesByTarget.get(`parameter_experiment_batch:${selectedBatchDetail.batch.batch_id}`) ?? []).map((note) => (
+                                <Tooltip key={note.note_id} title={note.content}>
+                                  <Tag color={note.labels.includes('excluded') ? 'red' : note.labels.includes('baseline') ? 'gold' : 'blue'}>
+                                    {note.labels.map((label) => RESEARCH_LABEL_TEXT[label] ?? label).join(' / ') || '备注'} · {formatDateTime(note.created_at)}
+                                  </Tag>
+                                </Tooltip>
+                              ))
+                            ) : <Text type="secondary">当前批次还没有人工结论。</Text>}
+                          </Space>
+                        </Card>
+                      ) : null}
+                      {selectedBatchDetail ? (
+                        <Card size="small" title="当前评分标准">
+                          <Row gutter={[12, 12]}>
+                            {Object.values(selectedBatchDetail.scoring_rules).map((rule) => (
+                              <Col xs={24} xl={8} key={rule.label}>
+                                <Alert
+                                  type="info"
+                                  showIcon
+                                  message={rule.label}
+                                  description={(
+                                    <Space direction="vertical" size={4}>
+                                      <Text>{rule.summary}</Text>
+                                      {rule.thresholds.map((threshold) => (
+                                        <Text key={`${rule.label}-${threshold}`} type="secondary">- {threshold}</Text>
+                                      ))}
+                                    </Space>
+                                  )}
+                                />
+                              </Col>
+                            ))}
+                          </Row>
+                        </Card>
+                      ) : null}
+                      <Row gutter={[12, 12]}>
+                        {batchRecommendationSections.map((section) => (
+                          <Col xs={24} xl={8} key={section.key}>
+                            <Card size="small" title={section.title}>
+                              <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                                {section.items.length ? section.items.map((item) => (
+                                  <Alert
+                                    key={`${section.key}-${item.fast_period}-${item.slow_period}-${item.leverage}`}
+                                    type={section.type}
+                                    showIcon
+                                    message={`快 ${item.fast_period ?? '--'} / 慢 ${item.slow_period ?? '--'} / 杠杆 ${item.leverage ?? '--'}`}
+                                    description={section.description(item)}
+                                  />
+                                )) : <Text type="secondary">{section.empty}</Text>}
+                              </Space>
+                            </Card>
+                          </Col>
+                        ))}
+                      </Row>
+                      <Card size="small" title="批次聚合结果">
+                        <Paragraph type="secondary">
+                          这里已经把同一组快慢参数和杠杆按跨快照结果聚合。现在应优先看样本外收益、最大回撤、收益回撤比，再看样本内收益和覆盖快照数。
+                        </Paragraph>
+                        <DataTable
+                          columns={batchParameterGroupColumns}
+                          data={filteredBatchParameterGroups}
+                          tableClassName="cbw-parameter-group-table"
+                          initialPageSize={8}
+                          pageSizeOptions={[8, 16, 32]}
+                          initialSorting={[{ id: 'score', desc: true }]}
+                        />
+                      </Card>
+                      <Card size="small" title="批次 Run 结果">
+                        <Paragraph type="secondary">
+                          当前显示 {filteredBatchRunRows.length} 条来自该批次的 run，可继续按收益、超额收益、胜率排序后跳转单次分析。
+                        </Paragraph>
+                        <DataTable
+                          columns={experimentResultColumns}
+                          data={filteredBatchRunRows}
+                          tableClassName="cbw-parameter-result-table"
+                          initialPageSize={8}
+                          pageSizeOptions={[8, 16, 32]}
+                          initialSorting={[{ id: 'total_return', desc: true }]}
+                        />
+                      </Card>
+                    </>
+                  )}
+                </Space>
+              </Spin>
+            )}
 
-      <Col span={24}>
-        <Card title="最近实验任务">
-          <DataTable
-            columns={experimentColumns}
-            data={experiments}
-            initialPageSize={8}
-            pageSizeOptions={[8, 16, 24]}
-            initialSorting={[{ id: 'created_at', desc: true }]}
-          />
+            {workspaceMode === 'experiment' && (
+              <Spin spinning={experimentDetailLoading}>
+                <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                  <Space wrap style={{ width: '100%', justifyContent: 'space-between' }}>
+                    <Text type="secondary">
+                      单实验明细只看一次实验内部的子 run 结果，适合精确比较某个快照上的参数组合。
+                    </Text>
+                    <Space wrap>
+                      <Select
+                        value={selectedExperimentId}
+                        style={{ minWidth: 320 }}
+                        placeholder="选择参数实验"
+                        onChange={(value) => {
+                          setSelectedExperimentId(value);
+                          setWorkspaceMode('experiment');
+                        }}
+                        options={[
+                          { label: '全部实验', value: ALL_EXPERIMENTS },
+                          ...visibleExperiments.map((experiment) => ({
+                            label: `${experiment.experiment_id} · ${experimentSearchTypeLabel(experiment.search_type)} · ${experiment.status}`,
+                            value: experiment.experiment_id,
+                          })),
+                        ]}
+                      />
+                      {selectedExperimentSummary ? (
+                        <Tag color={experimentStatusColor(selectedExperimentSummary.status)}>{selectedExperimentSummary.status}</Tag>
+                      ) : null}
+                      {selectedExperimentId !== ALL_EXPERIMENTS ? (
+                        <Popconfirm
+                          title="删除当前参数实验？"
+                          description={`experiment_id: ${selectedExperimentId}`}
+                          okText="删除"
+                          cancelText="取消"
+                          okButtonProps={{ danger: true, loading: deletingExperimentId === selectedExperimentId }}
+                          onConfirm={() => onDeleteExperiment(selectedExperimentId)}
+                        >
+                          <Button danger loading={deletingExperimentId === selectedExperimentId}>删除当前实验</Button>
+                        </Popconfirm>
+                      ) : null}
+                    </Space>
+                  </Space>
+
+                  {!visibleExperiments.length ? (
+                    <Alert type="info" showIcon message="当前没有可查看的单实验结果" />
+                  ) : (
+                    <>
+                      <Row gutter={[12, 12]}>
+                        <Col xs={12} md={6}><Card size="small"><Statistic title="实验数" value={selectedExperimentId === ALL_EXPERIMENTS ? visibleExperiments.length : 1} /></Card></Col>
+                        <Col xs={12} md={6}><Card size="small"><Statistic title="计划组合" value={selectedExperimentId === ALL_EXPERIMENTS ? visibleExperiments.reduce((sum, experiment) => sum + experiment.planned_run_count, 0) : (selectedExperimentDetail?.execution.planned_run_count ?? selectedExperimentSummary?.planned_run_count ?? 0)} /></Card></Col>
+                        <Col xs={12} md={6}><Card size="small"><Statistic title="已生成 Run" value={selectedExperimentId === ALL_EXPERIMENTS ? selectedExperimentRows.length : (selectedExperimentDetail?.execution.run_ids?.length ?? selectedExperimentSummary?.run_count ?? 0)} /></Card></Col>
+                        <Col xs={12} md={6}><Card size="small"><Statistic title="失败子任务" value={selectedExperimentId === ALL_EXPERIMENTS ? visibleExperiments.reduce((sum, experiment) => sum + experiment.failed_run_count, 0) : (failedChildTaskIds.length || selectedExperimentSummary?.failed_run_count || 0)} /></Card></Col>
+                      </Row>
+                      {selectedExperimentId === ALL_EXPERIMENTS ? (
+                        <DataTable
+                          columns={experimentColumns}
+                          data={visibleExperiments}
+                          tableClassName="cbw-parameter-meta-table"
+                          initialPageSize={8}
+                          pageSizeOptions={[8, 16, 24]}
+                          initialSorting={[{ id: 'created_at', desc: true }]}
+                        />
+                      ) : (
+                        <>
+                          <Descriptions size="small" column={{ xs: 1, md: 2 }}>
+                            <Descriptions.Item label="实验 ID">{selectedExperimentDetail?.experiment.experiment_id ?? selectedExperimentId}</Descriptions.Item>
+                            <Descriptions.Item label="搜索方式">{experimentSearchTypeLabel(selectedExperimentDetail?.experiment.search_type ?? selectedExperimentSummary?.search_type)}</Descriptions.Item>
+                            <Descriptions.Item label="数据集">{selectedExperimentDetail?.experiment.dataset_bundle_id ?? selectedExperimentSummary?.dataset_bundle_id ?? '--'}</Descriptions.Item>
+                            <Descriptions.Item label="父任务">{selectedExperimentDetail?.execution.task_id ?? selectedExperimentSummary?.task_id ?? '--'}</Descriptions.Item>
+                            <Descriptions.Item label="提交时间">{selectedExperimentDetail?.experiment.created_at ? formatDateTime(selectedExperimentDetail.experiment.created_at) : (selectedExperimentSummary ? formatDateTime(selectedExperimentSummary.created_at) : '--')}</Descriptions.Item>
+                            <Descriptions.Item label="随机种子策略">{selectedExperimentDetail?.experiment.seed_policy ?? '--'}</Descriptions.Item>
+                          </Descriptions>
+                          {failedChildTaskIds.length ? (
+                            <Alert
+                              type="warning"
+                              showIcon
+                              message={`有 ${failedChildTaskIds.length} 个子任务失败`}
+                              description={`失败任务：${failedChildTaskIds.join('，')}`}
+                            />
+                          ) : null}
+                        </>
+                      )}
+                      <Card size="small" title="实验 Run 结果">
+                        <Paragraph type="secondary">
+                          当前显示 {filteredExperimentRunRows.length} 条已落盘 run。优先按样本外收益、样本外超额排序，再回头看总收益和胜率。
+                        </Paragraph>
+                        <DataTable
+                          columns={experimentResultColumns}
+                          data={filteredExperimentRunRows}
+                          tableClassName="cbw-parameter-result-table"
+                          initialPageSize={8}
+                          pageSizeOptions={[8, 16, 32]}
+                          initialSorting={[{ id: 'total_return', desc: true }]}
+                        />
+                      </Card>
+                    </>
+                  )}
+                </Space>
+              </Spin>
+            )}
+
+            {workspaceMode === 'sensitivity' && (
+              <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                <Alert
+                  type="info"
+                  showIcon
+                  message="怎么看这两张图"
+                  description="先看蓝线 Avg Return 是否整体在 0 上方，再看橙线 Best Return 是否只是个别尖峰。优先选择一段稳定区间，不要只追单点冠军。"
+                />
+                <Row gutter={[16, 16]}>
+                  <Col xs={24} xl={12}>
+                    <Card size="small" title="Fast period 敏感度">
+                      <LazyPlot
+                        data={[
+                          {
+                            x: fastRows.map((row) => row.parameter_value),
+                            y: fastRows.map((row) => row.avg_metric),
+                            type: 'scatter',
+                            mode: 'lines+markers',
+                            name: 'Avg Return',
+                          },
+                          {
+                            x: fastRows.map((row) => row.parameter_value),
+                            y: fastRows.map((row) => row.best_metric),
+                            type: 'scatter',
+                            mode: 'lines+markers',
+                            name: 'Best Return',
+                          },
+                        ] as never}
+                        layout={{ autosize: true, height: 320, margin: { l: 40, r: 20, t: 20, b: 40 } } as never}
+                        config={{ displayModeBar: false, responsive: true }}
+                        style={{ width: '100%' }}
+                        useResizeHandler
+                      />
+                    </Card>
+                  </Col>
+                  <Col xs={24} xl={12}>
+                    <Card size="small" title="Slow period 敏感度">
+                      <LazyPlot
+                        data={[
+                          {
+                            x: slowRows.map((row) => row.parameter_value),
+                            y: slowRows.map((row) => row.avg_metric),
+                            type: 'scatter',
+                            mode: 'lines+markers',
+                            name: 'Avg Return',
+                          },
+                          {
+                            x: slowRows.map((row) => row.parameter_value),
+                            y: slowRows.map((row) => row.best_metric),
+                            type: 'scatter',
+                            mode: 'lines+markers',
+                            name: 'Best Return',
+                          },
+                        ] as never}
+                        layout={{ autosize: true, height: 320, margin: { l: 40, r: 20, t: 20, b: 40 } } as never}
+                        config={{ displayModeBar: false, responsive: true }}
+                        style={{ width: '100%' }}
+                        useResizeHandler
+                      />
+                    </Card>
+                  </Col>
+                </Row>
+                <Card size="small" title="当前筛选结果">
+                  <DataTable
+                    columns={experimentResultColumns}
+                    data={rows}
+                    initialPageSize={8}
+                    pageSizeOptions={[8, 16, 32]}
+                    initialSorting={[{ id: 'total_return', desc: true }]}
+                  />
+                </Card>
+              </Space>
+            )}
+          </Space>
         </Card>
       </Col>
     </Row>
+    <Modal
+      title={decisionTarget ? `研究决策 · ${decisionTarget.title}` : '研究决策'}
+      open={Boolean(decisionTarget)}
+      okText="保存"
+      cancelText="取消"
+      confirmLoading={savingResearchNote}
+      onCancel={() => setDecisionTarget(null)}
+      onOk={async () => {
+        if (!decisionTarget) {
+          return;
+        }
+        const values = await decisionForm.validateFields();
+        await onSaveResearchNote(decisionTarget.targetType, decisionTarget.targetId, values);
+        setDecisionTarget(null);
+      }}
+    >
+      <Form form={decisionForm} layout="vertical">
+        <Form.Item name="author" label="记录人" rules={[{ required: true, whitespace: true, message: '请输入记录人' }]}>
+          <Input />
+        </Form.Item>
+        <Form.Item name="labels" label="标签">
+          <Select mode="multiple" options={RESEARCH_LABEL_OPTIONS} />
+        </Form.Item>
+        <Form.Item name="content" label="结论" rules={[{ required: true, whitespace: true, message: '请输入研究结论' }]}>
+          <Input.TextArea rows={4} />
+        </Form.Item>
+      </Form>
+    </Modal>
+    </>
   );
 }
 

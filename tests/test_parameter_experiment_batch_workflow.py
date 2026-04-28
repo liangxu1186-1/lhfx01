@@ -3,12 +3,13 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from crypto_backtest_workbench.app.workflows import (
-    ParameterExperimentTaskRequest,
-    run_parameter_experiment_task_workflow,
+    ParameterExperimentBatchRequest,
+    run_parameter_experiment_batch_workflow,
 )
 from crypto_backtest_workbench.domain.models import DatasetSnapshot, MarketType, PriceType, SearchType, TaskStatus
 from crypto_backtest_workbench.storage.repositories import (
     FileDatasetRepository,
+    FileExperimentBatchRepository,
     FileFeatureRepository,
     FileParameterExperimentRepository,
     FileRunRepository,
@@ -16,23 +17,28 @@ from crypto_backtest_workbench.storage.repositories import (
 )
 
 
-def test_parameter_experiment_task_workflow_persists_parent_and_child_tasks(tmp_path) -> None:
+def test_parameter_experiment_batch_workflow_fans_out_into_multiple_experiments(tmp_path) -> None:
     dataset_repository = FileDatasetRepository(tmp_path)
     feature_repository = FileFeatureRepository(tmp_path)
     run_repository = FileRunRepository(tmp_path)
     task_repository = FileTaskRepository(tmp_path)
     experiment_repository = FileParameterExperimentRepository(tmp_path)
-    snapshot = _persist_snapshot(dataset_repository)
+    batch_repository = FileExperimentBatchRepository(tmp_path)
+    snapshots = (
+        _persist_snapshot(dataset_repository, snapshot_id="snapshot-batch-001", timeframe="1h"),
+        _persist_snapshot(dataset_repository, snapshot_id="snapshot-batch-002", timeframe="4h"),
+    )
 
-    result = run_parameter_experiment_task_workflow(
-        request=ParameterExperimentTaskRequest(
-            experiment_id="experiment-001",
-            snapshot=snapshot,
+    result = run_parameter_experiment_batch_workflow(
+        request=ParameterExperimentBatchRequest(
+            batch_id="batch-001",
+            snapshots=snapshots,
             search_type=SearchType.GRID,
             fast_periods=(2, 3),
-            slow_periods=(4, 5),
-            qty_policy_ref="fixed_1",
-            qty=0.01,
+            slow_periods=(5,),
+            qty_policy_ref="percent_of_cash",
+            qty=None,
+            cash_allocation_pct=100.0,
             initial_cash=1000.0,
             leverage_candidates=(1.0, 2.0),
             fee_rate=0.0,
@@ -40,43 +46,48 @@ def test_parameter_experiment_task_workflow_persists_parent_and_child_tasks(tmp_
             min_notional=0.0,
         ),
         task_repository=task_repository,
+        batch_repository=batch_repository,
         experiment_repository=experiment_repository,
         dataset_repository=dataset_repository,
         feature_repository=feature_repository,
         run_repository=run_repository,
     )
 
-    execution = experiment_repository.load_execution_index("experiment-001")
+    execution = batch_repository.load_execution_index("batch-001")
 
-    assert result.task.task_id == "parameter-experiment:experiment-001"
+    assert result.task.task_id == "parameter-experiment-batch:batch-001"
     assert result.task.status is TaskStatus.SUCCESS
+    assert len(result.experiment_ids) == 2
     assert len(result.run_ids) == 8
-    assert len(result.child_task_ids) == 8
     assert execution["status"] == "success"
-    assert len(execution["run_ids"]) == 8
+    assert execution["planned_experiment_count"] == 2
+    assert execution["planned_run_count"] == 8
+    assert len(execution["experiment_ids"]) == 2
     assert len(run_repository.list_run_ids()) == 8
-    assert any(run_id.endswith("-l2") for run_id in result.run_ids)
-    assert task_repository.load_task("parameter-experiment:experiment-001").status is TaskStatus.SUCCESS
+    batch = batch_repository.load_batch("batch-001")
+    assert batch.search_space_json["leverage_candidates"] == [1.0, 2.0]
 
 
-def test_parameter_experiment_task_workflow_rejects_invalid_parameter_grid(tmp_path) -> None:
+def test_parameter_experiment_batch_workflow_rejects_duplicate_snapshots(tmp_path) -> None:
     dataset_repository = FileDatasetRepository(tmp_path)
     feature_repository = FileFeatureRepository(tmp_path)
     run_repository = FileRunRepository(tmp_path)
     task_repository = FileTaskRepository(tmp_path)
     experiment_repository = FileParameterExperimentRepository(tmp_path)
-    snapshot = _persist_snapshot(dataset_repository)
+    batch_repository = FileExperimentBatchRepository(tmp_path)
+    snapshot = _persist_snapshot(dataset_repository, snapshot_id="snapshot-batch-duplicate", timeframe="1h")
 
     try:
-        run_parameter_experiment_task_workflow(
-            request=ParameterExperimentTaskRequest(
-                experiment_id="experiment-invalid",
-                snapshot=snapshot,
+        run_parameter_experiment_batch_workflow(
+            request=ParameterExperimentBatchRequest(
+                batch_id="batch-duplicate",
+                snapshots=(snapshot, snapshot),
                 search_type=SearchType.GRID,
-                fast_periods=(5, 8),
-                slow_periods=(5, 13),
-                qty_policy_ref="fixed_1",
-                qty=0.01,
+                fast_periods=(2,),
+                slow_periods=(5,),
+                qty_policy_ref="percent_of_cash",
+                qty=None,
+                cash_allocation_pct=100.0,
                 initial_cash=1000.0,
                 leverage_candidates=(1.0,),
                 fee_rate=0.0,
@@ -84,68 +95,32 @@ def test_parameter_experiment_task_workflow_rejects_invalid_parameter_grid(tmp_p
                 min_notional=0.0,
             ),
             task_repository=task_repository,
+            batch_repository=batch_repository,
             experiment_repository=experiment_repository,
             dataset_repository=dataset_repository,
             feature_repository=feature_repository,
             run_repository=run_repository,
         )
-        raise AssertionError("Expected invalid parameter grid to raise ValueError")
+        raise AssertionError("Expected duplicate snapshots to raise ValueError")
     except ValueError as exc:
-        assert "fast_period < slow_period" in str(exc)
+        assert "duplicates" in str(exc)
 
 
-def test_parameter_experiment_task_workflow_supports_percent_of_cash_sizing(tmp_path) -> None:
-    dataset_repository = FileDatasetRepository(tmp_path)
-    feature_repository = FileFeatureRepository(tmp_path)
-    run_repository = FileRunRepository(tmp_path)
-    task_repository = FileTaskRepository(tmp_path)
-    experiment_repository = FileParameterExperimentRepository(tmp_path)
-    snapshot = _persist_snapshot(dataset_repository)
-
-    result = run_parameter_experiment_task_workflow(
-        request=ParameterExperimentTaskRequest(
-            experiment_id="experiment-cash-001",
-            snapshot=snapshot,
-            search_type=SearchType.GRID,
-            fast_periods=(2,),
-            slow_periods=(4,),
-            qty_policy_ref="percent_of_cash",
-            qty=None,
-            cash_allocation_pct=75.0,
-            initial_cash=1000.0,
-            leverage_candidates=(2.0,),
-            fee_rate=0.0,
-            slippage_bps=0.0,
-            min_notional=0.0,
-        ),
-        task_repository=task_repository,
-        experiment_repository=experiment_repository,
-        dataset_repository=dataset_repository,
-        feature_repository=feature_repository,
-        run_repository=run_repository,
-    )
-
-    run_id = result.run_ids[0]
-    manifest = run_repository.load_manifest(run_id)
-    constraints = manifest.resolved_config_json["execution_constraints"]
-    assert constraints["cash_allocation_pct_by_policy"] == {"percent_of_cash": 75.0}
-
-
-def _persist_snapshot(repository: FileDatasetRepository) -> DatasetSnapshot:
-    candles = _build_candles([100.0, 99.0, 101.0, 104.0, 102.0, 106.0, 108.0, 105.0, 109.0, 111.0])
+def _persist_snapshot(repository: FileDatasetRepository, *, snapshot_id: str, timeframe: str) -> DatasetSnapshot:
+    candles = _build_candles([100.0, 99.0, 101.0, 104.0, 102.0, 106.0, 108.0, 105.0, 109.0, 111.0], timeframe=timeframe)
     snapshot = DatasetSnapshot(
-        dataset_snapshot_id="snapshot-parameter-experiment",
+        dataset_snapshot_id=snapshot_id,
         source="binance",
         exchange="binance",
         market_type=MarketType.LINEAR_USDT_PERPETUAL,
         symbol="BTC/USDT:USDT",
-        timeframe="1h",
+        timeframe=timeframe,
         time_range_start=candles[0].timestamp,
         time_range_end=candles[-1].timestamp,
         row_count=len(candles),
         schema_version="v1",
         feature_version="pending",
-        storage_uri="datasets/snapshot-parameter-experiment",
+        storage_uri=f"datasets/{snapshot_id}",
         data_source="fixture",
         price_type=PriceType.LAST,
     )
@@ -154,7 +129,7 @@ def _persist_snapshot(repository: FileDatasetRepository) -> DatasetSnapshot:
     return snapshot
 
 
-def _build_candles(close_prices: list[float]):
+def _build_candles(close_prices: list[float], *, timeframe: str):
     from crypto_backtest_workbench.domain.models import CanonicalCandle
 
     start = datetime(2024, 1, 1, tzinfo=UTC)
@@ -167,7 +142,7 @@ def _build_candles(close_prices: list[float]):
                 symbol="BTC/USDT:USDT",
                 exchange="binance",
                 market_type=MarketType.LINEAR_USDT_PERPETUAL,
-                timeframe="1h",
+                timeframe=timeframe,
                 open=close_price,
                 high=close_price + 1.0,
                 low=close_price - 1.0,

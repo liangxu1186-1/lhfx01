@@ -107,11 +107,28 @@ class ParameterExperiment:
 
 
 @dataclass(slots=True)
+class ExperimentBatch:
+    batch_id: str
+    strategy_name: str
+    dataset_snapshot_ids: tuple[str, ...]
+    validation_split_id: str
+    metric_policy_id: str
+    benchmark_policy_version: str
+    search_type: SearchType
+    search_space_json: dict[str, object]
+    base_config_uri: str
+    seed_policy: SeedPolicy
+    seed: int | None
+    experiment_ids: tuple[str, ...] = ()
+    created_at: datetime = field(default_factory=now_utc)
+
+
+@dataclass(slots=True)
 class ResearchNote:
     note_id: str
     target_type: str
     target_id: str
     content: str
     author: str
+    labels: tuple[str, ...] = ()
     created_at: datetime = field(default_factory=now_utc)
-

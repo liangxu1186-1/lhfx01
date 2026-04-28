@@ -16,12 +16,13 @@ from crypto_backtest_workbench.app.readmodels.runs import (
     build_equity_chart_rows,
     build_multi_run_equity_rows,
     build_run_comparison_views,
+    build_run_comparison_views_from_summaries,
     build_trade_rows,
     build_warning_rows,
     list_run_summary_views,
     load_run_detail_view,
 )
-from crypto_backtest_workbench.storage.repositories import FileRunRepository
+from crypto_backtest_workbench.storage.repositories import FileResearchNoteRepository, FileRunRepository
 
 
 def build_workspace_snapshot(*, data_dir: Path) -> dict[str, object]:
@@ -36,7 +37,11 @@ def build_workspace_snapshot(*, data_dir: Path) -> dict[str, object]:
         "generated_at": datetime.now(UTC),
         "source": _build_workspace_source(data_dir=data_dir, run_ids=run_ids, datasets=datasets),
         "datasets": datasets,
-        "overview": _build_overview_payload(details=details, summaries=summaries),
+        "overview": {
+            "summaries": [summary.as_dict() for summary in summaries],
+            "comparisons": [view.as_dict() for view in build_run_comparison_views(details)],
+            "multi_run_equity": build_multi_run_equity_rows(details),
+        },
         "analysis": {
             "runs": [_build_run_workspace(detail) for detail in details],
         },
@@ -56,10 +61,20 @@ def build_workspace_datasets(*, data_dir: Path) -> list[dict[str, Any]]:
 
 def build_workspace_overview(*, data_dir: Path) -> dict[str, object]:
     run_repository = FileRunRepository(data_dir)
-    run_ids = run_repository.list_run_ids()
-    details = [load_run_detail_view(run_repository, run_id) for run_id in run_ids]
     summaries = list_run_summary_views(run_repository)
-    return _build_overview_payload(details=details, summaries=summaries)
+    return _build_overview_payload(summaries=summaries)
+
+
+def build_workspace_overview_equity(
+    *,
+    data_dir: Path,
+    run_ids: list[str],
+) -> list[dict[str, object]]:
+    if not run_ids:
+        return []
+    run_repository = FileRunRepository(data_dir)
+    details = [load_run_detail_view(run_repository, run_id) for run_id in run_ids]
+    return build_multi_run_equity_rows(details)
 
 
 def build_workspace_run_index(*, data_dir: Path) -> list[dict[str, object]]:
@@ -70,7 +85,8 @@ def build_workspace_run_index(*, data_dir: Path) -> list[dict[str, object]]:
 def build_workspace_run_detail(*, data_dir: Path, run_id: str) -> dict[str, Any]:
     run_repository = FileRunRepository(data_dir)
     detail = load_run_detail_view(run_repository, run_id)
-    return _build_run_workspace(detail)
+    research_note_repository = FileResearchNoteRepository(data_dir)
+    return _build_run_workspace(detail, research_notes=research_note_repository.list_notes(target_type="run", target_id=run_id))
 
 
 def build_workspace_parameter_lab(*, data_dir: Path) -> dict[str, object]:
@@ -120,11 +136,11 @@ def _build_workspace_source(
     }
 
 
-def _build_overview_payload(*, details: list[Any], summaries: list[Any]) -> dict[str, object]:
+def _build_overview_payload(*, summaries: list[Any]) -> dict[str, object]:
     return {
         "summaries": [summary.as_dict() for summary in summaries],
-        "comparisons": [view.as_dict() for view in build_run_comparison_views(details)],
-        "multi_run_equity": build_multi_run_equity_rows(details),
+        "comparisons": [view.as_dict() for view in build_run_comparison_views_from_summaries(summaries)],
+        "multi_run_equity": [],
     }
 
 
@@ -155,7 +171,7 @@ def _build_parameter_lab_payload(
     }
 
 
-def _build_run_workspace(detail: Any) -> dict[str, Any]:
+def _build_run_workspace(detail: Any, *, research_notes: list[Any] | None = None) -> dict[str, Any]:
     resolved = detail.manifest.resolved_config_json
     return {
         "run_id": detail.run.run_id,
@@ -177,6 +193,8 @@ def _build_run_workspace(detail: Any) -> dict[str, Any]:
         },
         "metrics": detail.metrics.as_dict(),
         "benchmark": None if detail.benchmark is None else asdict(detail.benchmark.result),
+        "validation": detail.validation_summary,
+        "research_notes": [] if research_notes is None else research_notes,
         "execution_counts": {
             "order_count": len(detail.execution.orders),
             "fill_count": len(detail.execution.fills),

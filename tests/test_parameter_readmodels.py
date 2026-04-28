@@ -12,7 +12,7 @@ from crypto_backtest_workbench.app.workflows.run_backtest import (
     RunBacktestWorkflowRequest,
     run_backtest_workflow,
 )
-from crypto_backtest_workbench.domain.models import DatasetSnapshot, MarketType, PriceType
+from crypto_backtest_workbench.domain.models import DatasetSnapshot, MarketType, PriceType, ValidationSplit, ValidationTargetType
 from crypto_backtest_workbench.engine.execution import ExecutionConstraints
 from crypto_backtest_workbench.storage.repositories import (
     FileDatasetRepository,
@@ -48,6 +48,16 @@ def test_parameter_lab_rows_extract_strategy_and_execution_params(tmp_path) -> N
                     fee_rate=0.001,
                     qty_by_policy={"fixed_1": 1.0},
                 ),
+                validation_split=ValidationSplit(
+                    validation_split_id=f"split-{run_id}",
+                    target_type=ValidationTargetType.DATASET_SNAPSHOT,
+                    target_id=snapshot.dataset_snapshot_id,
+                    warmup_bars=1,
+                    is_start=snapshot.time_range_start + timedelta(hours=2),
+                    is_end=snapshot.time_range_start + timedelta(hours=6),
+                    oos_start=snapshot.time_range_start + timedelta(hours=6),
+                    oos_end=snapshot.time_range_start + timedelta(hours=9),
+                ),
                 enable_buy_and_hold_benchmark=True,
             ),
         )
@@ -60,8 +70,11 @@ def test_parameter_lab_rows_extract_strategy_and_execution_params(tmp_path) -> N
     assert rows[0].fast_period == 3
     assert rows[0].slow_period == 6
     assert rows[0].leverage == 3.0
+    assert rows[0].max_drawdown >= 0
     assert rows[0].benchmark_return is not None
     assert rows[0].excess_return is not None
+    assert rows[0].is_total_return is not None
+    assert rows[0].oos_total_return is not None
 
 
 def test_parameter_lab_rows_support_filter_and_sensitivity(tmp_path) -> None:

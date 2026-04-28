@@ -8,6 +8,8 @@ from crypto_backtest_workbench.domain.models import (
     Side,
     SignalAction,
     SignalIntent,
+    ValidationSplit,
+    ValidationTargetType,
 )
 from crypto_backtest_workbench.engine.execution import ExecutionConstraints
 from crypto_backtest_workbench.jobs import SingleRunOrchestrator, SingleRunRequest
@@ -79,6 +81,16 @@ def test_file_run_repository_round_trips_single_run_result(tmp_path) -> None:
             fee_rate=0.001,
             qty_by_policy={"fixed_1": 1.0},
         ),
+        validation_split=ValidationSplit(
+            validation_split_id="split-001",
+            target_type=ValidationTargetType.DATASET_SNAPSHOT,
+            target_id="snapshot-001",
+            warmup_bars=0,
+            is_start=candles[0].timestamp,
+            is_end=candles[4].timestamp,
+            oos_start=candles[4].timestamp,
+            oos_end=candles[4].timestamp + timedelta(hours=1),
+        ),
     )
 
     paths = repository.save_single_run_result(result)
@@ -95,19 +107,22 @@ def test_file_run_repository_round_trips_single_run_result(tmp_path) -> None:
     assert paths["benchmark"]["result"].exists()
     assert paths["benchmark"]["equity_points"].exists()
     assert paths["benchmark"]["daily_returns"].exists()
+    assert paths["validation_summary"].exists()
 
     loaded_manifest = repository.load_manifest("run-001")
     loaded_run = repository.load_run("run-001")
     loaded_execution = repository.load_execution("run-001")
     loaded_metrics = repository.load_metrics("run-001")
     loaded_benchmark = repository.load_benchmark("run-001")
+    loaded_validation_summary = repository.load_validation_summary("run-001")
 
     assert loaded_manifest == result.manifest
     assert loaded_run == result.run
     assert loaded_execution == result.execution
     assert loaded_metrics == result.metrics
     assert loaded_benchmark == result.benchmark_output
-    assert loaded_execution.warnings[0].warning_code == "SIGNAL_SKIPPED_NO_NEXT_OPEN"
+    assert loaded_validation_summary == result.validation_summary
+    assert loaded_execution.trades[0].trade_id == result.execution.trades[0].trade_id
 
 
 def test_file_run_repository_returns_none_when_benchmark_missing(tmp_path) -> None:

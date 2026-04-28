@@ -57,6 +57,10 @@ def test_single_run_orchestrator_includes_validation_view_and_buy_hold_benchmark
     assert result.benchmark_output.result.benchmark_type == "buy_and_hold"
     assert result.benchmark_output.result.return_pct == pytest.approx((107.0 - 103.0) / 103.0)
     assert result.metrics.trade_count == 1
+    assert result.validation_summary is not None
+    assert result.validation_summary["validation_split_id"] == "split-001"
+    assert result.validation_summary["is_segment"]["metrics"]["trade_count"] == 1
+    assert result.validation_summary["oos_segment"]["metrics"]["trade_count"] == 0
 
 
 def _request() -> SingleRunRequest:

@@ -2,13 +2,17 @@
 
 __all__ = [
     "DatasetRepository",
+    "ExperimentBatchRepository",
     "ParameterExperimentRepository",
     "FeatureRepository",
+    "ResearchNoteRepository",
     "RunRepository",
     "TaskRepository",
     "FileDatasetRepository",
+    "FileExperimentBatchRepository",
     "FileParameterExperimentRepository",
     "FileFeatureRepository",
+    "FileResearchNoteRepository",
     "FileRunRepository",
     "FileTaskRepository",
 ]
@@ -51,6 +55,18 @@ def __getattr__(name: str):
         }
         return exports[name]
 
+    if name in {"ExperimentBatchRepository", "FileExperimentBatchRepository"}:
+        from crypto_backtest_workbench.storage.repositories.experiment_batches import (
+            ExperimentBatchRepository,
+            FileExperimentBatchRepository,
+        )
+
+        exports = {
+            "ExperimentBatchRepository": ExperimentBatchRepository,
+            "FileExperimentBatchRepository": FileExperimentBatchRepository,
+        }
+        return exports[name]
+
     if name in {"RunRepository", "FileRunRepository"}:
         from crypto_backtest_workbench.storage.repositories.runs import (
             FileRunRepository,
@@ -60,6 +76,18 @@ def __getattr__(name: str):
         exports = {
             "RunRepository": RunRepository,
             "FileRunRepository": FileRunRepository,
+        }
+        return exports[name]
+
+    if name in {"ResearchNoteRepository", "FileResearchNoteRepository"}:
+        from crypto_backtest_workbench.storage.repositories.research_notes import (
+            FileResearchNoteRepository,
+            ResearchNoteRepository,
+        )
+
+        exports = {
+            "ResearchNoteRepository": ResearchNoteRepository,
+            "FileResearchNoteRepository": FileResearchNoteRepository,
         }
         return exports[name]
 

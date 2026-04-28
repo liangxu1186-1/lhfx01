@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from math import isnan
 
-from crypto_backtest_workbench.app.readmodels.runs import load_run_detail_view
+from crypto_backtest_workbench.app.readmodels.runs import list_run_summary_views
 from crypto_backtest_workbench.storage.repositories import RunRepository
 
 
@@ -28,8 +28,15 @@ class ParameterLabRow:
     fee_rate: float | None
     slippage_bps: float | None
     total_return: float
+    max_drawdown: float
     benchmark_return: float | None
     excess_return: float | None
+    is_total_return: float | None
+    is_excess_return: float | None
+    oos_total_return: float | None
+    oos_excess_return: float | None
+    oos_trade_count: int | None
+    oos_win_rate: float | None
     final_equity: float
     trade_count: int
     win_rate: float
@@ -59,25 +66,27 @@ def build_parameter_lab_rows(
 ) -> list[ParameterLabRow]:
     rows: list[ParameterLabRow] = []
     candidate_run_ids = run_ids or run_repository.list_run_ids()
+    summary_by_run_id = {
+        summary.run_id: summary
+        for summary in list_run_summary_views(run_repository)
+    }
     for run_id in candidate_run_ids:
-        detail = load_run_detail_view(run_repository, run_id)
-        strategy_params = detail.manifest.resolved_config_json.get("strategy_params") or {}
-        execution_constraints = detail.manifest.resolved_config_json.get("execution_constraints") or {}
-        benchmark_return = None
-        excess_return = None
-        if detail.benchmark is not None:
-            benchmark_return = detail.benchmark.result.return_pct
-            excess_return = detail.metrics.total_return - benchmark_return
+        summary = summary_by_run_id.get(run_id)
+        if summary is None:
+            continue
+        manifest = run_repository.load_manifest(run_id)
+        strategy_params = manifest.resolved_config_json.get("strategy_params") or {}
+        execution_constraints = manifest.resolved_config_json.get("execution_constraints") or {}
         rows.append(
             ParameterLabRow(
-                run_id=detail.run.run_id,
-                strategy_name=detail.run.strategy_name,
-                dataset_snapshot_id=detail.run.dataset_snapshot_id,
-                symbol=str(detail.manifest.resolved_config_json.get("symbol") or ""),
-                timeframe=str(detail.manifest.resolved_config_json.get("timeframe") or ""),
-                validation_split_id=detail.run.validation_split_id,
-                status=detail.run.status.value,
-                created_at=detail.run.created_at,
+                run_id=summary.run_id,
+                strategy_name=summary.strategy_name,
+                dataset_snapshot_id=summary.dataset_snapshot_id,
+                symbol=summary.symbol,
+                timeframe=summary.timeframe,
+                validation_split_id=summary.validation_split_id,
+                status=summary.status,
+                created_at=summary.created_at,
                 fast_period=_coerce_int(strategy_params.get("fast_period")),
                 slow_period=_coerce_int(strategy_params.get("slow_period")),
                 qty_policy_ref=_coerce_str(strategy_params.get("qty_policy_ref")),
@@ -85,14 +94,21 @@ def build_parameter_lab_rows(
                 leverage=_coerce_float(execution_constraints.get("leverage")),
                 fee_rate=_coerce_float(execution_constraints.get("fee_rate")),
                 slippage_bps=_coerce_float(execution_constraints.get("slippage_bps")),
-                total_return=detail.metrics.total_return,
-                benchmark_return=benchmark_return,
-                excess_return=excess_return,
-                final_equity=detail.metrics.final_equity,
-                trade_count=detail.metrics.trade_count,
-                win_rate=detail.metrics.win_rate,
-                profit_factor=_normalize_float(detail.metrics.profit_factor),
-                warning_count=len(detail.execution.warnings),
+                total_return=summary.total_return,
+                max_drawdown=summary.max_drawdown,
+                benchmark_return=summary.benchmark_return,
+                excess_return=summary.excess_return,
+                is_total_return=summary.is_total_return,
+                is_excess_return=summary.is_excess_return,
+                oos_total_return=summary.oos_total_return,
+                oos_excess_return=summary.oos_excess_return,
+                oos_trade_count=summary.oos_trade_count,
+                oos_win_rate=summary.oos_win_rate,
+                final_equity=summary.final_equity,
+                trade_count=summary.trade_count,
+                win_rate=summary.win_rate,
+                profit_factor=_normalize_float(summary.profit_factor),
+                warning_count=summary.warning_count,
             )
         )
     return sorted(rows, key=lambda item: item.created_at, reverse=True)

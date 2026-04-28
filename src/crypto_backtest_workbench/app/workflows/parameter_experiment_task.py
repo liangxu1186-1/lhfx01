@@ -43,7 +43,7 @@ class ParameterExperimentTaskRequest:
     qty_policy_ref: str
     qty: float | None
     initial_cash: float
-    leverage: float
+    leverage_candidates: tuple[float, ...]
     fee_rate: float
     slippage_bps: float
     min_notional: float
@@ -64,7 +64,7 @@ class ParameterExperimentTaskWorkflowResult:
 
 def build_parameter_experiment_task(
     request: ParameterExperimentTaskRequest,
-) -> tuple[TaskRecord, ParameterExperiment, list[dict[str, int]]]:
+) -> tuple[TaskRecord, ParameterExperiment, list[dict[str, float | int]]]:
     _validate_parameter_experiment_request(request)
     combinations = _build_parameter_combinations(request)
     task = TaskRecord(
@@ -75,6 +75,7 @@ def build_parameter_experiment_task(
     search_space = {
         "fast_periods": list(request.fast_periods),
         "slow_periods": list(request.slow_periods),
+        "leverage_candidates": list(request.leverage_candidates),
         "combination_count": len(combinations),
         "max_samples": request.max_samples,
     }
@@ -123,6 +124,7 @@ def run_parameter_experiment_task_workflow(
             experiment_id=request.experiment_id,
             fast_period=params["fast_period"],
             slow_period=params["slow_period"],
+            leverage=params["leverage"],
             index=index,
         )
         run_ids.append(run_id)
@@ -141,7 +143,7 @@ def run_parameter_experiment_task_workflow(
                 },
                 constraints=ExecutionConstraints(
                     initial_cash=request.initial_cash,
-                    leverage=request.leverage,
+                    leverage=float(params["leverage"]),
                     fee_rate=request.fee_rate,
                     slippage_bps=request.slippage_bps,
                     min_notional=request.min_notional,
@@ -209,10 +211,10 @@ def run_parameter_experiment_task_workflow(
     )
 
 
-def _build_parameter_combinations(request: ParameterExperimentTaskRequest) -> list[dict[str, int]]:
+def _build_parameter_combinations(request: ParameterExperimentTaskRequest) -> list[dict[str, float | int]]:
     combinations = [
-        {"fast_period": fast_period, "slow_period": slow_period}
-        for fast_period, slow_period in product(request.fast_periods, request.slow_periods)
+        {"fast_period": fast_period, "slow_period": slow_period, "leverage": leverage}
+        for fast_period, slow_period, leverage in product(request.fast_periods, request.slow_periods, request.leverage_candidates)
     ]
     if not combinations:
         raise ValueError("Parameter experiment requires at least one parameter combination")
@@ -233,8 +235,7 @@ def _validate_parameter_experiment_request(request: ParameterExperimentTaskReque
         raise ValueError("experiment_id must not be empty")
     if request.initial_cash <= 0:
         raise ValueError("initial_cash must be positive")
-    if request.leverage <= 0:
-        raise ValueError("leverage must be positive")
+    _validate_leverage_candidates(request.leverage_candidates)
     if request.fee_rate < 0:
         raise ValueError("fee_rate must be >= 0")
     if request.slippage_bps < 0:
@@ -275,8 +276,21 @@ def _validate_periods(periods: tuple[int, ...], *, field_name: str) -> None:
         raise ValueError(f"{field_name} must not contain duplicate values")
 
 
-def _experiment_run_id(*, experiment_id: str, fast_period: int, slow_period: int, index: int) -> str:
-    return f"{experiment_id}-run-{index:03d}-f{fast_period}-s{slow_period}"
+def _validate_leverage_candidates(leverage_candidates: tuple[float, ...]) -> None:
+    if not leverage_candidates:
+        raise ValueError("leverage_candidates must not be empty")
+    if any(leverage <= 0 for leverage in leverage_candidates):
+        raise ValueError("leverage_candidates must contain only positive numbers")
+    if len(set(leverage_candidates)) != len(leverage_candidates):
+        raise ValueError("leverage_candidates must not contain duplicate values")
+
+
+def _experiment_run_id(*, experiment_id: str, fast_period: int | float, slow_period: int | float, leverage: int | float, index: int) -> str:
+    return f"{experiment_id}-run-{index:03d}-f{int(fast_period)}-s{int(slow_period)}-l{_format_leverage_for_id(float(leverage))}"
+
+
+def _format_leverage_for_id(value: float) -> str:
+    return f"{value:g}".replace(".", "p")
 
 
 def _transition_task(

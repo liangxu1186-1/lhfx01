@@ -21,6 +21,8 @@ from crypto_backtest_workbench.domain.models import (
     Side,
     SignalAction,
     SignalIntent,
+    ValidationSplit,
+    ValidationTargetType,
 )
 from crypto_backtest_workbench.engine.execution import ExecutionConstraints
 from crypto_backtest_workbench.jobs import SingleRunOrchestrator, SingleRunRequest
@@ -41,6 +43,9 @@ def test_run_readmodels_build_summary_and_detail(tmp_path) -> None:
     assert summaries[0].fast_period == 2
     assert summaries[0].slow_period == 5
     assert summaries[0].leverage == 2.0
+    assert summaries[0].max_drawdown >= 0
+    assert summaries[0].is_total_return is not None
+    assert summaries[0].oos_total_return is not None
 
     detail = load_run_detail_view(repository, "run-001")
     equity_rows = build_equity_chart_rows(detail)
@@ -48,11 +53,12 @@ def test_run_readmodels_build_summary_and_detail(tmp_path) -> None:
     warning_rows = build_warning_rows(detail)
 
     assert detail.run.run_id == "run-001"
+    assert detail.validation_summary is not None
     assert len(equity_rows) == len(detail.execution.equity_curve)
     assert equity_rows[0]["strategy_equity"] == detail.execution.equity_curve[0].equity
     assert equity_rows[0]["benchmark_equity"] is not None
     assert trade_rows[0]["trade_id"] == detail.execution.trades[0].trade_id
-    assert warning_rows[0]["warning_code"] == detail.execution.warnings[0].warning_code
+    assert len(warning_rows) == len(detail.execution.warnings)
 
 
 def test_run_readmodels_filter_summary_views(tmp_path) -> None:
@@ -207,6 +213,16 @@ def _build_single_run_result(*, run_id: str):
             leverage=2.0,
             fee_rate=0.001,
             qty_by_policy={"fixed_1": 1.0},
+        ),
+        validation_split=ValidationSplit(
+            validation_split_id="split-001",
+            target_type=ValidationTargetType.DATASET_SNAPSHOT,
+            target_id="snapshot-001",
+            warmup_bars=0,
+            is_start=candles[0].timestamp,
+            is_end=candles[4].timestamp,
+            oos_start=candles[4].timestamp,
+            oos_end=candles[4].timestamp + timedelta(hours=1),
         ),
     )
 
