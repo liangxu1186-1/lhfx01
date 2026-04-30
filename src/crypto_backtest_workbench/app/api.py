@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import mimetypes
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from crypto_backtest_workbench.app.batch_scoring import build_batch_recommendations
 from crypto_backtest_workbench.app.readmodels import (
     build_workspace_datasets,
     build_workspace_overview,
@@ -56,6 +57,7 @@ from crypto_backtest_workbench.storage.repositories import (
 
 DEFAULT_QTY_POLICY_REF = "percent_of_cash"
 DEFAULT_CASH_ALLOCATION_PCT = 100.0
+RESEARCH_NOTE_DECISION_STATUSES = frozenset({"candidate", "observing", "approved", "rejected", "archived"})
 
 
 class WorkspaceApiServer(ThreadingHTTPServer):
@@ -472,7 +474,7 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
         run_ids = set(str(run_id) for run_id in execution.get("run_ids", []))
         summaries = build_workspace_run_index(data_dir=self.server.data_dir)
         run_rows = [row for row in summaries if row["run_id"] in run_ids]
-        parameter_groups, recommendations, scoring_rules = _build_batch_recommendations(run_rows)
+        parameter_groups, recommendations, scoring_rules = build_batch_recommendations(run_rows)
         return {
             "batch": json_ready(batch),
             "execution": execution,
@@ -487,7 +489,21 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
         repository = FileResearchNoteRepository(self.server.data_dir)
         target_type = _first_query_value(query, "target_type")
         target_id = _first_query_value(query, "target_id")
-        return [json_ready(note) for note in repository.list_notes(target_type=target_type, target_id=target_id)]
+        decision_status = _optional_query_decision_status(query, "decision_status")
+        label = _first_query_value(query, "label")
+        linked_batch_id = _first_query_value(query, "linked_batch_id")
+        linked_parameter_group = _first_query_value(query, "linked_parameter_group")
+        return [
+            json_ready(note)
+            for note in repository.list_notes(
+                target_type=target_type,
+                target_id=target_id,
+                decision_status=decision_status,
+                label=label,
+                linked_batch_id=linked_batch_id,
+                linked_parameter_group=linked_parameter_group,
+            )
+        ]
 
     def _handle_parameter_experiment(self, payload: dict[str, object]) -> tuple[HTTPStatus, dict[str, object]]:
         snapshot = _load_snapshot(self.server.data_dir, _require_str(payload, "snapshot_id"))
@@ -583,6 +599,7 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             benchmark_enabled=str(payload.get("benchmark", "buy_and_hold")) == "buy_and_hold",
             max_samples=int(payload["max_samples"]) if payload.get("max_samples") is not None else None,
             seed=int(payload["seed"]) if payload.get("seed") is not None else None,
+            validation_split_factory=_build_batch_validation_split_factory(payload=payload, batch_id=batch_id),
         )
         task, batch, child_requests, planned_run_count = build_parameter_experiment_batch(request)
         task_repository = FileTaskRepository(self.server.data_dir)
@@ -653,6 +670,11 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
         if not content:
             raise ValueError("content must not be empty")
         labels = _normalize_labels(payload.get("labels"))
+        decision_status = _normalize_decision_status(payload.get("decision_status"))
+        decision_reason = _optional_str(payload.get("decision_reason"))
+        linked_batch_id = _optional_str(payload.get("linked_batch_id"))
+        linked_parameter_group = _optional_str(payload.get("linked_parameter_group"))
+        confidence_score = _optional_float(payload.get("confidence_score"))
         author = str(payload.get("author", "local")).strip() or "local"
         note_id = str(payload.get("note_id", _build_research_note_id()))
         repository = FileResearchNoteRepository(self.server.data_dir)
@@ -665,6 +687,11 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             content=content,
             author=author,
             labels=labels,
+            decision_status=decision_status,
+            decision_reason=decision_reason,
+            confidence_score=confidence_score,
+            linked_batch_id=linked_batch_id,
+            linked_parameter_group=linked_parameter_group,
         )
         repository.save_note(note)
         return (
@@ -1049,6 +1076,91 @@ def _build_validation_split(
     )
 
 
+def _build_batch_validation_split_factory(
+    *,
+    payload: dict[str, object],
+    batch_id: str,
+):
+    mode = str(payload.get("validation_split_mode", "none"))
+    if mode in {"none", ""}:
+        return None
+    warmup_bars = int(payload.get("warmup_bars", 0))
+    if warmup_bars < 0:
+        raise ValueError("warmup_bars must be >= 0")
+
+    if mode == "auto_ratio":
+        ratio = float(payload.get("oos_ratio", 0.3))
+        if ratio <= 0 or ratio >= 1:
+            raise ValueError("oos_ratio must be in (0, 1)")
+
+        def factory(snapshot: DatasetSnapshot) -> ValidationSplit:
+            split_at = _split_timestamp_by_ratio(snapshot=snapshot, oos_ratio=ratio)
+            return ValidationSplit(
+                validation_split_id=f"validation:{batch_id}:{snapshot.dataset_snapshot_id}:auto-{int(ratio * 100)}",
+                target_type=ValidationTargetType.DATASET_SNAPSHOT,
+                target_id=snapshot.dataset_snapshot_id,
+                warmup_bars=warmup_bars,
+                is_start=snapshot.time_range_start,
+                is_end=split_at,
+                oos_start=split_at,
+                oos_end=snapshot.time_range_end + _snapshot_bar_delta(snapshot),
+            )
+
+        return factory
+
+    if mode == "manual":
+        boundaries = {
+            "is_start": payload.get("is_start"),
+            "is_end": payload.get("is_end"),
+            "oos_start": payload.get("oos_start"),
+            "oos_end": payload.get("oos_end"),
+        }
+        if any(value in {None, ""} for value in boundaries.values()):
+            joined = ", ".join(sorted(boundaries))
+            raise ValueError(f"Manual validation split requires all of: {joined}")
+
+        def factory(snapshot: DatasetSnapshot) -> ValidationSplit:
+            return ValidationSplit(
+                validation_split_id=f"validation:{batch_id}:{snapshot.dataset_snapshot_id}:manual",
+                target_type=ValidationTargetType.DATASET_SNAPSHOT,
+                target_id=snapshot.dataset_snapshot_id,
+                warmup_bars=warmup_bars,
+                is_start=_parse_datetime(str(payload["is_start"])),
+                is_end=_parse_datetime(str(payload["is_end"])),
+                oos_start=_parse_datetime(str(payload["oos_start"])),
+                oos_end=_parse_datetime(str(payload["oos_end"])),
+            )
+
+        return factory
+
+    raise ValueError("validation_split_mode must be one of: none, auto_ratio, manual")
+
+
+def _split_timestamp_by_ratio(*, snapshot: DatasetSnapshot, oos_ratio: float) -> datetime:
+    duration = snapshot.time_range_end - snapshot.time_range_start
+    if duration.total_seconds() <= 0:
+        raise ValueError("Dataset snapshot time range must be positive for auto validation split")
+    return snapshot.time_range_start + duration * (1 - oos_ratio)
+
+
+def _snapshot_bar_delta(snapshot: DatasetSnapshot) -> timedelta:
+    normalized = snapshot.timeframe.strip().lower()
+    unit = normalized[-1:] if normalized else ""
+    try:
+        amount = int(normalized[:-1])
+    except ValueError:
+        return timedelta(0)
+    if unit == "m":
+        return timedelta(minutes=amount)
+    if unit == "h":
+        return timedelta(hours=amount)
+    if unit == "d":
+        return timedelta(days=amount)
+    if unit == "w":
+        return timedelta(weeks=amount)
+    return timedelta(0)
+
+
 def _parse_datetime(value: str) -> datetime:
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
@@ -1163,6 +1275,13 @@ def _first_query_value(query: dict[str, list[str]], field_name: str) -> str | No
     return value or None
 
 
+def _optional_query_decision_status(query: dict[str, list[str]], field_name: str) -> str | None:
+    value = _first_query_value(query, field_name)
+    if value is None:
+        return None
+    return _normalize_decision_status(value)
+
+
 def _normalize_labels(value: object | None) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -1170,6 +1289,29 @@ def _normalize_labels(value: object | None) -> tuple[str, ...]:
         raise ValueError("labels must be an array")
     labels = tuple(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
     return labels
+
+
+def _normalize_decision_status(value: object | None) -> str:
+    if value is None:
+        return "candidate"
+    decision_status = str(value).strip()
+    if decision_status not in RESEARCH_NOTE_DECISION_STATUSES:
+        allowed = ", ".join(sorted(RESEARCH_NOTE_DECISION_STATUSES))
+        raise ValueError(f"decision_status must be one of {allowed}")
+    return decision_status
+
+
+def _optional_str(value: object | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_float(value: object | None) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
 
 
 def _build_research_note_id() -> str:
@@ -1207,410 +1349,3 @@ def _delete_task_if_exists(task_repository: FileTaskRepository, task_id: str) ->
         task_repository.delete_task(task_id)
     except FileNotFoundError:
         return
-
-
-BATCH_RECOMMENDATION_RULES: dict[str, dict[str, object]] = {
-    "robust_candidate": {
-        "label": "自动稳健候选",
-        "summary": "跨多个快照样本内外都保持正收益，且相邻参数区间没有明显断层。",
-        "thresholds": [
-            "覆盖快照数 >= 2",
-            "正收益占比 >= 60%",
-            "平均收益率 > 0",
-            "平均超额收益 > 0",
-            "平均最大回撤 <= 35%",
-            "最少交易数 >= 3",
-            "相邻参数稳定度 >= 50%，且至少有 1 个稳定邻居",
-            "若存在样本外数据，则平均样本外收益 > 0、平均样本外超额 > 0、样本外正收益占比 >= 50%",
-        ],
-        "min_snapshot_count": 2,
-        "min_positive_ratio": 0.6,
-        "min_trade_count": 3,
-        "max_avg_drawdown": 0.35,
-        "min_neighbor_stability": 0.5,
-        "min_stable_neighbor_count": 1,
-        "min_oos_positive_ratio": 0.5,
-    },
-    "high_return_candidate": {
-        "label": "自动高收益候选",
-        "summary": "收益上限足够高，但稳定性还没有达到稳健候选标准。",
-        "thresholds": [
-            "最佳收益率 > 0",
-            "平均收益率 > 0",
-            "未命中自动排除",
-            "且未命中自动稳健候选",
-        ],
-    },
-    "excluded_combination": {
-        "label": "自动排除",
-        "summary": "平均收益或样本外正收益表现明显不达标，应优先排除。",
-        "thresholds": [
-            "平均收益率 <= 0，或",
-            "正收益占比 = 0，或",
-            "最差最大回撤 >= 80%，或",
-            "存在样本外数据且样本外正收益占比 = 0",
-        ],
-    },
-}
-
-
-def _build_batch_scoring_rules() -> dict[str, dict[str, object]]:
-    return {
-        key: {
-            "label": value["label"],
-            "summary": value["summary"],
-            "thresholds": list(value["thresholds"]),
-        }
-        for key, value in BATCH_RECOMMENDATION_RULES.items()
-    }
-
-
-def _clamp_score(value: float) -> float:
-    return max(0.0, min(value, 1.0))
-
-
-def _score_metric(value: float, target: float) -> float:
-    if target <= 0:
-        return 0.0
-    return _clamp_score(value / target)
-
-
-def _build_batch_recommendations(
-    run_rows: list[dict[str, object]],
-) -> tuple[list[dict[str, object]], dict[str, list[dict[str, object]]], dict[str, dict[str, object]]]:
-    grouped: dict[tuple[int | None, int | None, float | None], dict[str, object]] = {}
-    for row in run_rows:
-        fast_period = _as_optional_int(row.get("fast_period"))
-        slow_period = _as_optional_int(row.get("slow_period"))
-        leverage = _as_optional_float(row.get("leverage"))
-        key = (fast_period, slow_period, leverage)
-        group = grouped.setdefault(
-            key,
-            {
-                "fast_period": fast_period,
-                "slow_period": slow_period,
-                "leverage": leverage,
-                "run_count": 0,
-                "positive_run_count": 0,
-                "oos_positive_run_count": 0,
-                "oos_available_count": 0,
-                "avg_total_return": 0.0,
-                "avg_excess_return": 0.0,
-                "avg_oos_total_return": 0.0,
-                "avg_oos_excess_return": 0.0,
-                "avg_max_drawdown": 0.0,
-                "worst_max_drawdown": 0.0,
-                "best_total_return": float("-inf"),
-                "min_trade_count": None,
-                "min_oos_trade_count": None,
-                "snapshot_ids": set(),
-                "timeframes": set(),
-                "run_ids": [],
-                "neighbor_count": 0,
-                "stable_neighbor_count": 0,
-                "neighbor_stability_score": None,
-            },
-        )
-        total_return = float(row.get("total_return", 0.0))
-        excess_return = row.get("excess_return")
-        oos_total_return = row.get("oos_total_return")
-        oos_excess_return = row.get("oos_excess_return")
-        oos_trade_count = row.get("oos_trade_count")
-        max_drawdown = float(row.get("max_drawdown", 0.0))
-        trade_count = int(row.get("trade_count", 0))
-        group["run_count"] = int(group["run_count"]) + 1
-        if total_return > 0:
-            group["positive_run_count"] = int(group["positive_run_count"]) + 1
-        if oos_total_return is not None:
-            group["oos_available_count"] = int(group["oos_available_count"]) + 1
-            if float(oos_total_return) > 0:
-                group["oos_positive_run_count"] = int(group["oos_positive_run_count"]) + 1
-        group["avg_total_return"] = float(group["avg_total_return"]) + total_return
-        group["avg_excess_return"] = float(group["avg_excess_return"]) + (float(excess_return) if excess_return is not None else 0.0)
-        group["avg_oos_total_return"] = float(group["avg_oos_total_return"]) + (float(oos_total_return) if oos_total_return is not None else 0.0)
-        group["avg_oos_excess_return"] = float(group["avg_oos_excess_return"]) + (float(oos_excess_return) if oos_excess_return is not None else 0.0)
-        group["avg_max_drawdown"] = float(group["avg_max_drawdown"]) + max_drawdown
-        group["worst_max_drawdown"] = max(float(group["worst_max_drawdown"]), max_drawdown)
-        group["best_total_return"] = max(float(group["best_total_return"]), total_return)
-        min_trade_count = group["min_trade_count"]
-        group["min_trade_count"] = trade_count if min_trade_count is None else min(int(min_trade_count), trade_count)
-        min_oos_trade_count = group["min_oos_trade_count"]
-        if oos_trade_count is not None:
-            group["min_oos_trade_count"] = int(oos_trade_count) if min_oos_trade_count is None else min(int(min_oos_trade_count), int(oos_trade_count))
-        cast_snapshot_ids = group["snapshot_ids"]
-        cast_timeframes = group["timeframes"]
-        cast_run_ids = group["run_ids"]
-        if isinstance(cast_snapshot_ids, set):
-            cast_snapshot_ids.add(str(row.get("dataset_snapshot_id", "")))
-        if isinstance(cast_timeframes, set):
-            cast_timeframes.add(str(row.get("timeframe", "")))
-        if isinstance(cast_run_ids, list):
-            cast_run_ids.append(str(row.get("run_id", "")))
-
-    fast_values = sorted({key[0] for key in grouped if key[0] is not None})
-    slow_values = sorted({key[1] for key in grouped if key[1] is not None})
-    leverage_values = sorted({key[2] for key in grouped if key[2] is not None})
-    fast_index = {value: index for index, value in enumerate(fast_values)}
-    slow_index = {value: index for index, value in enumerate(slow_values)}
-    leverage_index = {value: index for index, value in enumerate(leverage_values)}
-
-    def averaged_metric(group: dict[str, object], field_name: str) -> float:
-        return float(group[field_name]) / int(group["run_count"])
-
-    def oos_positive_ratio_for_group(group: dict[str, object]) -> float | None:
-        oos_available_count = int(group["oos_available_count"])
-        if oos_available_count == 0:
-            return None
-        return int(group["oos_positive_run_count"]) / oos_available_count
-
-    def is_stable_group(candidate: dict[str, object]) -> bool:
-        if averaged_metric(candidate, "avg_total_return") <= 0 or averaged_metric(candidate, "avg_excess_return") <= 0:
-            return False
-        if averaged_metric(candidate, "avg_max_drawdown") >= 0.8:
-            return False
-        if int(candidate["oos_available_count"]) == 0:
-            return True
-        return (
-            averaged_metric(candidate, "avg_oos_total_return") > 0
-            and averaged_metric(candidate, "avg_oos_excess_return") > 0
-            and float(oos_positive_ratio_for_group(candidate) or 0.0) > 0
-        )
-
-    for key, group in grouped.items():
-        fast_period, slow_period, leverage = key
-        neighbors: list[dict[str, object]] = []
-        if fast_period is not None and slow_period is not None:
-            current_fast_index = fast_index.get(fast_period)
-            current_slow_index = slow_index.get(slow_period)
-            if current_fast_index is not None:
-                for offset in (-1, 1):
-                    next_index = current_fast_index + offset
-                    if 0 <= next_index < len(fast_values):
-                        neighbor = grouped.get((fast_values[next_index], slow_period, leverage))
-                        if neighbor is not None:
-                            neighbors.append(neighbor)
-            if current_slow_index is not None:
-                for offset in (-1, 1):
-                    next_index = current_slow_index + offset
-                    if 0 <= next_index < len(slow_values):
-                        neighbor = grouped.get((fast_period, slow_values[next_index], leverage))
-                        if neighbor is not None:
-                            neighbors.append(neighbor)
-        if leverage is not None:
-            current_leverage_index = leverage_index.get(leverage)
-            if current_leverage_index is not None:
-                for offset in (-1, 1):
-                    next_index = current_leverage_index + offset
-                    if 0 <= next_index < len(leverage_values):
-                        neighbor = grouped.get((fast_period, slow_period, leverage_values[next_index]))
-                        if neighbor is not None:
-                            neighbors.append(neighbor)
-        stable_neighbor_count = sum(1 for neighbor in neighbors if is_stable_group(neighbor))
-        group["neighbor_count"] = len(neighbors)
-        group["stable_neighbor_count"] = stable_neighbor_count
-        group["neighbor_stability_score"] = (
-            stable_neighbor_count / len(neighbors)
-            if neighbors
-            else None
-        )
-
-    parameter_groups: list[dict[str, object]] = []
-    for group in grouped.values():
-        run_count = int(group["run_count"])
-        avg_total_return = float(group["avg_total_return"]) / run_count
-        avg_excess_return = float(group["avg_excess_return"]) / run_count
-        avg_oos_total_return = float(group["avg_oos_total_return"]) / run_count
-        avg_oos_excess_return = float(group["avg_oos_excess_return"]) / run_count
-        avg_max_drawdown = float(group["avg_max_drawdown"]) / run_count
-        worst_max_drawdown = float(group["worst_max_drawdown"])
-        return_over_drawdown = avg_total_return / avg_max_drawdown if avg_max_drawdown > 0 else (avg_total_return if avg_total_return > 0 else 0.0)
-        positive_ratio = int(group["positive_run_count"]) / run_count
-        oos_available_count = int(group["oos_available_count"])
-        oos_positive_ratio = int(group["oos_positive_run_count"]) / oos_available_count if oos_available_count else None
-        neighbor_stability_score = group["neighbor_stability_score"]
-        confidence_components = [
-            0.25 * _score_metric(len(group["snapshot_ids"]), 3.0),
-            0.25 * float(neighbor_stability_score or 0.0),
-            0.2 * positive_ratio,
-            0.15 * _score_metric(int(group["min_trade_count"] or 0), 10.0),
-            0.15 * (
-                _score_metric(avg_oos_total_return, 0.2) * 0.5
-                + float(oos_positive_ratio or 0.0) * 0.5
-                if oos_available_count
-                else 0.0
-            ),
-        ]
-        confidence = round(sum(confidence_components) * 100, 1)
-        return_weights = [
-            ("avg_total_return", avg_total_return, 0.35, 0.3),
-            ("avg_excess_return", avg_excess_return, 0.2, 0.2),
-            ("avg_oos_total_return", avg_oos_total_return, 0.25, 0.2),
-            ("avg_oos_excess_return", avg_oos_excess_return, 0.1, 0.15),
-            ("best_total_return", float(group["best_total_return"]), 0.1, 0.5),
-        ]
-        weighted_return_score = 0.0
-        active_weight_sum = 0.0
-        for metric_name, metric_value, weight, target in return_weights:
-            if metric_name in {"avg_oos_total_return", "avg_oos_excess_return"}:
-                if not oos_available_count:
-                    continue
-            weighted_return_score += weight * _score_metric(metric_value, target)
-            active_weight_sum += weight
-        normalized_return_score = (weighted_return_score / active_weight_sum) if active_weight_sum else 0.0
-        drawdown_penalty = _clamp_score(avg_max_drawdown / 0.8)
-        risk_reward_score = _score_metric(return_over_drawdown, 2.0)
-        score = round((0.45 * normalized_return_score + 0.25 * risk_reward_score + 0.3 * (confidence / 100.0)) * (1 - 0.35 * drawdown_penalty) * 100, 1)
-        parameter_groups.append(
-            {
-                "fast_period": group["fast_period"],
-                "slow_period": group["slow_period"],
-                "leverage": group["leverage"],
-                "run_count": run_count,
-                "snapshot_count": len(group["snapshot_ids"]),
-                "timeframe_count": len(group["timeframes"]),
-                "avg_total_return": avg_total_return,
-                "avg_excess_return": avg_excess_return,
-                "avg_oos_total_return": avg_oos_total_return,
-                "avg_oos_excess_return": avg_oos_excess_return,
-                "avg_max_drawdown": avg_max_drawdown,
-                "worst_max_drawdown": worst_max_drawdown,
-                "return_over_drawdown": return_over_drawdown,
-                "best_total_return": group["best_total_return"],
-                "min_trade_count": group["min_trade_count"],
-                "min_oos_trade_count": group["min_oos_trade_count"],
-                "positive_ratio": positive_ratio,
-                "oos_available_count": oos_available_count,
-                "oos_positive_ratio": oos_positive_ratio,
-                "neighbor_count": group["neighbor_count"],
-                "stable_neighbor_count": group["stable_neighbor_count"],
-                "neighbor_stability_score": neighbor_stability_score,
-                "score": score,
-                "confidence": confidence,
-                "run_ids": group["run_ids"],
-            }
-        )
-
-    robust_rule = BATCH_RECOMMENDATION_RULES["robust_candidate"]
-    robust_candidates = [
-        {
-            **group,
-            "reason": (
-                "命中稳健候选："
-                f"覆盖 {group['snapshot_count']} 个快照，"
-                f"正收益占比 {float(group['positive_ratio']) * 100:.0f}%，"
-                f"相邻参数稳定度 {(float(group['neighbor_stability_score'] or 0.0) * 100):.0f}%，"
-                f"总分 {float(group['score']):.1f}，置信度 {float(group['confidence']):.1f}，"
-                f"平均样本外收益 {float(group['avg_oos_total_return']) * 100:.2f}%，"
-                f"平均样本外超额 {float(group['avg_oos_excess_return']) * 100:.2f}%，"
-                f"平均最大回撤 {float(group['avg_max_drawdown']) * 100:.2f}%，"
-                f"最少交易数 {int(group['min_trade_count'] or 0)}。"
-            ),
-        }
-        for group in parameter_groups
-        if group["snapshot_count"] >= int(robust_rule["min_snapshot_count"])
-        and group["positive_ratio"] >= float(robust_rule["min_positive_ratio"])
-        and float(group["avg_total_return"]) > 0
-        and float(group["avg_excess_return"]) > 0
-        and float(group["avg_max_drawdown"]) <= float(robust_rule["max_avg_drawdown"])
-        and int(group["min_trade_count"] or 0) >= int(robust_rule["min_trade_count"])
-        and int(group["stable_neighbor_count"]) >= int(robust_rule["min_stable_neighbor_count"])
-        and float(group["neighbor_stability_score"] or 0.0) >= float(robust_rule["min_neighbor_stability"])
-        and (
-            int(group["oos_available_count"]) == 0
-            or (
-                float(group["avg_oos_total_return"]) > 0
-                and float(group["avg_oos_excess_return"]) > 0
-                and float(group["oos_positive_ratio"] or 0.0) >= float(robust_rule["min_oos_positive_ratio"])
-            )
-        )
-    ]
-    robust_keys = {(item["fast_period"], item["slow_period"], item["leverage"]) for item in robust_candidates}
-    excluded_keys = {
-        (group["fast_period"], group["slow_period"], group["leverage"])
-        for group in parameter_groups
-        if (
-            float(group["avg_total_return"]) <= 0
-            or float(group["positive_ratio"]) == 0
-            or float(group["worst_max_drawdown"]) >= 0.8
-            or (group["oos_available_count"] and float(group["oos_positive_ratio"] or 0.0) == 0)
-        )
-    }
-    high_return_candidates = [
-        {
-            **group,
-            "reason": (
-                "命中高收益候选："
-                f"最佳收益率 {float(group['best_total_return']) * 100:.2f}%，"
-                f"平均收益率 {float(group['avg_total_return']) * 100:.2f}%，"
-                f"平均最大回撤 {float(group['avg_max_drawdown']) * 100:.2f}%，"
-                f"收益回撤比 {float(group['return_over_drawdown']):.2f}，"
-                f"相邻参数稳定度 {(float(group['neighbor_stability_score'] or 0.0) * 100):.0f}%，"
-                f"总分 {float(group['score']):.1f}，置信度 {float(group['confidence']):.1f}，"
-                f"样本外收益 {float(group['avg_oos_total_return']) * 100:.2f}%。"
-                " 收益上限高，但稳定性还没有达到稳健候选标准。"
-            ),
-        }
-        for group in parameter_groups
-        if float(group["best_total_return"]) > 0
-        and float(group["avg_total_return"]) > 0
-        and (group["fast_period"], group["slow_period"], group["leverage"]) not in robust_keys
-        and (group["fast_period"], group["slow_period"], group["leverage"]) not in excluded_keys
-    ]
-    excluded_combinations = [
-        {
-            **group,
-            "reason": (
-                "命中排除规则："
-                f"平均收益率 {float(group['avg_total_return']) * 100:.2f}%，"
-                f"正收益占比 {float(group['positive_ratio']) * 100:.0f}%，"
-                f"最差最大回撤 {float(group['worst_max_drawdown']) * 100:.2f}%，"
-                f"相邻参数稳定度 {(float(group['neighbor_stability_score'] or 0.0) * 100):.0f}%，"
-                f"总分 {float(group['score']):.1f}，置信度 {float(group['confidence']):.1f}，"
-                f"样本外正收益占比 {(float(group['oos_positive_ratio']) * 100):.0f}%"
-                if group["oos_positive_ratio"] is not None
-                else (
-                    "命中排除规则："
-                    f"平均收益率 {float(group['avg_total_return']) * 100:.2f}%，"
-                    f"正收益占比 {float(group['positive_ratio']) * 100:.0f}%，"
-                    f"最差最大回撤 {float(group['worst_max_drawdown']) * 100:.2f}%，"
-                    f"相邻参数稳定度 {(float(group['neighbor_stability_score'] or 0.0) * 100):.0f}%，"
-                    f"总分 {float(group['score']):.1f}，置信度 {float(group['confidence']):.1f}，"
-                    "当前没有样本外正收益记录。"
-                )
-            ),
-        }
-        for group in parameter_groups
-        if (
-            float(group["avg_total_return"]) <= 0
-            or float(group["positive_ratio"]) == 0
-            or float(group["worst_max_drawdown"]) >= 0.8
-            or (group["oos_available_count"] and float(group["oos_positive_ratio"] or 0.0) == 0)
-        )
-    ]
-
-    parameter_groups.sort(key=lambda item: (float(item["score"]), float(item["confidence"]), float(item["avg_oos_excess_return"]), float(item["avg_excess_return"])), reverse=True)
-    robust_candidates.sort(key=lambda item: (float(item["confidence"]), float(item["score"]), float(item["avg_oos_excess_return"])), reverse=True)
-    high_return_candidates.sort(key=lambda item: (float(item["score"]), float(item["best_total_return"]), float(item["confidence"])), reverse=True)
-    excluded_combinations.sort(key=lambda item: (float(item["score"]), float(item["confidence"])))
-
-    return (
-        parameter_groups,
-        {
-            "robust_candidates": robust_candidates[:5],
-            "high_return_candidates": high_return_candidates[:5],
-            "excluded_combinations": excluded_combinations[:5],
-        },
-        _build_batch_scoring_rules(),
-    )
-
-
-def _as_optional_int(value: object | None) -> int | None:
-    if value is None:
-        return None
-    return int(value)
-
-
-def _as_optional_float(value: object | None) -> float | None:
-    if value is None:
-        return None
-    return float(value)

@@ -217,6 +217,9 @@ def test_workspace_api_research_notes_can_be_created_and_read_from_run_detail(tm
                 "target_id": "run-api-note-001",
                 "author": "tester",
                 "labels": ["candidate", "review"],
+                "decision_status": "observing",
+                "decision_reason": "样本外仍为正，进入观察。",
+                "confidence_score": 68.0,
                 "content": "样本外仍为正，先保留候选。",
             },
             method="POST",
@@ -225,6 +228,8 @@ def test_workspace_api_research_notes_can_be_created_and_read_from_run_detail(tm
             server,
             "/api/research-notes?target_type=run&target_id=run-api-note-001",
         )
+        status_notes_response = _request_json(server, "/api/research-notes?decision_status=observing")
+        label_notes_response = _request_json(server, "/api/research-notes?label=review")
         run_detail_response = _request_json(server, "/api/runs/run-api-note-001")
     finally:
         server.shutdown()
@@ -233,8 +238,66 @@ def test_workspace_api_research_notes_can_be_created_and_read_from_run_detail(tm
 
     assert create_response["note"]["target_id"] == "run-api-note-001"
     assert create_response["note"]["labels"] == ["candidate", "review"]
+    assert create_response["note"]["decision_status"] == "observing"
+    assert create_response["note"]["decision_reason"] == "样本外仍为正，进入观察。"
+    assert create_response["note"]["confidence_score"] == 68.0
     assert notes_response["research_notes"][0]["author"] == "tester"
+    assert notes_response["research_notes"][0]["decision_status"] == "observing"
+    assert status_notes_response["research_notes"][0]["target_id"] == "run-api-note-001"
+    assert label_notes_response["research_notes"][0]["target_id"] == "run-api-note-001"
     assert run_detail_response["run"]["research_notes"][0]["content"] == "样本外仍为正，先保留候选。"
+
+
+def test_workspace_api_research_note_rejects_invalid_decision_status(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-note-invalid-001")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        _request_json(
+            server,
+            "/api/run-ema",
+            payload={
+                "snapshot_id": "snapshot-api-note-invalid-001",
+                "run_id": "run-api-note-invalid-001",
+                "fast_period": 2,
+                "slow_period": 3,
+                "qty_policy_ref": "fixed_1",
+                "qty": 0.01,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.0,
+                "slippage_bps": 0.0,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+            },
+        )
+        response = _request_error_json(
+            server,
+            "/api/research-notes",
+            payload={
+                "target_type": "run",
+                "target_id": "run-api-note-invalid-001",
+                "author": "tester",
+                "decision_status": "pending",
+                "content": "invalid",
+            },
+            method="POST",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response["status"] == 400
+    assert "decision_status must be one of" in response["body"]["error"]["message"]
 
 
 def test_workspace_api_parameter_experiment_executes_in_background_and_is_queryable(tmp_path: Path) -> None:
@@ -267,6 +330,8 @@ def test_workspace_api_parameter_experiment_executes_in_background_and_is_querya
                 "slippage_bps": 0.0,
                 "min_notional": 0.0,
                 "benchmark": "buy_and_hold",
+                "validation_split_mode": "auto_ratio",
+                "oos_ratio": 0.3,
             },
             method="POST",
         )
@@ -317,6 +382,8 @@ def test_workspace_api_parameter_experiment_rejects_duplicate_experiment_id(tmp_
                 "slippage_bps": 0.0,
                 "min_notional": 0.0,
                 "benchmark": "buy_and_hold",
+                "validation_split_mode": "auto_ratio",
+                "oos_ratio": 0.3,
             },
             method="POST",
         )
@@ -337,6 +404,8 @@ def test_workspace_api_parameter_experiment_rejects_duplicate_experiment_id(tmp_
                 "slippage_bps": 0.0,
                 "min_notional": 0.0,
                 "benchmark": "buy_and_hold",
+                "validation_split_mode": "auto_ratio",
+                "oos_ratio": 0.3,
             },
             method="POST",
         )
@@ -379,6 +448,8 @@ def test_workspace_api_parameter_experiment_rejects_invalid_parameter_combinatio
                 "slippage_bps": 0.0,
                 "min_notional": 0.0,
                 "benchmark": "buy_and_hold",
+                "validation_split_mode": "auto_ratio",
+                "oos_ratio": 0.3,
             },
             method="POST",
         )
@@ -421,6 +492,8 @@ def test_workspace_api_parameter_experiment_batch_executes_and_returns_recommend
                 "slippage_bps": 0.0,
                 "min_notional": 0.0,
                 "benchmark": "buy_and_hold",
+                "validation_split_mode": "auto_ratio",
+                "oos_ratio": 0.3,
             },
             method="POST",
         )
@@ -438,6 +511,8 @@ def test_workspace_api_parameter_experiment_batch_executes_and_returns_recommend
                 "target_id": "batch-api-001",
                 "author": "tester",
                 "labels": ["candidate"],
+                "decision_status": "observing",
+                "linked_batch_id": "batch-api-001",
                 "content": "批次整体进入候选观察。",
             },
             method="POST",
@@ -450,6 +525,11 @@ def test_workspace_api_parameter_experiment_batch_executes_and_returns_recommend
                 "target_id": group_target_id,
                 "author": "tester",
                 "labels": ["baseline"],
+                "decision_status": "approved",
+                "decision_reason": "作为当前基准组。",
+                "confidence_score": 75.0,
+                "linked_batch_id": "batch-api-001",
+                "linked_parameter_group": group_target_id,
                 "content": "参数组作为基准组。",
             },
             method="POST",
@@ -457,6 +537,11 @@ def test_workspace_api_parameter_experiment_batch_executes_and_returns_recommend
         group_notes_response = _request_json(
             server,
             f"/api/research-notes?target_type=parameter_group&target_id={group_target_id}",
+        )
+        linked_batch_notes_response = _request_json(server, "/api/research-notes?linked_batch_id=batch-api-001")
+        linked_group_notes_response = _request_json(
+            server,
+            f"/api/research-notes?linked_parameter_group={group_target_id}",
         )
     finally:
         server.shutdown()
@@ -471,6 +556,11 @@ def test_workspace_api_parameter_experiment_batch_executes_and_returns_recommend
     assert batch_detail_response["parameter_experiment_batch"]["batch"]["batch_id"] == "batch-api-001"
     assert len(batch_detail_response["parameter_experiment_batch"]["experiments"]) == 2
     assert len(batch_detail_response["parameter_experiment_batch"]["run_rows"]) == 4
+    assert batch_detail_response["parameter_experiment_batch"]["batch"]["validation_split_id"].startswith("validation:batch-api-001")
+    assert any(
+        row["oos_total_return"] is not None
+        for row in batch_detail_response["parameter_experiment_batch"]["run_rows"]
+    )
     assert "robust_candidates" in batch_detail_response["parameter_experiment_batch"]["recommendations"]
     assert "robust_candidate" in batch_detail_response["parameter_experiment_batch"]["scoring_rules"]
     assert "相邻参数稳定度 >= 50%，且至少有 1 个稳定邻居" in batch_detail_response["parameter_experiment_batch"]["scoring_rules"]["robust_candidate"]["thresholds"]
@@ -478,8 +568,16 @@ def test_workspace_api_parameter_experiment_batch_executes_and_returns_recommend
     assert "score" in batch_detail_response["parameter_experiment_batch"]["parameter_groups"][0]
     assert "confidence" in batch_detail_response["parameter_experiment_batch"]["parameter_groups"][0]
     assert batch_note_response["note"]["target_type"] == "parameter_experiment_batch"
+    assert batch_note_response["note"]["decision_status"] == "observing"
     assert group_note_response["note"]["target_id"] == group_target_id
+    assert group_note_response["note"]["decision_status"] == "approved"
+    assert group_note_response["note"]["linked_parameter_group"] == group_target_id
     assert group_notes_response["research_notes"][0]["content"] == "参数组作为基准组。"
+    assert {note["target_type"] for note in linked_batch_notes_response["research_notes"]} == {
+        "parameter_experiment_batch",
+        "parameter_group",
+    }
+    assert linked_group_notes_response["research_notes"][0]["target_id"] == group_target_id
 
 
 def test_workspace_api_delete_parameter_experiment_removes_runs_and_metadata(tmp_path: Path) -> None:

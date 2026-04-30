@@ -112,9 +112,31 @@ const RESEARCH_LABEL_TEXT: Record<string, string> = {
   review: '待复核',
   excluded: '排除',
 };
+const DECISION_STATUS_OPTIONS = [
+  { label: '候选', value: 'candidate' },
+  { label: '观察', value: 'observing' },
+  { label: '通过', value: 'approved' },
+  { label: '拒绝', value: 'rejected' },
+  { label: '归档', value: 'archived' },
+];
+const DECISION_STATUS_TEXT: Record<string, string> = {
+  candidate: '候选',
+  observing: '观察',
+  approved: '通过',
+  rejected: '拒绝',
+  archived: '归档',
+};
+const DECISION_STATUS_COLOR: Record<string, string> = {
+  candidate: 'blue',
+  observing: 'purple',
+  approved: 'green',
+  rejected: 'red',
+  archived: 'default',
+};
 const AUTO_GROUP_MEMBERSHIP_LABEL_TEXT: Record<string, string> = {
   auto_robust_candidate: '所属稳健参数组',
   auto_high_return_candidate: '所属高收益参数组',
+  auto_exploratory_candidate: '所属探索参数组',
   auto_excluded: '所属排除参数组',
 };
 
@@ -203,6 +225,34 @@ function researchLabelText(value: string): string {
   return RESEARCH_LABEL_TEXT[value] ?? value;
 }
 
+function decisionStatusText(value: string | null | undefined): string {
+  return value ? (DECISION_STATUS_TEXT[value] ?? value) : '候选';
+}
+
+function decisionStatusColor(value: string | null | undefined): string {
+  return value ? (DECISION_STATUS_COLOR[value] ?? 'blue') : 'blue';
+}
+
+function targetTypeText(value: string): string {
+  if (value === 'run') {
+    return 'Run';
+  }
+  if (value === 'parameter_experiment') {
+    return '单实验';
+  }
+  if (value === 'parameter_experiment_batch') {
+    return '实验批次';
+  }
+  if (value === 'parameter_group') {
+    return '参数组';
+  }
+  return value;
+}
+
+function isInactiveDecisionStatus(value: string | null | undefined): boolean {
+  return value === 'rejected' || value === 'archived';
+}
+
 function pickChartSamples<T>(rows: T[], maxPoints = 1200): T[] {
   if (rows.length <= maxPoints) {
     return rows;
@@ -232,6 +282,14 @@ function normalizeDateValue(value: unknown): string | undefined {
   return String(value);
 }
 
+function normalizeRatioValue(value: unknown): number | undefined {
+  if (value === null || value === undefined || value === '') {
+    return undefined;
+  }
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
 function normalizeTimeframeValue(value: unknown): string | undefined {
   if (value === null || value === undefined) {
     return undefined;
@@ -250,6 +308,10 @@ function buildDatasetGroupLabel(snapshot: DatasetSnapshotView): string {
 
 function buildParameterGroupTargetId(batchId: string, group: { fast_period: number | null; slow_period: number | null; leverage: number | null }): string {
   return `${batchId}:f${group.fast_period ?? 'na'}:s${group.slow_period ?? 'na'}:l${group.leverage ?? 'na'}`;
+}
+
+function buildParameterGroupKey(group: { fast_period: number | null | undefined; slow_period: number | null | undefined; leverage: number | null | undefined }): string {
+  return `${group.fast_period ?? 'na'}:${group.slow_period ?? 'na'}:${group.leverage ?? 'na'}`;
 }
 
 function parseIntegerList(value: unknown): number[] {
@@ -988,6 +1050,13 @@ function WorkspaceShell() {
         slippage_bps: values.slippage_bps,
         min_notional: values.min_notional,
         benchmark: 'buy_and_hold',
+        validation_split_mode: values.validation_split_mode,
+        oos_ratio: normalizeRatioValue(values.oos_ratio_pct) === undefined ? undefined : Number(values.oos_ratio_pct) / 100,
+        warmup_bars: values.warmup_bars,
+        is_start: normalizeDateValue(values.is_start),
+        is_end: normalizeDateValue(values.is_end),
+        oos_start: normalizeDateValue(values.oos_start),
+        oos_end: normalizeDateValue(values.oos_end),
       });
       const batchId = String(result.batch_id ?? '');
       setLastActionResult(`参数实验批次已提交：${batchId}`);
@@ -1066,6 +1135,11 @@ function WorkspaceShell() {
               run_count: Math.max(0, group.run_count - (group.run_ids.includes(runId) ? 1 : 0)),
             })),
             high_return_candidates: current.recommendations.high_return_candidates.map((group) => ({
+              ...group,
+              run_ids: group.run_ids.filter((value) => value !== runId),
+              run_count: Math.max(0, group.run_count - (group.run_ids.includes(runId) ? 1 : 0)),
+            })),
+            exploratory_candidates: current.recommendations.exploratory_candidates?.map((group) => ({
               ...group,
               run_ids: group.run_ids.filter((value) => value !== runId),
               run_count: Math.max(0, group.run_count - (group.run_ids.includes(runId) ? 1 : 0)),
@@ -1150,6 +1224,7 @@ function WorkspaceShell() {
           recommendations: {
             robust_candidates: current.recommendations.robust_candidates.map((group) => shrinkGroup(group)),
             high_return_candidates: current.recommendations.high_return_candidates.map((group) => shrinkGroup(group)),
+            exploratory_candidates: current.recommendations.exploratory_candidates?.map((group) => shrinkGroup(group)),
             excluded_combinations: current.recommendations.excluded_combinations.map((group) => shrinkGroup(group)),
           },
         };
@@ -2450,6 +2525,11 @@ function AnalysisView({
                       {researchLabelText(label)}
                     </Tag>
                   )) : <Text type="secondary">当前还没有标签</Text>}
+                  {latestResearchNote ? (
+                    <Tag color={decisionStatusColor(latestResearchNote.decision_status)}>
+                      {decisionStatusText(latestResearchNote.decision_status)}
+                    </Tag>
+                  ) : null}
                 </Space>
                 <Descriptions size="small" column={1}>
                   <Descriptions.Item label="备注数">{researchNotes.length}</Descriptions.Item>
@@ -2466,12 +2546,15 @@ function AnalysisView({
               <Form
                 form={researchNoteForm}
                 layout="vertical"
-                initialValues={{ author: 'local', labels: [] }}
+                initialValues={{ author: 'local', decision_status: 'candidate', labels: [] }}
                 onFinish={async (values) => {
                   await onSaveResearchNote(selectedRun.run_id, values);
                   researchNoteForm.setFieldsValue({
                     author: values.author,
+                    decision_status: values.decision_status ?? 'candidate',
                     labels: values.labels ?? [],
+                    decision_reason: '',
+                    confidence_score: null,
                     content: '',
                   });
                 }}
@@ -2490,6 +2573,23 @@ function AnalysisView({
                         placeholder="选择标签"
                         optionFilterProp="label"
                       />
+                    </Form.Item>
+                  </Col>
+                </Row>
+                <Row gutter={[12, 12]}>
+                  <Col xs={24} md={8}>
+                    <Form.Item name="decision_status" label="决策状态" rules={[{ required: true, message: '请选择决策状态' }]}>
+                      <Select options={DECISION_STATUS_OPTIONS} />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item name="confidence_score" label="置信度">
+                      <InputNumber min={0} max={100} precision={1} style={{ width: '100%' }} />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item name="decision_reason" label="状态原因">
+                      <Input />
                     </Form.Item>
                   </Col>
                 </Row>
@@ -2518,6 +2618,9 @@ function AnalysisView({
                           <Text type="secondary">{formatDateTime(note.created_at)}</Text>
                         </Space>
                         <Space wrap size={[8, 8]}>
+                          <Tag color={decisionStatusColor(note.decision_status)}>
+                            {decisionStatusText(note.decision_status)}
+                          </Tag>
                           {note.labels.map((label) => (
                             <Tag color={label === 'excluded' ? 'red' : label === 'baseline' ? 'gold' : 'blue'} key={`${note.note_id}-${label}`}>
                               {researchLabelText(label)}
@@ -2525,6 +2628,7 @@ function AnalysisView({
                           ))}
                         </Space>
                       </Flex>
+                      {note.decision_reason ? <Text type="secondary">{note.decision_reason}</Text> : null}
                       <Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>{note.content}</Paragraph>
                     </Space>
                   </Card>
@@ -2683,10 +2787,21 @@ function ParametersView({
   onSaveResearchNote: (targetType: string, targetId: string, values: Record<string, unknown>) => Promise<void>;
   savingResearchNote: boolean;
   onRefreshExperiments: () => Promise<void>;
-}) {
+  }) {
   const experimentSearchType = Form.useWatch('search_type', experimentForm) as string | undefined;
-  const [workspaceMode, setWorkspaceMode] = useState<'batch' | 'experiment' | 'sensitivity'>('batch');
-  const [manualLabelFilter, setManualLabelFilter] = useState<string[]>([]);
+  const validationSplitMode = Form.useWatch('validation_split_mode', experimentForm) as string | undefined;
+  const [workspaceMode, setWorkspaceMode] = useState<'batch' | 'experiment' | 'decisions' | 'sensitivity'>('batch');
+  const [runManualLabelFilter, setRunManualLabelFilter] = useState<string[]>([]);
+  const [groupDecisionLabelFilter, setGroupDecisionLabelFilter] = useState<string[]>([]);
+  const [batchDecisionLabelFilter, setBatchDecisionLabelFilter] = useState<string[]>([]);
+  const [groupDecisionStatusFilter, setGroupDecisionStatusFilter] = useState<string[]>([]);
+  const [batchDecisionStatusFilter, setBatchDecisionStatusFilter] = useState<string[]>([]);
+  const [decisionLedgerStatusFilter, setDecisionLedgerStatusFilter] = useState<string[]>([]);
+  const [decisionLedgerLabelFilter, setDecisionLedgerLabelFilter] = useState<string[]>([]);
+  const [decisionLedgerTargetTypeFilter, setDecisionLedgerTargetTypeFilter] = useState<string[]>([]);
+  const [decisionLedgerBatchFilter, setDecisionLedgerBatchFilter] = useState<string | null>(null);
+  const [decisionLedgerParameterGroupFilter, setDecisionLedgerParameterGroupFilter] = useState<string | null>(null);
+  const [showExperimentForm, setShowExperimentForm] = useState(false);
   const [autoLabelFilter, setAutoLabelFilter] = useState<string[]>([]);
   const [minScoreFilter, setMinScoreFilter] = useState<number | null>(null);
   const [minConfidenceFilter, setMinConfidenceFilter] = useState<number | null>(null);
@@ -2712,6 +2827,15 @@ function ParametersView({
     }
     if (!experimentForm.getFieldValue('search_type')) {
       experimentForm.setFieldValue('search_type', 'grid');
+    }
+    if (!experimentForm.getFieldValue('validation_split_mode')) {
+      experimentForm.setFieldValue('validation_split_mode', 'auto_ratio');
+    }
+    if (experimentForm.getFieldValue('oos_ratio_pct') === undefined) {
+      experimentForm.setFieldValue('oos_ratio_pct', 30);
+    }
+    if (experimentForm.getFieldValue('warmup_bars') === undefined) {
+      experimentForm.setFieldValue('warmup_bars', 0);
     }
     if (!experimentForm.getFieldValue('fast_periods')) {
       experimentForm.setFieldValue('fast_periods', '2,3,5,8');
@@ -2777,6 +2901,12 @@ function ParametersView({
     if (autoLabelFilter.length) {
       setAutoLabelFilter([]);
     }
+    if (groupDecisionLabelFilter.length) {
+      setGroupDecisionLabelFilter([]);
+    }
+    if (groupDecisionStatusFilter.length) {
+      setGroupDecisionStatusFilter([]);
+    }
     if (minScoreFilter !== null) {
       setMinScoreFilter(null);
     }
@@ -2792,10 +2922,13 @@ function ParametersView({
     if (topNFilter !== null) {
       setTopNFilter(null);
     }
-  }, [autoLabelFilter.length, maxDrawdownFilter, minConfidenceFilter, minReturnDrawdownFilter, minScoreFilter, selectedBatchId, topNFilter]);
+  }, [autoLabelFilter.length, groupDecisionLabelFilter.length, groupDecisionStatusFilter.length, maxDrawdownFilter, minConfidenceFilter, minReturnDrawdownFilter, minScoreFilter, selectedBatchId, topNFilter]);
   const selectedBatchRows = useMemo(() => {
     if (selectedBatchId === ALL_BATCHES) {
       return rows;
+    }
+    if (selectedBatchDetail?.run_rows) {
+      return selectedBatchDetail.run_rows;
     }
     const runIds = new Set(selectedBatchDetail?.execution.run_ids ?? []);
     if (!runIds.size) {
@@ -2836,15 +2969,18 @@ function ParametersView({
     for (const item of selectedBatchDetail.recommendations.high_return_candidates) {
       applyLabels(item.run_ids, 'auto_high_return_candidate', item.reason);
     }
+    for (const item of selectedBatchDetail.recommendations.exploratory_candidates ?? []) {
+      applyLabels(item.run_ids, 'auto_exploratory_candidate', item.reason);
+    }
     for (const item of selectedBatchDetail.recommendations.excluded_combinations) {
       applyLabels(item.run_ids, 'auto_excluded', item.reason);
     }
     return labelMap;
   }, [selectedBatchDetail]);
 
-  const availableManualLabels = useMemo(
-    () => Array.from(new Set(rows.flatMap((row) => manualLabelsByRunId.get(row.run_id) ?? []))),
-    [manualLabelsByRunId, rows],
+  const availableRunManualLabels = useMemo(
+    () => Array.from(new Set(researchNotes.filter((note) => note.target_type === 'run').flatMap((note) => note.labels ?? []))),
+    [researchNotes],
   );
   const availableAutoLabels = useMemo(
     () => Array.from(new Set(rows.flatMap((row) => (autoLabelsByRunId.get(row.run_id) ?? []).map((item) => item.label)))),
@@ -2858,19 +2994,99 @@ function ParametersView({
     }
     return noteMap;
   }, [researchNotes]);
+  const availableDecisionLedgerStatuses = useMemo(
+    () => Array.from(new Set(researchNotes.map((note) => note.decision_status ?? 'candidate'))),
+    [researchNotes],
+  );
+  const availableDecisionLedgerLabels = useMemo(
+    () => Array.from(new Set(researchNotes.flatMap((note) => note.labels ?? []))),
+    [researchNotes],
+  );
+  const availableDecisionLedgerTargetTypes = useMemo(
+    () => Array.from(new Set(researchNotes.map((note) => note.target_type))),
+    [researchNotes],
+  );
+  const availableDecisionLedgerBatchIds = useMemo(
+    () => Array.from(new Set(researchNotes.map((note) => note.linked_batch_id).filter((value): value is string => Boolean(value)))),
+    [researchNotes],
+  );
+  const availableDecisionLedgerParameterGroups = useMemo(
+    () => Array.from(new Set(researchNotes.map((note) => note.linked_parameter_group).filter((value): value is string => Boolean(value)))),
+    [researchNotes],
+  );
+  const filteredDecisionLedgerNotes = useMemo(
+    () => researchNotes.filter((note) => (
+      (!decisionLedgerStatusFilter.length || decisionLedgerStatusFilter.includes(note.decision_status ?? 'candidate'))
+      && (!decisionLedgerLabelFilter.length || decisionLedgerLabelFilter.some((label) => (note.labels ?? []).includes(label)))
+      && (!decisionLedgerTargetTypeFilter.length || decisionLedgerTargetTypeFilter.includes(note.target_type))
+      && (!decisionLedgerBatchFilter || note.linked_batch_id === decisionLedgerBatchFilter)
+      && (!decisionLedgerParameterGroupFilter || note.linked_parameter_group === decisionLedgerParameterGroupFilter)
+    )),
+    [
+      decisionLedgerBatchFilter,
+      decisionLedgerLabelFilter,
+      decisionLedgerParameterGroupFilter,
+      decisionLedgerStatusFilter,
+      decisionLedgerTargetTypeFilter,
+      researchNotes,
+    ],
+  );
+  const batchDecisionNotes = useMemo(
+    () => (selectedBatchDetail ? (notesByTarget.get(`parameter_experiment_batch:${selectedBatchDetail.batch.batch_id}`) ?? []) : []),
+    [notesByTarget, selectedBatchDetail],
+  );
+  const batchDecisionNotesByBatchId = useMemo(() => {
+    const noteMap = new Map<string, ResearchNote[]>();
+    for (const note of researchNotes) {
+      if (note.target_type !== 'parameter_experiment_batch') {
+        continue;
+      }
+      noteMap.set(note.target_id, [...(noteMap.get(note.target_id) ?? []), note]);
+    }
+    return noteMap;
+  }, [researchNotes]);
+  const availableBatchDecisionLabels = useMemo(
+    () => Array.from(new Set(Array.from(batchDecisionNotesByBatchId.values()).flatMap((notes) => notes.flatMap((note) => note.labels ?? [])))),
+    [batchDecisionNotesByBatchId],
+  );
+  const availableBatchDecisionStatuses = useMemo(
+    () => Array.from(new Set(Array.from(batchDecisionNotesByBatchId.values()).flatMap((notes) => notes.map((note) => note.decision_status ?? 'candidate')))),
+    [batchDecisionNotesByBatchId],
+  );
+  const filteredBatches = useMemo(() => {
+    if (!batchDecisionLabelFilter.length && !batchDecisionStatusFilter.length) {
+      return batches;
+    }
+    return batches.filter((batch) => {
+      const notes = batchDecisionNotesByBatchId.get(batch.batch_id) ?? [];
+      const labels = Array.from(new Set(notes.flatMap((note) => note.labels ?? [])));
+      const statuses = Array.from(new Set(notes.map((note) => note.decision_status ?? 'candidate')));
+      return (
+        (!batchDecisionLabelFilter.length || batchDecisionLabelFilter.some((label) => labels.includes(label)))
+        && (!batchDecisionStatusFilter.length || batchDecisionStatusFilter.some((status) => statuses.includes(status)))
+      );
+    });
+  }, [batchDecisionLabelFilter, batchDecisionNotesByBatchId, batchDecisionStatusFilter, batches]);
+  useEffect(() => {
+    if (selectedBatchId === ALL_BATCHES || (!batchDecisionLabelFilter.length && !batchDecisionStatusFilter.length)) {
+      return;
+    }
+    if (!filteredBatches.some((batch) => batch.batch_id === selectedBatchId)) {
+      setSelectedBatchId(ALL_BATCHES);
+    }
+  }, [batchDecisionLabelFilter.length, batchDecisionStatusFilter.length, filteredBatches, selectedBatchId, setSelectedBatchId]);
   const autoLabelFilterDisabled = selectedBatchId === ALL_BATCHES;
   const batchGroupLabelsByKey = useMemo(() => {
     const labelMap = new Map<string, AutoLabelInfo[]>();
     if (!selectedBatchDetail) {
       return labelMap;
     }
-    const groupKey = (fastPeriod: number | null | undefined, slowPeriod: number | null | undefined, leverage: number | null | undefined) => `${fastPeriod ?? 'na'}:${slowPeriod ?? 'na'}:${leverage ?? 'na'}`;
     const applyLabel = (
       groups: Array<{ fast_period: number | null; slow_period: number | null; leverage: number | null; reason: string }>,
       label: string,
     ) => {
       for (const group of groups) {
-        const key = groupKey(group.fast_period, group.slow_period, group.leverage);
+        const key = buildParameterGroupKey(group);
         const current = labelMap.get(key) ?? [];
         if (!current.some((item) => item.label === label)) {
           labelMap.set(key, [...current, { label, reason: group.reason }]);
@@ -2879,9 +3095,83 @@ function ParametersView({
     };
     applyLabel(selectedBatchDetail.recommendations.robust_candidates, 'auto_robust_candidate');
     applyLabel(selectedBatchDetail.recommendations.high_return_candidates, 'auto_high_return_candidate');
+    applyLabel(selectedBatchDetail.recommendations.exploratory_candidates ?? [], 'auto_exploratory_candidate');
     applyLabel(selectedBatchDetail.recommendations.excluded_combinations, 'auto_excluded');
     return labelMap;
   }, [selectedBatchDetail]);
+  const batchGroupResearchNotesByKey = useMemo(() => {
+    const noteMap = new Map<string, ResearchNote[]>();
+    if (!selectedBatchDetail) {
+      return noteMap;
+    }
+    for (const group of selectedBatchDetail.parameter_groups) {
+      const targetId = buildParameterGroupTargetId(selectedBatchDetail.batch.batch_id, group);
+      noteMap.set(buildParameterGroupKey(group), notesByTarget.get(`parameter_group:${targetId}`) ?? []);
+    }
+    return noteMap;
+  }, [notesByTarget, selectedBatchDetail]);
+  const batchManualLabelsByRunId = useMemo(() => {
+    const labelMap = new Map<string, string[]>();
+    for (const row of selectedBatchRows) {
+      labelMap.set(row.run_id, [...(manualLabelsByRunId.get(row.run_id) ?? [])]);
+    }
+    for (const group of selectedBatchDetail?.parameter_groups ?? []) {
+      const noteLabels = Array.from(new Set((batchGroupResearchNotesByKey.get(buildParameterGroupKey(group)) ?? []).flatMap((note) => note.labels ?? [])));
+      if (!noteLabels.length) {
+        continue;
+      }
+      for (const runId of group.run_ids) {
+        const current = labelMap.get(runId) ?? [];
+        labelMap.set(runId, Array.from(new Set([...current, ...noteLabels])));
+      }
+    }
+    return labelMap;
+  }, [batchGroupResearchNotesByKey, manualLabelsByRunId, selectedBatchDetail, selectedBatchRows]);
+  const latestBatchGroupDecisionStatusByKey = useMemo(() => {
+    const statusMap = new Map<string, string>();
+    for (const [key, notes] of batchGroupResearchNotesByKey.entries()) {
+      const latestNote = notes[0];
+      if (latestNote) {
+        statusMap.set(key, latestNote.decision_status ?? 'candidate');
+      }
+    }
+    return statusMap;
+  }, [batchGroupResearchNotesByKey]);
+  const batchManualDecisionStatusByRunId = useMemo(() => {
+    const statusMap = new Map<string, string>();
+    for (const group of selectedBatchDetail?.parameter_groups ?? []) {
+      const latestStatus = latestBatchGroupDecisionStatusByKey.get(buildParameterGroupKey(group));
+      if (!latestStatus) {
+        continue;
+      }
+      for (const runId of group.run_ids) {
+        statusMap.set(runId, latestStatus);
+      }
+    }
+    return statusMap;
+  }, [latestBatchGroupDecisionStatusByKey, selectedBatchDetail]);
+  const availableGroupDecisionLabels = useMemo(
+    () => Array.from(new Set(Array.from(batchGroupResearchNotesByKey.values()).flatMap((notes) => notes.flatMap((note) => note.labels ?? [])))),
+    [batchGroupResearchNotesByKey],
+  );
+  const availableGroupDecisionStatuses = useMemo(
+    () => Array.from(new Set(Array.from(batchGroupResearchNotesByKey.values()).flatMap((notes) => notes.map((note) => note.decision_status ?? 'candidate')))),
+    [batchGroupResearchNotesByKey],
+  );
+  const activeManualDecisionGroups = useMemo(() => {
+    const groups = (selectedBatchDetail?.parameter_groups ?? []).filter((group) => {
+      const status = latestBatchGroupDecisionStatusByKey.get(buildParameterGroupKey(group));
+      return status === 'approved' || status === 'observing';
+    });
+    return [...groups].sort((left, right) => {
+      const leftStatus = latestBatchGroupDecisionStatusByKey.get(buildParameterGroupKey(left));
+      const rightStatus = latestBatchGroupDecisionStatusByKey.get(buildParameterGroupKey(right));
+      if (leftStatus !== rightStatus) {
+        return leftStatus === 'approved' ? -1 : 1;
+      }
+      return right.score - left.score;
+    });
+  }, [latestBatchGroupDecisionStatusByKey, selectedBatchDetail]);
   const selectedBatchGroupMetricsByRunId = useMemo(() => {
     const metrics = new Map<string, { score: number; confidence: number }>();
     for (const group of selectedBatchDetail?.parameter_groups ?? []) {
@@ -2916,10 +3206,19 @@ function ParametersView({
     return true;
   }
 
-  function matchesRunLabelFilters(runId: string, options: { applyAutoLabelFilters: boolean; applyBatchScoreFilters: boolean }): boolean {
-    const manualLabels = manualLabelsByRunId.get(runId) ?? [];
+  function matchesRunLabelFilters(
+    runId: string,
+    options: {
+      applyAutoLabelFilters: boolean;
+      applyBatchScoreFilters: boolean;
+      manualLabelsByRunIdSource?: Map<string, string[]>;
+      manualFilterValues?: string[];
+    },
+  ): boolean {
+    const manualLabels = options.manualLabelsByRunIdSource?.get(runId) ?? manualLabelsByRunId.get(runId) ?? [];
     const autoLabels = (autoLabelsByRunId.get(runId) ?? []).map((item) => item.label);
-    if (manualLabelFilter.length && !manualLabelFilter.some((label) => manualLabels.includes(label))) {
+    const manualFilterValues = options.manualFilterValues ?? runManualLabelFilter;
+    if (manualFilterValues.length && !manualFilterValues.some((label) => manualLabels.includes(label))) {
       return false;
     }
     if (options.applyAutoLabelFilters && autoLabelFilter.length && !autoLabelFilter.some((label) => autoLabels.includes(label))) {
@@ -2934,17 +3233,52 @@ function ParametersView({
     return true;
   }
 
+  function matchesBatchGroupFilters(group: NonNullable<ParameterExperimentBatchDetail['parameter_groups']>[number]): boolean {
+    if (!matchesScoreFilters(group.score, group.confidence, group.avg_max_drawdown, group.return_over_drawdown)) {
+      return false;
+    }
+    const groupKey = buildParameterGroupKey(group);
+    const autoLabels = (batchGroupLabelsByKey.get(groupKey) ?? []).map((item) => item.label);
+    const manualNotes = batchGroupResearchNotesByKey.get(groupKey) ?? [];
+    const manualLabels = Array.from(new Set(manualNotes.flatMap((note) => note.labels ?? [])));
+    const manualStatuses = Array.from(new Set(manualNotes.map((note) => note.decision_status ?? 'candidate')));
+    if (autoLabelFilter.length && !autoLabelFilter.some((label) => autoLabels.includes(label))) {
+      return false;
+    }
+    if (groupDecisionLabelFilter.length && !groupDecisionLabelFilter.some((label) => manualLabels.includes(label))) {
+      return false;
+    }
+    if (groupDecisionStatusFilter.length && !groupDecisionStatusFilter.some((status) => manualStatuses.includes(status))) {
+      return false;
+    }
+    return true;
+  }
+
+  function matchesBatchRecommendationFilters(group: NonNullable<ParameterExperimentBatchDetail['parameter_groups']>[number]): boolean {
+    if (!matchesBatchGroupFilters(group)) {
+      return false;
+    }
+    if (groupDecisionStatusFilter.length) {
+      return true;
+    }
+    const latestStatus = latestBatchGroupDecisionStatusByKey.get(buildParameterGroupKey(group));
+    return !isInactiveDecisionStatus(latestStatus);
+  }
+
   const filteredBatchParameterGroups = useMemo(() => {
-    const groups = (selectedBatchDetail?.parameter_groups ?? []).filter((group) => matchesScoreFilters(group.score, group.confidence, group.avg_max_drawdown, group.return_over_drawdown));
+    const groups = (selectedBatchDetail?.parameter_groups ?? []).filter((group) => matchesBatchGroupFilters(group));
     const sortedGroups = [...groups].sort((left, right) => right.score - left.score);
     return topNFilter ? sortedGroups.slice(0, topNFilter) : sortedGroups;
-  }, [maxDrawdownFilter, minConfidenceFilter, minReturnDrawdownFilter, minScoreFilter, selectedBatchDetail, topNFilter]);
+  }, [autoLabelFilter, batchGroupLabelsByKey, batchGroupResearchNotesByKey, groupDecisionLabelFilter, groupDecisionStatusFilter, maxDrawdownFilter, minConfidenceFilter, minReturnDrawdownFilter, minScoreFilter, selectedBatchDetail, topNFilter]);
   const filteredBatchGroupRunIds = useMemo(
     () => new Set(filteredBatchParameterGroups.flatMap((group) => group.run_ids)),
     [filteredBatchParameterGroups],
   );
   const hasBatchGroupFilters = selectedBatchId !== ALL_BATCHES && (
-    minScoreFilter !== null
+    autoLabelFilter.length > 0
+    || groupDecisionLabelFilter.length > 0
+    || groupDecisionStatusFilter.length > 0
+    || minScoreFilter !== null
     || minConfidenceFilter !== null
     || maxDrawdownFilter !== null
     || minReturnDrawdownFilter !== null
@@ -2952,16 +3286,21 @@ function ParametersView({
   );
   const filteredBatchRunRows = useMemo(
     () => selectedBatchRows.filter((row) => (
-      matchesRunLabelFilters(row.run_id, { applyAutoLabelFilters: true, applyBatchScoreFilters: true })
+      matchesRunLabelFilters(row.run_id, {
+        applyAutoLabelFilters: false,
+        applyBatchScoreFilters: true,
+        manualLabelsByRunIdSource: batchManualLabelsByRunId,
+        manualFilterValues: [],
+      })
       && (!hasBatchGroupFilters || filteredBatchGroupRunIds.has(row.run_id))
     )),
-    [autoLabelFilter, filteredBatchGroupRunIds, hasBatchGroupFilters, manualLabelFilter, selectedBatchRows, autoLabelsByRunId, manualLabelsByRunId, selectedBatchGroupMetricsByRunId, minScoreFilter, minConfidenceFilter],
+    [batchManualLabelsByRunId, filteredBatchGroupRunIds, hasBatchGroupFilters, selectedBatchRows, autoLabelsByRunId, manualLabelsByRunId, selectedBatchGroupMetricsByRunId, minScoreFilter, minConfidenceFilter],
   );
   const filteredExperimentRunRows = useMemo(
     () => selectedExperimentRows.filter((row) => (
       matchesRunLabelFilters(row.run_id, { applyAutoLabelFilters: false, applyBatchScoreFilters: false })
     )),
-    [autoLabelFilter, manualLabelFilter, selectedExperimentRows, autoLabelsByRunId, manualLabelsByRunId],
+    [runManualLabelFilter, selectedExperimentRows, autoLabelsByRunId, manualLabelsByRunId],
   );
   const experimentResultColumns = useMemo<ColumnDef<ParameterLabRow>[]>(() => [
     {
@@ -3009,15 +3348,25 @@ function ParametersView({
       enableSorting: false,
       cell: ({ row }) => {
         const autoLabels = autoLabelsByRunId.get(row.original.run_id) ?? [];
-        const manualLabels = manualLabelsByRunId.get(row.original.run_id) ?? [];
-        if (!autoLabels.length && !manualLabels.length) {
+        const manualLabels = workspaceMode === 'batch'
+          ? (batchManualLabelsByRunId.get(row.original.run_id) ?? [])
+          : (manualLabelsByRunId.get(row.original.run_id) ?? []);
+        const groupDecisionStatus = workspaceMode === 'batch'
+          ? batchManualDecisionStatusByRunId.get(row.original.run_id)
+          : undefined;
+        if (!autoLabels.length && !manualLabels.length && !groupDecisionStatus) {
           return <Text type="secondary">--</Text>;
         }
         return (
           <Space size={[4, 4]} wrap>
+            {groupDecisionStatus ? (
+              <Tag color={decisionStatusColor(groupDecisionStatus)}>
+                {decisionStatusText(groupDecisionStatus)}
+              </Tag>
+            ) : null}
             {autoLabels.map((item) => (
               <Tooltip key={`${row.original.run_id}-${item.label}`} title={item.reason}>
-                <Tag color={item.label === 'auto_excluded' ? 'red' : item.label === 'auto_high_return_candidate' ? 'blue' : 'green'}>
+                <Tag color={item.label === 'auto_excluded' ? 'red' : item.label === 'auto_high_return_candidate' ? 'blue' : item.label === 'auto_exploratory_candidate' ? 'purple' : 'green'}>
                   {AUTO_GROUP_MEMBERSHIP_LABEL_TEXT[item.label] ?? item.label}
                 </Tag>
               </Tooltip>
@@ -3053,7 +3402,7 @@ function ParametersView({
         </Space>
       ),
     },
-  ], [autoLabelsByRunId, manualLabelsByRunId, onDeleteRun, onOpenRun]);
+  ], [autoLabelsByRunId, batchManualDecisionStatusByRunId, batchManualLabelsByRunId, manualLabelsByRunId, onDeleteRun, onOpenRun, workspaceMode]);
   const experimentColumns = useMemo<ColumnDef<ParameterExperimentSummary>[]>(() => [
     {
       header: '实验 ID',
@@ -3120,6 +3469,45 @@ function ParametersView({
     { header: '计划 / 已完成', size: 110, minSize: 110, cell: ({ row }) => `${row.original.planned_run_count} / ${row.original.run_count}` },
     { header: '失败实验', size: 84, minSize: 84, accessorKey: 'failed_experiment_count' },
     {
+      id: 'batch_decision',
+      header: '批次决策',
+      size: 220,
+      minSize: 200,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const notes = batchDecisionNotesByBatchId.get(row.original.batch_id) ?? [];
+        const labels = Array.from(new Set(notes.flatMap((note) => note.labels ?? [])));
+        const statuses = Array.from(new Set(notes.map((note) => note.decision_status ?? 'candidate')));
+        if (!labels.length && !statuses.length) {
+          return <Text type="secondary">--</Text>;
+        }
+        return (
+          <Space size={[4, 4]} wrap>
+            {statuses.map((status) => (
+              <Tooltip
+                key={`${row.original.batch_id}-${status}`}
+                title={notes.filter((note) => (note.decision_status ?? 'candidate') === status).map((note) => note.decision_reason || note.content).join(' / ')}
+              >
+                <Tag color={decisionStatusColor(status)}>
+                  {decisionStatusText(status)}
+                </Tag>
+              </Tooltip>
+            ))}
+            {labels.map((label) => (
+              <Tooltip
+                key={`${row.original.batch_id}-${label}`}
+                title={notes.filter((note) => note.labels.includes(label)).map((note) => note.content).join(' / ')}
+              >
+                <Tag color={label === 'excluded' ? 'red' : label === 'baseline' ? 'gold' : 'blue'}>
+                  {researchLabelText(label)}
+                </Tag>
+              </Tooltip>
+            ))}
+          </Space>
+        );
+      },
+    },
+    {
       header: '状态',
       size: 96,
       minSize: 96,
@@ -3150,10 +3538,10 @@ function ParametersView({
         </Space>
       ),
     },
-  ], [deletingBatchId, onDeleteBatch, selectedBatchId, setSelectedBatchId]);
+  ], [batchDecisionNotesByBatchId, deletingBatchId, onDeleteBatch, selectedBatchId, setSelectedBatchId]);
   function openDecisionModal(targetType: string, targetId: string, title: string) {
     decisionForm.resetFields();
-    decisionForm.setFieldsValue({ author: 'local', labels: ['candidate'] });
+    decisionForm.setFieldsValue({ author: 'local', decision_status: 'candidate', labels: [] });
     setDecisionTarget({ targetType, targetId, title });
   }
 
@@ -3176,14 +3564,45 @@ function ParametersView({
           <Space size={[4, 4]} wrap>
             {autoLabels.map((item) => (
               <Tooltip key={`${key}-${item.label}`} title={item.reason}>
-                <Tag color={item.label === 'auto_excluded' ? 'red' : item.label === 'auto_high_return_candidate' ? 'blue' : 'green'}>
+                <Tag color={item.label === 'auto_excluded' ? 'red' : item.label === 'auto_high_return_candidate' ? 'blue' : item.label === 'auto_exploratory_candidate' ? 'purple' : 'green'}>
                   {item.label === 'auto_excluded'
                     ? '自动排除'
                     : item.label === 'auto_high_return_candidate'
                       ? '自动高收益候选'
-                      : '自动稳健候选'}
+                      : item.label === 'auto_exploratory_candidate'
+                        ? '自动探索候选'
+                        : '自动稳健候选'}
                 </Tag>
               </Tooltip>
+            ))}
+          </Space>
+        );
+      },
+    },
+    {
+      id: 'manual_labels',
+      header: '人工决策标签',
+      enableSorting: false,
+      size: 220,
+      minSize: 200,
+      cell: ({ row }) => {
+        const notes = batchGroupResearchNotesByKey.get(buildParameterGroupKey(row.original)) ?? [];
+        const labels = Array.from(new Set(notes.flatMap((note) => note.labels ?? [])));
+        const statuses = Array.from(new Set(notes.map((note) => note.decision_status ?? 'candidate')));
+        if (!labels.length && !statuses.length) {
+          return <Text type="secondary">--</Text>;
+        }
+        return (
+          <Space size={[4, 4]} wrap>
+            {statuses.map((status) => (
+              <Tag color={decisionStatusColor(status)} key={`${buildParameterGroupKey(row.original)}-${status}`}>
+                {decisionStatusText(status)}
+              </Tag>
+            ))}
+            {labels.map((label) => (
+              <Tag color={label === 'excluded' ? 'red' : label === 'baseline' ? 'gold' : 'default'} key={`${buildParameterGroupKey(row.original)}-${label}`}>
+                {researchLabelText(label)}
+              </Tag>
             ))}
           </Space>
         );
@@ -3200,6 +3619,7 @@ function ParametersView({
     { id: 'avg_excess_return', header: '平均超额收益', accessorFn: (row) => row.avg_excess_return, cell: ({ row }) => formatPct(row.original.avg_excess_return) },
     { id: 'avg_oos_total_return', header: '平均样本外收益', accessorFn: (row) => row.avg_oos_total_return, cell: ({ row }) => formatPct(row.original.avg_oos_total_return) },
     { id: 'avg_oos_excess_return', header: '平均样本外超额', accessorFn: (row) => row.avg_oos_excess_return, cell: ({ row }) => formatPct(row.original.avg_oos_excess_return) },
+    { id: 'is_oos_gap', header: 'IS/OOS 差', accessorFn: (row) => row.is_oos_gap ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.is_oos_gap) },
     { id: 'best_total_return', header: '最佳收益率', accessorFn: (row) => row.best_total_return, cell: ({ row }) => formatPct(row.original.best_total_return) },
     { id: 'positive_ratio', header: '正收益占比', accessorFn: (row) => row.positive_ratio, cell: ({ row }) => formatPct(row.original.positive_ratio) },
     { id: 'oos_positive_ratio', header: '样本外正收益占比', accessorFn: (row) => row.oos_positive_ratio ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.oos_positive_ratio) },
@@ -3219,7 +3639,12 @@ function ParametersView({
         const notes = notesByTarget.get(`parameter_group:${targetId}`) ?? [];
         return (
           <Space>
-            {notes.length ? <Tag color="blue">{notes.length} 条</Tag> : <Text type="secondary">--</Text>}
+            {notes.length ? (
+              <Space size={[4, 4]} wrap>
+                <Tag color="blue">{notes.length} 条</Tag>
+                <Tag color={decisionStatusColor(notes[0]?.decision_status)}>{decisionStatusText(notes[0]?.decision_status)}</Tag>
+              </Space>
+            ) : <Text type="secondary">--</Text>}
             {targetId ? (
               <Button
                 size="small"
@@ -3236,7 +3661,95 @@ function ParametersView({
         );
       },
     },
-  ], [batchGroupLabelsByKey, notesByTarget, selectedBatchDetail]);
+  ], [batchGroupLabelsByKey, batchGroupResearchNotesByKey, notesByTarget, selectedBatchDetail]);
+  const decisionLedgerColumns = useMemo<ColumnDef<ResearchNote>[]>(() => [
+    {
+      id: 'decision_status',
+      header: '状态',
+      size: 96,
+      minSize: 96,
+      accessorFn: (row) => row.decision_status ?? 'candidate',
+      cell: ({ row }) => (
+        <Tag color={decisionStatusColor(row.original.decision_status)}>
+          {decisionStatusText(row.original.decision_status)}
+        </Tag>
+      ),
+    },
+    {
+      id: 'target',
+      header: '对象',
+      size: 280,
+      minSize: 240,
+      accessorFn: (row) => `${row.target_type}:${row.target_id}`,
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Text strong>{targetTypeText(row.original.target_type)}</Text>
+          <Text type="secondary" copyable>{row.original.target_id}</Text>
+        </Space>
+      ),
+    },
+    {
+      id: 'labels',
+      header: '标签',
+      size: 220,
+      minSize: 180,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const labels = row.original.labels ?? [];
+        if (!labels.length) {
+          return <Text type="secondary">--</Text>;
+        }
+        return (
+          <Space size={[4, 4]} wrap>
+            {labels.map((label) => (
+              <Tag color={label === 'excluded' ? 'red' : label === 'baseline' ? 'gold' : 'blue'} key={`${row.original.note_id}-${label}`}>
+                {researchLabelText(label)}
+              </Tag>
+            ))}
+          </Space>
+        );
+      },
+    },
+    {
+      id: 'linked_batch_id',
+      header: '关联批次',
+      size: 220,
+      minSize: 180,
+      accessorFn: (row) => row.linked_batch_id ?? '',
+      cell: ({ row }) => row.original.linked_batch_id ? <Text copyable>{row.original.linked_batch_id}</Text> : <Text type="secondary">--</Text>,
+    },
+    {
+      id: 'linked_parameter_group',
+      header: '关联参数组',
+      size: 260,
+      minSize: 220,
+      accessorFn: (row) => row.linked_parameter_group ?? '',
+      cell: ({ row }) => row.original.linked_parameter_group ? <Text copyable>{row.original.linked_parameter_group}</Text> : <Text type="secondary">--</Text>,
+    },
+    {
+      id: 'confidence_score',
+      header: '置信度',
+      size: 92,
+      minSize: 92,
+      accessorFn: (row) => row.confidence_score ?? Number.NEGATIVE_INFINITY,
+      cell: ({ row }) => row.original.confidence_score ?? '--',
+    },
+    {
+      id: 'decision_reason',
+      header: '原因 / 备注',
+      size: 320,
+      minSize: 260,
+      accessorFn: (row) => `${row.decision_reason ?? ''} ${row.content}`,
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Text>{row.original.decision_reason || '--'}</Text>
+          <Text type="secondary" ellipsis={{ tooltip: row.original.content }}>{row.original.content}</Text>
+        </Space>
+      ),
+    },
+    { id: 'author', header: '记录人', size: 100, minSize: 90, accessorFn: (row) => row.author, cell: ({ row }) => row.original.author },
+    { id: 'created_at', header: '时间', size: 160, minSize: 150, accessorFn: (row) => row.created_at, cell: ({ row }) => formatDateTime(row.original.created_at) },
+  ], []);
 
   const resultStats = useMemo(() => {
     const sourceRows = workspaceMode === 'batch' ? filteredBatchRunRows : filteredExperimentRunRows;
@@ -3263,54 +3776,191 @@ function ParametersView({
         key: 'robust',
         title: '稳健候选',
         type: 'success' as const,
-        items: selectedBatchDetail.recommendations.robust_candidates.filter((item) => matchesScoreFilters(item.score, item.confidence, item.avg_max_drawdown, item.return_over_drawdown)),
-        empty: '当前批次还没有满足规则的稳健候选。',
-        description: (item: ParameterExperimentBatchDetail['recommendations']['robust_candidates'][number]) => `${item.reason}；总分 ${formatNumber(item.score, 1)}，置信度 ${formatNumber(item.confidence, 1)}，平均收益 ${formatPct(item.avg_total_return)}，最大回撤 ${formatPct(item.avg_max_drawdown)}，收益回撤比 ${formatNumber(item.return_over_drawdown, 2)}。`,
+        items: selectedBatchDetail.recommendations.robust_candidates.filter((item) => matchesBatchRecommendationFilters(item)),
+        empty: groupDecisionLabelFilter.length || groupDecisionStatusFilter.length || autoLabelFilter.length ? '当前筛选下没有满足条件的稳健候选。' : '当前批次还没有满足规则的稳健候选，或已被人工拒绝 / 归档。',
+        description: (item: ParameterExperimentBatchDetail['recommendations']['robust_candidates'][number]) => {
+          const notes = batchGroupResearchNotesByKey.get(buildParameterGroupKey(item)) ?? [];
+          const noteSummary = notes.length
+            ? `；人工结论 ${Array.from(new Set(notes.map((note) => note.decision_status ?? 'candidate'))).map((status) => decisionStatusText(status)).join(' / ')}`
+            : '';
+          return `${item.reason}；总分 ${formatNumber(item.score, 1)}，置信度 ${formatNumber(item.confidence, 1)}，平均收益 ${formatPct(item.avg_total_return)}，最大回撤 ${formatPct(item.avg_max_drawdown)}，收益回撤比 ${formatNumber(item.return_over_drawdown, 2)}${noteSummary}。`;
+        },
       },
       {
         key: 'high',
         title: '高收益候选',
         type: 'info' as const,
-        items: selectedBatchDetail.recommendations.high_return_candidates.filter((item) => matchesScoreFilters(item.score, item.confidence, item.avg_max_drawdown, item.return_over_drawdown)),
-        empty: '当前批次还没有可单独标记的高收益候选。',
-        description: (item: ParameterExperimentBatchDetail['recommendations']['high_return_candidates'][number]) => `${item.reason}；总分 ${formatNumber(item.score, 1)}，置信度 ${formatNumber(item.confidence, 1)}，最佳收益 ${formatPct(item.best_total_return)}，最大回撤 ${formatPct(item.avg_max_drawdown)}。`,
+        items: selectedBatchDetail.recommendations.high_return_candidates.filter((item) => matchesBatchRecommendationFilters(item)),
+        empty: groupDecisionLabelFilter.length || groupDecisionStatusFilter.length || autoLabelFilter.length ? '当前筛选下没有满足条件的高收益候选。' : '当前批次还没有可单独标记的高收益候选，或已被人工拒绝 / 归档。',
+        description: (item: ParameterExperimentBatchDetail['recommendations']['high_return_candidates'][number]) => {
+          const notes = batchGroupResearchNotesByKey.get(buildParameterGroupKey(item)) ?? [];
+          const noteSummary = notes.length
+            ? `；人工结论 ${Array.from(new Set(notes.map((note) => note.decision_status ?? 'candidate'))).map((status) => decisionStatusText(status)).join(' / ')}`
+            : '';
+          return `${item.reason}；总分 ${formatNumber(item.score, 1)}，置信度 ${formatNumber(item.confidence, 1)}，最佳收益 ${formatPct(item.best_total_return)}，最大回撤 ${formatPct(item.avg_max_drawdown)}${noteSummary}。`;
+        },
       },
       {
         key: 'exclude',
         title: '需排除组合',
         type: 'warning' as const,
-        items: selectedBatchDetail.recommendations.excluded_combinations.filter((item) => matchesScoreFilters(item.score, item.confidence, item.avg_max_drawdown, item.return_over_drawdown)),
-        empty: '当前批次没有明显应排除的组合。',
-        description: (item: ParameterExperimentBatchDetail['recommendations']['excluded_combinations'][number]) => `${item.reason}；总分 ${formatNumber(item.score, 1)}，置信度 ${formatNumber(item.confidence, 1)}，平均收益 ${formatPct(item.avg_total_return)}，最差回撤 ${formatPct(item.worst_max_drawdown)}。`,
+        items: selectedBatchDetail.recommendations.excluded_combinations.filter((item) => matchesBatchRecommendationFilters(item)),
+        empty: groupDecisionLabelFilter.length || groupDecisionStatusFilter.length || autoLabelFilter.length ? '当前筛选下没有命中排除规则的组合。' : '当前批次没有明显应排除的组合，或已被人工归档。',
+        description: (item: ParameterExperimentBatchDetail['recommendations']['excluded_combinations'][number]) => {
+          const notes = batchGroupResearchNotesByKey.get(buildParameterGroupKey(item)) ?? [];
+          const noteSummary = notes.length
+            ? `；人工结论 ${Array.from(new Set(notes.map((note) => note.decision_status ?? 'candidate'))).map((status) => decisionStatusText(status)).join(' / ')}`
+            : '';
+          return `${item.reason}；总分 ${formatNumber(item.score, 1)}，置信度 ${formatNumber(item.confidence, 1)}，平均收益 ${formatPct(item.avg_total_return)}，最差回撤 ${formatPct(item.worst_max_drawdown)}${noteSummary}。`;
+        },
+      },
+      {
+        key: 'explore',
+        title: '探索候选',
+        type: 'info' as const,
+        items: (selectedBatchDetail.recommendations.exploratory_candidates ?? []).filter((item) => matchesBatchRecommendationFilters(item)),
+        empty: groupDecisionLabelFilter.length || groupDecisionStatusFilter.length || autoLabelFilter.length ? '当前筛选下没有探索候选。' : '当前批次没有仅可观察的探索候选，或已被人工拒绝 / 归档。',
+        description: (item: ParameterExperimentBatchDetail['recommendations']['high_return_candidates'][number]) => {
+          const notes = batchGroupResearchNotesByKey.get(buildParameterGroupKey(item)) ?? [];
+          const noteSummary = notes.length
+            ? `；人工结论 ${Array.from(new Set(notes.map((note) => note.decision_status ?? 'candidate'))).map((status) => decisionStatusText(status)).join(' / ')}`
+            : '';
+          return `${item.reason}；总分 ${formatNumber(item.score, 1)}，置信度 ${formatNumber(item.confidence, 1)}，平均收益 ${formatPct(item.avg_total_return)}，样本外交易数 ${item.min_oos_trade_count ?? 0}${noteSummary}。`;
+        },
       },
     ]
     : [];
+  const candidateRecommendationSections = batchRecommendationSections.filter((section) => section.key !== 'exclude');
+  const excludedRecommendationSection = batchRecommendationSections.find((section) => section.key === 'exclude');
 
   return (
     <>
-    <Row gutter={[16, 16]}>
-      <Col xs={24} xl={8}>
-        <Card title="发起实验批次" extra={<Button onClick={() => void onRefreshExperiments()}>刷新状态</Button>}>
-          <Paragraph type="secondary">
-            这里只负责提交新的实验批次。右侧工作区负责查看批次结果、单实验明细和参数敏感度。
+    <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      {showExperimentForm ? (
+        <Card
+          className="cbw-experiment-form-card"
+          title="发起实验批次"
+          extra={(
+            <Space>
+              <Button onClick={() => void onRefreshExperiments()}>刷新状态</Button>
+              <Button onClick={() => setShowExperimentForm(false)}>收起</Button>
+            </Space>
+          )}
+        >
+          <Paragraph type="secondary" style={{ marginBottom: 12 }}>
+            提交新的 EMA 参数实验批次。提交后回到下方工作区查看批次推荐、参数组和研究决策。
           </Paragraph>
           <Form form={experimentForm} layout="vertical" onFinish={(values) => void onSubmitExperiment(values as Record<string, unknown>)}>
-            <Form.Item name="batch_id" label="批次 ID" rules={[{ required: true, whitespace: true, message: '请输入批次 ID' }]}>
-              <Input />
-            </Form.Item>
-            <Form.Item name="snapshot_ids" label="数据快照" rules={[{ required: true, type: 'array', min: 1, message: '请至少选择一个数据快照' }]}>
-              <Select mode="multiple" options={datasetOptions} showSearch optionFilterProp="label" />
-            </Form.Item>
-            <Form.Item name="search_type" label="搜索方式" rules={[{ required: true }]}>
-              <Select
-                options={[
-                  { label: '网格搜索', value: 'grid' },
-                  { label: '随机搜索', value: 'random' },
-                ]}
-              />
-            </Form.Item>
             <Row gutter={12}>
+              <Col xs={24} md={12} xl={8}>
+                <Form.Item name="batch_id" label="批次 ID" rules={[{ required: true, whitespace: true, message: '请输入批次 ID' }]}>
+                  <Input />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={12} xl={8}>
+                <Form.Item name="search_type" label="搜索方式" rules={[{ required: true }]}>
+                  <Select
+                    options={[
+                      { label: '网格搜索', value: 'grid' },
+                      { label: '随机搜索', value: 'random' },
+                    ]}
+                  />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={12} xl={8}>
+                <Form.Item
+                  name="max_samples"
+                  label="随机搜索样本数"
+                  rules={[
+                    {
+                      validator: async (_, value) => {
+                        if (experimentSearchType !== 'random') {
+                          return;
+                        }
+                        if (value === null || value === undefined || value === '') {
+                          throw new Error('随机搜索时必须填写样本数');
+                        }
+                        if (Number(value) <= 0) {
+                          throw new Error('随机搜索样本数必须大于 0');
+                        }
+                      },
+                    },
+                  ]}
+                >
+                  <InputNumber min={1} disabled={experimentSearchType !== 'random'} style={{ width: '100%' }} placeholder="仅随机搜索时生效" />
+                </Form.Item>
+              </Col>
               <Col span={24}>
+                <Form.Item name="snapshot_ids" label="数据快照" rules={[{ required: true, type: 'array', min: 1, message: '请至少选择一个数据快照' }]}>
+                  <Select mode="multiple" options={datasetOptions} showSearch optionFilterProp="label" />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={8}>
+                <Form.Item name="validation_split_mode" label="验证切分" rules={[{ required: true }]}>
+                  <Segmented
+                    block
+                    options={[
+                      { label: '自动 70/30', value: 'auto_ratio' },
+                      { label: '手动', value: 'manual' },
+                      { label: '不使用', value: 'none' },
+                    ]}
+                  />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={8}>
+                <Form.Item
+                  name="oos_ratio_pct"
+                  label="样本外比例 (%)"
+                  rules={[
+                    {
+                      validator: async (_, value) => {
+                        if (validationSplitMode !== 'auto_ratio') {
+                          return;
+                        }
+                        if (value === null || value === undefined || value === '') {
+                          throw new Error('请输入样本外比例');
+                        }
+                        const numeric = Number(value);
+                        if (!Number.isFinite(numeric) || numeric <= 0 || numeric >= 100) {
+                          throw new Error('样本外比例必须在 0 到 100 之间');
+                        }
+                      },
+                    },
+                  ]}
+                >
+                  <InputNumber min={1} max={99} step={5} disabled={validationSplitMode !== 'auto_ratio'} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={8}>
+                <Form.Item name="warmup_bars" label="切分预热 K 线">
+                  <InputNumber min={0} step={1} disabled={validationSplitMode === 'none'} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              {validationSplitMode === 'manual' ? (
+                <>
+                  <Col xs={24} md={6}>
+                    <Form.Item name="is_start" label="IS 开始" rules={[{ required: true, message: '请选择 IS 开始时间' }]}>
+                      <DatePicker showTime style={{ width: '100%' }} />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={6}>
+                    <Form.Item name="is_end" label="IS 结束" rules={[{ required: true, message: '请选择 IS 结束时间' }]}>
+                      <DatePicker showTime style={{ width: '100%' }} />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={6}>
+                    <Form.Item name="oos_start" label="OOS 开始" rules={[{ required: true, message: '请选择 OOS 开始时间' }]}>
+                      <DatePicker showTime style={{ width: '100%' }} />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={6}>
+                    <Form.Item name="oos_end" label="OOS 结束" rules={[{ required: true, message: '请选择 OOS 结束时间' }]}>
+                      <DatePicker showTime style={{ width: '100%' }} />
+                    </Form.Item>
+                  </Col>
+                </>
+              ) : null}
+              <Col xs={24} md={8}>
                 <Form.Item
                   name="fast_periods"
                   label="快线候选"
@@ -3340,7 +3990,7 @@ function ParametersView({
                   <Input placeholder="例如 2,3,5,8" />
                 </Form.Item>
               </Col>
-              <Col span={24}>
+              <Col xs={24} md={8}>
                 <Form.Item
                   name="slow_periods"
                   label="慢线候选"
@@ -3370,40 +4020,7 @@ function ParametersView({
                   <Input placeholder="例如 13,21,34" />
                 </Form.Item>
               </Col>
-              <Col span={24}>
-                <Form.Item
-                  name="max_samples"
-                  label="随机搜索样本数"
-                  rules={[
-                    {
-                      validator: async (_, value) => {
-                        if (experimentSearchType !== 'random') {
-                          return;
-                        }
-                        if (value === null || value === undefined || value === '') {
-                          throw new Error('随机搜索时必须填写样本数');
-                        }
-                        if (Number(value) <= 0) {
-                          throw new Error('随机搜索样本数必须大于 0');
-                        }
-                      },
-                    },
-                  ]}
-                >
-                  <InputNumber min={1} disabled={experimentSearchType !== 'random'} style={{ width: '100%' }} placeholder="仅随机搜索时生效" />
-                </Form.Item>
-              </Col>
-              <Col span={24}>
-                <Form.Item name="cash_allocation_pct" label="资金使用比例 (%)" rules={[{ required: true, message: '请输入资金使用比例' }]}>
-                  <InputNumber min={0.01} max={100} step={1} style={{ width: '100%' }} />
-                </Form.Item>
-              </Col>
-              <Col span={12}>
-                <Form.Item name="initial_cash" label="初始资金" rules={[{ required: true, message: '请输入初始资金' }]}>
-                  <InputNumber min={0.01} style={{ width: '100%' }} />
-                </Form.Item>
-              </Col>
-              <Col span={12}>
+              <Col xs={24} md={8}>
                 <Form.Item
                   name="leverage_candidates"
                   label="杠杆候选"
@@ -3421,17 +4038,27 @@ function ParametersView({
                   <Input placeholder="例如 1,2,3,5" />
                 </Form.Item>
               </Col>
-              <Col span={8}>
+              <Col xs={24} md={8} xl={4}>
+                <Form.Item name="cash_allocation_pct" label="资金使用比例 (%)" rules={[{ required: true, message: '请输入资金使用比例' }]}>
+                  <InputNumber min={0.01} max={100} step={1} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={8} xl={4}>
+                <Form.Item name="initial_cash" label="初始资金" rules={[{ required: true, message: '请输入初始资金' }]}>
+                  <InputNumber min={0.01} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={8} xl={4}>
                 <Form.Item name="fee_rate" label="手续费率">
                   <InputNumber min={0} step={0.0001} style={{ width: '100%' }} />
                 </Form.Item>
               </Col>
-              <Col span={8}>
+              <Col xs={24} md={8} xl={4}>
                 <Form.Item name="slippage_bps" label="滑点基点">
                   <InputNumber min={0} step={0.1} style={{ width: '100%' }} />
                 </Form.Item>
               </Col>
-              <Col span={8}>
+              <Col xs={24} md={8} xl={4}>
                 <Form.Item name="min_notional" label="最小名义价值">
                   <InputNumber min={0} style={{ width: '100%' }} />
                 </Form.Item>
@@ -3442,7 +4069,7 @@ function ParametersView({
                 type="info"
                 showIcon
                 message="当前边界"
-                description="仍然只支持 EMA，多快照会拆成多个单快照实验，快线、慢线和杠杆候选会一起组成参数组合。"
+                description="仍然只支持 EMA，多快照会拆成多个单快照实验。自动切分会按每个快照自己的时间范围使用前 70% 做 IS、后 30% 做 OOS。"
               />
               <Button block type="primary" htmlType="submit" loading={submitting === 'experiment'}>
                 提交实验批次
@@ -3450,119 +4077,182 @@ function ParametersView({
             </Space>
           </Form>
         </Card>
-      </Col>
-
-      <Col xs={24} xl={16}>
+      ) : null}
         <Card
-          title="参数实验工作区"
+          className="cbw-research-workbench"
+          title={(
+            <Space direction="vertical" size={0}>
+              <Text strong>参数实验工作区</Text>
+              <Text type="secondary" style={{ fontWeight: 400 }}>先看批次推荐和人工关注，再进入参数组、Run 和台账明细。</Text>
+            </Space>
+          )}
           extra={(
-            <Input
-              placeholder="搜索 run / 数据集 / 标的"
-              value={parameterQuery}
-              onChange={(event) => setParameterQuery(event.target.value)}
-              style={{ width: 280 }}
-            />
+            <Space wrap>
+              <Input
+                placeholder="搜索 run / 数据集 / 标的"
+                value={parameterQuery}
+                onChange={(event) => setParameterQuery(event.target.value)}
+                style={{ width: 260 }}
+              />
+              <Button onClick={() => setShowExperimentForm((value) => !value)}>
+                {showExperimentForm ? '收起实验表单' : '新建实验批次'}
+              </Button>
+              <Button onClick={() => void onRefreshExperiments()}>刷新状态</Button>
+            </Space>
           )}
         >
           <Space direction="vertical" size={16} style={{ width: '100%' }}>
             <Row gutter={[12, 12]}>
-              <Col xs={12} md={6}><Card size="small"><Statistic title="当前结果" value={resultStats.runCount} suffix={`/ ${resultStats.baseCount}`} /></Card></Col>
-              <Col xs={12} md={6}><Card size="small"><Statistic title="筛选命中" value={resultStats.filteredCount} /></Card></Col>
-              <Col xs={12} md={6}><Card size="small"><Statistic title="平均收益率" value={resultStats.avgReturn === null ? '--' : formatPct(resultStats.avgReturn)} /></Card></Col>
-              <Col xs={12} md={6}><Card size="small"><Statistic title="最佳收益率" value={resultStats.bestReturn === null ? '--' : formatPct(resultStats.bestReturn)} /></Card></Col>
+              <Col xs={12} md={6}><Card size="small" className="cbw-summary-card"><Statistic className="cbw-summary-stat" title="当前结果" value={resultStats.runCount} suffix={`/ ${resultStats.baseCount}`} /></Card></Col>
+              <Col xs={12} md={6}><Card size="small" className="cbw-summary-card"><Statistic className="cbw-summary-stat" title="筛选命中" value={resultStats.filteredCount} /></Card></Col>
+              <Col xs={12} md={6}><Card size="small" className="cbw-summary-card"><Statistic className="cbw-summary-stat" title="平均收益率" value={resultStats.avgReturn === null ? '--' : formatPct(resultStats.avgReturn)} /></Card></Col>
+              <Col xs={12} md={6}><Card size="small" className="cbw-summary-card"><Statistic className="cbw-summary-stat" title="最佳收益率" value={resultStats.bestReturn === null ? '--' : formatPct(resultStats.bestReturn)} /></Card></Col>
             </Row>
-            <Space wrap>
-              <Select
-                mode="multiple"
-                allowClear
-                disabled={autoLabelFilterDisabled}
-                value={autoLabelFilter}
-                style={{ minWidth: 260 }}
-                placeholder={autoLabelFilterDisabled ? '先选择单个批次后使用自动标签筛选' : '按自动标签筛选'}
-                onChange={setAutoLabelFilter}
-                options={availableAutoLabels.map((label) => ({
-                  label: AUTO_GROUP_MEMBERSHIP_LABEL_TEXT[label] ?? label,
-                  value: label,
-                }))}
-              />
-              <Select
-                mode="multiple"
-                allowClear
-                value={manualLabelFilter}
-                style={{ minWidth: 260 }}
-                placeholder="按人工标签筛选"
-                onChange={setManualLabelFilter}
-                options={availableManualLabels.map((label) => ({
-                  label: RESEARCH_LABEL_TEXT[label] ?? label,
-                  value: label,
-                }))}
-              />
-              <InputNumber
-                min={0}
-                max={100}
-                step={5}
-                style={{ width: 140 }}
-                disabled={selectedBatchId === ALL_BATCHES}
-                value={minScoreFilter}
-                placeholder="最小总分"
-                onChange={(value) => setMinScoreFilter(value === null ? null : Number(value))}
-              />
-              <InputNumber
-                min={0}
-                max={100}
-                step={5}
-                style={{ width: 140 }}
-                disabled={selectedBatchId === ALL_BATCHES}
-                value={minConfidenceFilter}
-                placeholder="最小置信度"
-                onChange={(value) => setMinConfidenceFilter(value === null ? null : Number(value))}
-              />
-              <InputNumber
-                min={0}
-                max={100}
-                step={5}
-                style={{ width: 150 }}
-                disabled={selectedBatchId === ALL_BATCHES}
-                value={maxDrawdownFilter}
-                placeholder="最大允许回撤%"
-                onChange={(value) => setMaxDrawdownFilter(value === null ? null : Number(value))}
-              />
-              <InputNumber
-                min={0}
-                step={0.1}
-                style={{ width: 150 }}
-                disabled={selectedBatchId === ALL_BATCHES}
-                value={minReturnDrawdownFilter}
-                placeholder="最小收益回撤比"
-                onChange={(value) => setMinReturnDrawdownFilter(value === null ? null : Number(value))}
-              />
-              <InputNumber
-                min={1}
-                max={100}
-                step={1}
-                style={{ width: 140 }}
-                disabled={selectedBatchId === ALL_BATCHES}
-                value={topNFilter}
-                placeholder="仅看 Top N"
-                onChange={(value) => setTopNFilter(value === null ? null : Number(value))}
-              />
-            </Space>
-            <Alert
-              showIcon
-              type="info"
-              message="自动标签来自当前批次评分规则"
-              description="悬停在自动标签上可查看命中原因。当前主要依据收益、回撤、样本外表现、覆盖快照数、正收益占比、最少交易数和邻域稳定度。在批次 Run 结果和单实验明细里，自动标签表示该 run 所属参数组的批次推荐，不代表该单条 run 自身单独通过了候选标准。总分 / 置信度 / 回撤 / 收益回撤比 / Top N 筛选在选中单个批次时生效。"
-            />
-            <Segmented<'batch' | 'experiment' | 'sensitivity'>
+            <Segmented<'batch' | 'experiment' | 'decisions' | 'sensitivity'>
               block
+              className="cbw-workbench-switcher"
               value={workspaceMode}
               onChange={setWorkspaceMode}
               options={[
                 { label: '批次结果', value: 'batch' },
                 { label: '单实验明细', value: 'experiment' },
+                { label: '研究决策台账', value: 'decisions' },
                 { label: '参数敏感度', value: 'sensitivity' },
               ]}
             />
+            <Card size="small" className="cbw-filter-panel" title="筛选与定位">
+              <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                <Space wrap>
+                  {workspaceMode === 'batch' ? (
+                    <>
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        value={batchDecisionStatusFilter}
+                        style={{ minWidth: 200 }}
+                        placeholder="批次状态"
+                        onChange={setBatchDecisionStatusFilter}
+                        options={DECISION_STATUS_OPTIONS.filter((option) => availableBatchDecisionStatuses.includes(option.value))}
+                      />
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        value={batchDecisionLabelFilter}
+                        style={{ minWidth: 210 }}
+                        placeholder="批次标签"
+                        onChange={setBatchDecisionLabelFilter}
+                        options={availableBatchDecisionLabels.map((label) => ({
+                          label: RESEARCH_LABEL_TEXT[label] ?? label,
+                          value: label,
+                        }))}
+                      />
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        disabled={autoLabelFilterDisabled}
+                        value={autoLabelFilter}
+                        style={{ minWidth: 220 }}
+                        placeholder={autoLabelFilterDisabled ? '选择单个批次后筛自动标签' : '参数组自动标签'}
+                        onChange={setAutoLabelFilter}
+                        options={availableAutoLabels.map((label) => ({
+                          label: AUTO_GROUP_MEMBERSHIP_LABEL_TEXT[label] ?? label,
+                          value: label,
+                        }))}
+                      />
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        disabled={selectedBatchId === ALL_BATCHES}
+                        value={groupDecisionStatusFilter}
+                        style={{ minWidth: 220 }}
+                        placeholder={selectedBatchId === ALL_BATCHES ? '选择单个批次后筛参数组状态' : '参数组状态'}
+                        onChange={setGroupDecisionStatusFilter}
+                        options={DECISION_STATUS_OPTIONS.filter((option) => availableGroupDecisionStatuses.includes(option.value))}
+                      />
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        disabled={selectedBatchId === ALL_BATCHES}
+                        value={groupDecisionLabelFilter}
+                        style={{ minWidth: 220 }}
+                        placeholder={selectedBatchId === ALL_BATCHES ? '选择单个批次后筛参数组标签' : '参数组标签'}
+                        onChange={setGroupDecisionLabelFilter}
+                        options={availableGroupDecisionLabels.map((label) => ({
+                          label: RESEARCH_LABEL_TEXT[label] ?? label,
+                          value: label,
+                        }))}
+                      />
+                    </>
+                  ) : (
+                    <Select
+                      mode="multiple"
+                      allowClear
+                      value={runManualLabelFilter}
+                      style={{ minWidth: 220 }}
+                      placeholder="Run 人工标签"
+                      onChange={setRunManualLabelFilter}
+                      options={availableRunManualLabels.map((label) => ({
+                        label: RESEARCH_LABEL_TEXT[label] ?? label,
+                        value: label,
+                      }))}
+                    />
+                  )}
+                </Space>
+                {workspaceMode === 'batch' ? (
+                  <Space wrap>
+                    <InputNumber
+                      min={0}
+                      max={100}
+                      step={5}
+                      style={{ width: 132 }}
+                      disabled={selectedBatchId === ALL_BATCHES}
+                      value={minScoreFilter}
+                      placeholder="最小总分"
+                      onChange={(value) => setMinScoreFilter(value === null ? null : Number(value))}
+                    />
+                    <InputNumber
+                      min={0}
+                      max={100}
+                      step={5}
+                      style={{ width: 132 }}
+                      disabled={selectedBatchId === ALL_BATCHES}
+                      value={minConfidenceFilter}
+                      placeholder="最小置信度"
+                      onChange={(value) => setMinConfidenceFilter(value === null ? null : Number(value))}
+                    />
+                    <InputNumber
+                      min={0}
+                      max={100}
+                      step={5}
+                      style={{ width: 146 }}
+                      disabled={selectedBatchId === ALL_BATCHES}
+                      value={maxDrawdownFilter}
+                      placeholder="最大回撤%"
+                      onChange={(value) => setMaxDrawdownFilter(value === null ? null : Number(value))}
+                    />
+                    <InputNumber
+                      min={0}
+                      step={0.1}
+                      style={{ width: 150 }}
+                      disabled={selectedBatchId === ALL_BATCHES}
+                      value={minReturnDrawdownFilter}
+                      placeholder="最小收益回撤比"
+                      onChange={(value) => setMinReturnDrawdownFilter(value === null ? null : Number(value))}
+                    />
+                    <InputNumber
+                      min={1}
+                      max={100}
+                      step={1}
+                      style={{ width: 120 }}
+                      disabled={selectedBatchId === ALL_BATCHES}
+                      value={topNFilter}
+                      placeholder="Top N"
+                      onChange={(value) => setTopNFilter(value === null ? null : Number(value))}
+                    />
+                  </Space>
+                ) : null}
+              </Space>
+            </Card>
 
             {workspaceMode === 'batch' && (
               <Spin spinning={experimentDetailLoading}>
@@ -3582,7 +4272,7 @@ function ParametersView({
                         }}
                         options={[
                           { label: '全部批次', value: ALL_BATCHES },
-                          ...batches.map((batch) => ({
+                          ...filteredBatches.map((batch) => ({
                             label: `${batch.batch_id} · ${batch.snapshot_count} 快照 · ${batch.status}`,
                             value: batch.batch_id,
                           })),
@@ -3612,12 +4302,15 @@ function ParametersView({
                     <>
                       <DataTable
                         columns={batchColumns}
-                        data={batches}
+                        data={filteredBatches}
                         tableClassName="cbw-parameter-meta-table"
                         initialPageSize={6}
                         pageSizeOptions={[6, 12, 24]}
                         initialSorting={[{ id: 'created_at', desc: true }]}
                       />
+                      {batchDecisionLabelFilter.length && !filteredBatches.length ? (
+                        <Alert type="info" showIcon message="当前批次人工决策筛选没有命中批次" />
+                      ) : null}
                       <Card size="small" title="全部批次结果">
                         <Paragraph type="secondary">
                           当前显示 {filteredBatchRunRows.length} 条 run。先整体排序筛掉明显差的组合，再进入具体批次查看推荐。
@@ -3634,19 +4327,16 @@ function ParametersView({
                     </>
                   ) : (
                     <>
-                      <Descriptions size="small" column={{ xs: 1, md: 2 }}>
-                        <Descriptions.Item label="批次 ID">{selectedBatchDetail?.batch.batch_id ?? selectedBatchId}</Descriptions.Item>
-                        <Descriptions.Item label="搜索方式">{experimentSearchTypeLabel(selectedBatchDetail?.batch.search_type ?? selectedBatchSummary?.search_type)}</Descriptions.Item>
-                        <Descriptions.Item label="快照数">{selectedBatchDetail?.batch.dataset_snapshot_ids.length ?? selectedBatchSummary?.snapshot_count ?? 0}</Descriptions.Item>
-                        <Descriptions.Item label="实验数">{selectedBatchDetail?.batch.experiment_ids.length ?? selectedBatchSummary?.experiment_count ?? 0}</Descriptions.Item>
-                        <Descriptions.Item label="父任务">{selectedBatchDetail?.execution.task_id ?? selectedBatchSummary?.task_id ?? '--'}</Descriptions.Item>
-                        <Descriptions.Item label="提交时间">{selectedBatchDetail?.batch.created_at ? formatDateTime(selectedBatchDetail.batch.created_at) : (selectedBatchSummary ? formatDateTime(selectedBatchSummary.created_at) : '--')}</Descriptions.Item>
-                      </Descriptions>
-                      {selectedBatchDetail ? (
-                        <Card
-                          size="small"
-                          title="批次研究决策"
-                          extra={(
+                      <Card size="small" className="cbw-context-panel">
+                        <Flex justify="space-between" align="flex-start" wrap="wrap" gap={12}>
+                          <Descriptions size="small" column={{ xs: 1, md: 3 }} style={{ flex: 1, minWidth: 520 }}>
+                            <Descriptions.Item label="批次 ID">{selectedBatchDetail?.batch.batch_id ?? selectedBatchId}</Descriptions.Item>
+                            <Descriptions.Item label="搜索方式">{experimentSearchTypeLabel(selectedBatchDetail?.batch.search_type ?? selectedBatchSummary?.search_type)}</Descriptions.Item>
+                            <Descriptions.Item label="快照 / 实验">{selectedBatchDetail?.batch.dataset_snapshot_ids.length ?? selectedBatchSummary?.snapshot_count ?? 0} / {selectedBatchDetail?.batch.experiment_ids.length ?? selectedBatchSummary?.experiment_count ?? 0}</Descriptions.Item>
+                            <Descriptions.Item label="父任务">{selectedBatchDetail?.execution.task_id ?? selectedBatchSummary?.task_id ?? '--'}</Descriptions.Item>
+                            <Descriptions.Item label="提交时间">{selectedBatchDetail?.batch.created_at ? formatDateTime(selectedBatchDetail.batch.created_at) : (selectedBatchSummary ? formatDateTime(selectedBatchSummary.created_at) : '--')}</Descriptions.Item>
+                          </Descriptions>
+                          {selectedBatchDetail ? (
                             <Button
                               size="small"
                               onClick={() => openDecisionModal(
@@ -3657,63 +4347,89 @@ function ParametersView({
                             >
                               记录批次结论
                             </Button>
-                          )}
-                        >
-                          <Space size={[6, 6]} wrap>
-                            {(notesByTarget.get(`parameter_experiment_batch:${selectedBatchDetail.batch.batch_id}`) ?? []).length ? (
-                              (notesByTarget.get(`parameter_experiment_batch:${selectedBatchDetail.batch.batch_id}`) ?? []).map((note) => (
-                                <Tooltip key={note.note_id} title={note.content}>
-                                  <Tag color={note.labels.includes('excluded') ? 'red' : note.labels.includes('baseline') ? 'gold' : 'blue'}>
-                                    {note.labels.map((label) => RESEARCH_LABEL_TEXT[label] ?? label).join(' / ') || '备注'} · {formatDateTime(note.created_at)}
-                                  </Tag>
-                                </Tooltip>
-                              ))
-                            ) : <Text type="secondary">当前批次还没有人工结论。</Text>}
-                          </Space>
-                        </Card>
-                      ) : null}
-                      {selectedBatchDetail ? (
-                        <Card size="small" title="当前评分标准">
+                          ) : null}
+                        </Flex>
+                        <Space size={[6, 6]} wrap style={{ marginTop: 8 }}>
+                          {batchDecisionNotes.length ? (
+                            batchDecisionNotes.map((note) => (
+                              <Tooltip key={note.note_id} title={note.content}>
+                                <Tag color={decisionStatusColor(note.decision_status)}>
+                                  {decisionStatusText(note.decision_status)} · {formatDateTime(note.created_at)}
+                                </Tag>
+                              </Tooltip>
+                            ))
+                          ) : <Text type="secondary">当前批次还没有人工结论。</Text>}
+                        </Space>
+                      </Card>
+                      <Row gutter={[12, 12]} align="top">
+                        <Col xs={24} xl={16}>
                           <Row gutter={[12, 12]}>
-                            {Object.values(selectedBatchDetail.scoring_rules).map((rule) => (
-                              <Col xs={24} xl={8} key={rule.label}>
-                                <Alert
-                                  type="info"
-                                  showIcon
-                                  message={rule.label}
-                                  description={(
-                                    <Space direction="vertical" size={4}>
-                                      <Text>{rule.summary}</Text>
-                                      {rule.thresholds.map((threshold) => (
-                                        <Text key={`${rule.label}-${threshold}`} type="secondary">- {threshold}</Text>
-                                      ))}
-                                    </Space>
-                                  )}
-                                />
+                            {candidateRecommendationSections.map((section) => (
+                              <Col xs={24} lg={12} key={section.key}>
+                                <Card size="small" title={section.title}>
+                                  <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                                    {section.items.length ? section.items.map((item) => (
+                                      <Alert
+                                        key={`${section.key}-${item.fast_period}-${item.slow_period}-${item.leverage}`}
+                                        type={section.type}
+                                        showIcon
+                                        message={`快 ${item.fast_period ?? '--'} / 慢 ${item.slow_period ?? '--'} / 杠杆 ${item.leverage ?? '--'}`}
+                                        description={section.description(item)}
+                                      />
+                                    )) : <Text type="secondary">{section.empty}</Text>}
+                                  </Space>
+                                </Card>
                               </Col>
                             ))}
                           </Row>
-                        </Card>
-                      ) : null}
-                      <Row gutter={[12, 12]}>
-                        {batchRecommendationSections.map((section) => (
-                          <Col xs={24} xl={8} key={section.key}>
-                            <Card size="small" title={section.title}>
+                        </Col>
+                        {excludedRecommendationSection ? (
+                          <Col xs={24} xl={8}>
+                            <Card size="small" title={excludedRecommendationSection.title}>
                               <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                                {section.items.length ? section.items.map((item) => (
+                                {excludedRecommendationSection.items.length ? excludedRecommendationSection.items.map((item) => (
                                   <Alert
-                                    key={`${section.key}-${item.fast_period}-${item.slow_period}-${item.leverage}`}
-                                    type={section.type}
+                                    key={`${excludedRecommendationSection.key}-${item.fast_period}-${item.slow_period}-${item.leverage}`}
+                                    type={excludedRecommendationSection.type}
                                     showIcon
                                     message={`快 ${item.fast_period ?? '--'} / 慢 ${item.slow_period ?? '--'} / 杠杆 ${item.leverage ?? '--'}`}
-                                    description={section.description(item)}
+                                    description={excludedRecommendationSection.description(item)}
                                   />
-                                )) : <Text type="secondary">{section.empty}</Text>}
+                                )) : <Text type="secondary">{excludedRecommendationSection.empty}</Text>}
                               </Space>
                             </Card>
                           </Col>
-                        ))}
+                        ) : null}
                       </Row>
+                      <Card size="small" title="人工关注参数组">
+                        {activeManualDecisionGroups.length ? (
+                          <Row gutter={[12, 12]}>
+                            {activeManualDecisionGroups.slice(0, 6).map((group) => {
+                              const groupKey = buildParameterGroupKey(group);
+                              const latestStatus = latestBatchGroupDecisionStatusByKey.get(groupKey) ?? 'candidate';
+                              const notes = batchGroupResearchNotesByKey.get(groupKey) ?? [];
+                              const latestNote = notes[0];
+                              return (
+                                <Col xs={24} xl={12} key={`manual-focus-${groupKey}`}>
+                                  <Alert
+                                    type={latestStatus === 'approved' ? 'success' : 'info'}
+                                    showIcon
+                                    message={(
+                                      <Space size={[6, 6]} wrap>
+                                        <Tag color={decisionStatusColor(latestStatus)}>{decisionStatusText(latestStatus)}</Tag>
+                                        <Text>快 {group.fast_period ?? '--'} / 慢 {group.slow_period ?? '--'} / 杠杆 {group.leverage ?? '--'}</Text>
+                                      </Space>
+                                    )}
+                                    description={`总分 ${formatNumber(group.score, 1)}，置信度 ${formatNumber(group.confidence, 1)}，平均收益 ${formatPct(group.avg_total_return)}，样本外收益 ${formatPct(group.avg_oos_total_return)}，最大回撤 ${formatPct(group.avg_max_drawdown)}${latestNote?.decision_reason ? `；${latestNote.decision_reason}` : ''}。`}
+                                  />
+                                </Col>
+                              );
+                            })}
+                          </Row>
+                        ) : (
+                          <Text type="secondary">还没有通过或观察中的参数组。对参数组点“记录”，状态选择“观察”或“通过”后会出现在这里。</Text>
+                        )}
+                      </Card>
                       <Card size="small" title="批次聚合结果">
                         <Paragraph type="secondary">
                           这里已经把同一组快慢参数和杠杆按跨快照结果聚合。现在应优先看样本外收益、最大回撤、收益回撤比，再看样本内收益和覆盖快照数。
@@ -3740,6 +4456,29 @@ function ParametersView({
                           initialSorting={[{ id: 'total_return', desc: true }]}
                         />
                       </Card>
+                      {selectedBatchDetail ? (
+                        <Card size="small" title="评分标准">
+                          <Row gutter={[12, 12]}>
+                            {Object.values(selectedBatchDetail.scoring_rules).map((rule) => (
+                              <Col xs={24} xl={8} key={rule.label}>
+                                <Alert
+                                  type="info"
+                                  showIcon
+                                  message={rule.label}
+                                  description={(
+                                    <Space direction="vertical" size={4}>
+                                      <Text>{rule.summary}</Text>
+                                      {rule.thresholds.map((threshold) => (
+                                        <Text key={`${rule.label}-${threshold}`} type="secondary">- {threshold}</Text>
+                                      ))}
+                                    </Space>
+                                  )}
+                                />
+                              </Col>
+                            ))}
+                          </Row>
+                        </Card>
+                      ) : null}
                     </>
                   )}
                 </Space>
@@ -3846,6 +4585,90 @@ function ParametersView({
               </Spin>
             )}
 
+            {workspaceMode === 'decisions' && (
+              <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                <Alert
+                  type="info"
+                  showIcon
+                  message="研究决策台账"
+                  description="这里保留所有人工判断记录。最新状态用于当前参数组判断，历史记录用于复盘决策变化。"
+                />
+                <Row gutter={[12, 12]}>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="全部记录" value={researchNotes.length} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="当前命中" value={filteredDecisionLedgerNotes.length} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="通过 / 观察" value={researchNotes.filter((note) => note.decision_status === 'approved' || note.decision_status === 'observing').length} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="拒绝 / 归档" value={researchNotes.filter((note) => note.decision_status === 'rejected' || note.decision_status === 'archived').length} /></Card></Col>
+                </Row>
+                <Space wrap>
+                  <Select
+                    mode="multiple"
+                    allowClear
+                    value={decisionLedgerStatusFilter}
+                    style={{ minWidth: 220 }}
+                    placeholder="按状态筛选"
+                    onChange={setDecisionLedgerStatusFilter}
+                    options={DECISION_STATUS_OPTIONS.filter((option) => availableDecisionLedgerStatuses.includes(option.value))}
+                  />
+                  <Select
+                    mode="multiple"
+                    allowClear
+                    value={decisionLedgerLabelFilter}
+                    style={{ minWidth: 220 }}
+                    placeholder="按标签筛选"
+                    onChange={setDecisionLedgerLabelFilter}
+                    options={availableDecisionLedgerLabels.map((label) => ({
+                      label: researchLabelText(label),
+                      value: label,
+                    }))}
+                  />
+                  <Select
+                    mode="multiple"
+                    allowClear
+                    value={decisionLedgerTargetTypeFilter}
+                    style={{ minWidth: 220 }}
+                    placeholder="按对象类型筛选"
+                    onChange={setDecisionLedgerTargetTypeFilter}
+                    options={availableDecisionLedgerTargetTypes.map((targetType) => ({
+                      label: targetTypeText(targetType),
+                      value: targetType,
+                    }))}
+                  />
+                  <Select
+                    allowClear
+                    showSearch
+                    value={decisionLedgerBatchFilter}
+                    style={{ minWidth: 280 }}
+                    placeholder="按关联批次筛选"
+                    onChange={(value) => setDecisionLedgerBatchFilter(value ?? null)}
+                    options={availableDecisionLedgerBatchIds.map((batchId) => ({
+                      label: batchId,
+                      value: batchId,
+                    }))}
+                  />
+                  <Select
+                    allowClear
+                    showSearch
+                    value={decisionLedgerParameterGroupFilter}
+                    style={{ minWidth: 320 }}
+                    placeholder="按关联参数组筛选"
+                    onChange={(value) => setDecisionLedgerParameterGroupFilter(value ?? null)}
+                    options={availableDecisionLedgerParameterGroups.map((groupId) => ({
+                      label: groupId,
+                      value: groupId,
+                    }))}
+                  />
+                </Space>
+                <DataTable
+                  columns={decisionLedgerColumns}
+                  data={filteredDecisionLedgerNotes}
+                  tableClassName="cbw-parameter-meta-table"
+                  initialPageSize={10}
+                  pageSizeOptions={[10, 20, 50]}
+                  initialSorting={[{ id: 'created_at', desc: true }]}
+                />
+              </Space>
+            )}
+
             {workspaceMode === 'sensitivity' && (
               <Space direction="vertical" size={16} style={{ width: '100%' }}>
                 <Alert
@@ -3921,8 +4744,7 @@ function ParametersView({
             )}
           </Space>
         </Card>
-      </Col>
-    </Row>
+    </Space>
     <Modal
       title={decisionTarget ? `研究决策 · ${decisionTarget.title}` : '研究决策'}
       open={Boolean(decisionTarget)}
@@ -3943,8 +4765,23 @@ function ParametersView({
         <Form.Item name="author" label="记录人" rules={[{ required: true, whitespace: true, message: '请输入记录人' }]}>
           <Input />
         </Form.Item>
+        <Row gutter={12}>
+          <Col xs={24} md={12}>
+            <Form.Item name="decision_status" label="决策状态" rules={[{ required: true, message: '请选择决策状态' }]}>
+              <Select options={DECISION_STATUS_OPTIONS} />
+            </Form.Item>
+          </Col>
+          <Col xs={24} md={12}>
+            <Form.Item name="confidence_score" label="置信度">
+              <InputNumber min={0} max={100} precision={1} style={{ width: '100%' }} />
+            </Form.Item>
+          </Col>
+        </Row>
         <Form.Item name="labels" label="标签">
           <Select mode="multiple" options={RESEARCH_LABEL_OPTIONS} />
+        </Form.Item>
+        <Form.Item name="decision_reason" label="状态原因">
+          <Input />
         </Form.Item>
         <Form.Item name="content" label="结论" rules={[{ required: true, whitespace: true, message: '请输入研究结论' }]}>
           <Input.TextArea rows={4} />

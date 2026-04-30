@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +107,8 @@ def json_ready(value: Any) -> Any:
         return [json_ready(inner) for inner in value]
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, float) and not isfinite(value):
+        return None
     if hasattr(value, "isoformat"):
         return value.isoformat()
     if hasattr(value, "value"):

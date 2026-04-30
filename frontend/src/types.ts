@@ -251,6 +251,11 @@ export interface ResearchNote {
   content: string;
   author: string;
   labels: string[];
+  decision_status: string;
+  decision_reason: string | null;
+  confidence_score: number | null;
+  linked_batch_id: string | null;
+  linked_parameter_group: string | null;
   created_at: string;
 }
 
@@ -390,6 +395,7 @@ export interface ParameterGroupRecommendation {
   avg_excess_return: number;
   avg_oos_total_return: number;
   avg_oos_excess_return: number;
+  is_oos_gap: number | null;
   avg_max_drawdown: number;
   worst_max_drawdown: number;
   return_over_drawdown: number;
@@ -449,6 +455,7 @@ export interface ParameterExperimentBatchDetail {
   recommendations: {
     robust_candidates: ParameterGroupRecommendation[];
     high_return_candidates: ParameterGroupRecommendation[];
+    exploratory_candidates?: ParameterGroupRecommendation[];
     excluded_combinations: ParameterGroupRecommendation[];
   };
   scoring_rules: {

@@ -25,6 +25,10 @@ class ResearchNoteRepository(Protocol):
         *,
         target_type: str | None = None,
         target_id: str | None = None,
+        decision_status: str | None = None,
+        label: str | None = None,
+        linked_batch_id: str | None = None,
+        linked_parameter_group: str | None = None,
     ) -> list[str]:
         """List persisted research note identifiers."""
 
@@ -33,6 +37,10 @@ class ResearchNoteRepository(Protocol):
         *,
         target_type: str | None = None,
         target_id: str | None = None,
+        decision_status: str | None = None,
+        label: str | None = None,
+        linked_batch_id: str | None = None,
+        linked_parameter_group: str | None = None,
     ) -> list[ResearchNote]:
         """List persisted research notes."""
 
@@ -68,6 +76,11 @@ class FileResearchNoteRepository:
         payload = json.loads(self._note_path(note_id).read_text(encoding="utf-8"))
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])
         payload["labels"] = tuple(payload.get("labels", ()))
+        payload.setdefault("decision_status", "candidate")
+        payload.setdefault("decision_reason", None)
+        payload.setdefault("confidence_score", None)
+        payload.setdefault("linked_batch_id", None)
+        payload.setdefault("linked_parameter_group", None)
         return ResearchNote(**payload)
 
     def list_note_ids(
@@ -75,6 +88,10 @@ class FileResearchNoteRepository:
         *,
         target_type: str | None = None,
         target_id: str | None = None,
+        decision_status: str | None = None,
+        label: str | None = None,
+        linked_batch_id: str | None = None,
+        linked_parameter_group: str | None = None,
     ) -> list[str]:
         notes_dir = self.base_dir / "research_notes"
         if not notes_dir.exists():
@@ -88,6 +105,14 @@ class FileResearchNoteRepository:
                 continue
             if target_id is not None and note.target_id != target_id:
                 continue
+            if decision_status is not None and note.decision_status != decision_status:
+                continue
+            if label is not None and label not in note.labels:
+                continue
+            if linked_batch_id is not None and note.linked_batch_id != linked_batch_id:
+                continue
+            if linked_parameter_group is not None and note.linked_parameter_group != linked_parameter_group:
+                continue
             note_ids.append(note.note_id)
         return sorted(note_ids)
 
@@ -96,10 +121,21 @@ class FileResearchNoteRepository:
         *,
         target_type: str | None = None,
         target_id: str | None = None,
+        decision_status: str | None = None,
+        label: str | None = None,
+        linked_batch_id: str | None = None,
+        linked_parameter_group: str | None = None,
     ) -> list[ResearchNote]:
         notes = [
             self.load_note(note_id)
-            for note_id in self.list_note_ids(target_type=target_type, target_id=target_id)
+            for note_id in self.list_note_ids(
+                target_type=target_type,
+                target_id=target_id,
+                decision_status=decision_status,
+                label=label,
+                linked_batch_id=linked_batch_id,
+                linked_parameter_group=linked_parameter_group,
+            )
         ]
         return sorted(notes, key=lambda item: item.created_at, reverse=True)
 

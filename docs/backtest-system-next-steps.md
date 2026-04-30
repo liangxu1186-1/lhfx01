@@ -23,9 +23,9 @@
 
 当前系统最明显的短板已经不在“能不能跑起来”，而在研究结论如何沉淀、复用和治理：
 
-1. Research Note 已能记录 run 级结论，但批次和参数组级决策刚开始接入，还没有形成完整研究决策流
-2. 参数实验已支持批次、杠杆维度、回撤评分和自动推荐，但评分规则仍写在 API 层，后续应抽成独立评分模块
-3. IS/OOS 与回撤已进入 run / parameter readmodel 和批次评分，但解释、筛选和人工结论之间还需继续打通
+1. Research Note 已能记录 run / 批次 / 参数组级结论，并开始升级为显式决策状态流
+2. 参数实验已支持批次、杠杆维度、回撤评分和自动推荐，评分规则已抽到独立模块
+3. IS/OOS 与回撤已进入 run / parameter readmodel 和批次评分；无 OOS 数据不再允许进入稳健候选
 4. 任务系统已经持久化，但执行方式仍是进程内后台线程，缺少更稳的本地异步执行治理
 5. 大 workspace 下总览和参数实验仍有全量读模型带来的性能压力
 6. 策略入口仍偏 EMA 专用，扩第二个策略前应先把研究闭环收口
@@ -140,31 +140,32 @@
 
 ## 5. 当前轮次执行策略
 
-本轮先做“任务中心持久化”的最小切片，作为后续参数实验任务化的基础。
+本轮先收口研究可信度和决策闭环，不改回测核心策略，不引入 ATR 策略 v2。
 
 本轮范围：
 
-- 新增任务仓储
-- 单次回测写入持久化任务记录
-- API 增加任务列表 / 任务详情接口
-- 补测试与文档
+- Phase 1：IS/OOS 评分硬化
+- Phase 1 文档同步
+- Research Note 决策状态机最小切片
 
 本轮明确不做：
 
-- 异步 worker
-- 任务队列
-- 参数实验执行器
-- 前端任务页
+- 不修改回测核心策略
+- 不引入 ATR / stop loss / take profit 策略 v2
+- 不引入新的搜索器
+- 不做多用户 / 权限
 
 ## 6. 验收方式
 
 本轮完成后，至少满足：
 
-1. 触发一次 `run-ema` 后，任务记录落盘
-2. 可以通过 API 查看任务列表
-3. 可以通过 API 查看单个任务详情
-4. 失败任务能返回结构化失败信息
-5. 不改变现有单次回测结果语义
+1. `high_return_candidates` 必须有正 OOS 收益和足够 OOS 交易数
+2. `stable/robust_candidates` 必须有 OOS 数据，且 IS/OOS 都为正
+3. `is_oos_gap` 超阈值不能进入稳健候选
+4. 无 OOS 数据只能进入 `exploratory_candidates`
+5. `excluded_combinations` 优先级高于推荐候选
+6. Research Note 支持显式 `decision_status`
+7. 不改变现有单次回测结果语义
 
 ## 7. 当前已完成
 
@@ -189,23 +190,37 @@
 - `POST /api/research-notes`
 - `GET /api/research-notes`
 - 单次分析页已支持 run 备注、标签与候选标记
+- 批次评分已抽出到 [batch_scoring.py](../src/crypto_backtest_workbench/app/batch_scoring.py)
+- 参数实验批次聚合主键已扩展为 `fast_period + slow_period + leverage`
+- 批次评分已接入 `avg_max_drawdown`、`worst_max_drawdown`、`return_over_drawdown`
+- 批次评分已接入 `is_oos_gap`、`min_oos_trade_count`
+- `high_return_candidates` 与 `excluded_combinations` 保持互斥
+- `stable/robust_candidates` 在无 OOS 数据时不再命中
+- 无 OOS 但 IS 表现为正的组合进入 `exploratory_candidates`
+- Research Note 已支持 `decision_status`、`decision_reason`、`confidence_score`、`linked_batch_id`、`linked_parameter_group`
+- 参数实验页已支持按批次 / 参数组决策状态筛选
+- 推荐卡默认不再展示最新人工状态为 `rejected` / `archived` 的参数组
+- 参数实验页已增加“人工关注参数组”，集中展示最新状态为 `approved` / `observing` 的参数组
+- `GET /api/research-notes` 已支持按 `decision_status`、`label`、`linked_batch_id`、`linked_parameter_group` 查询
+- 参数实验页已增加“研究决策台账”，可按状态、标签、对象类型、关联批次和关联参数组复盘人工记录
+- 批次 Run 表已继承展示所属参数组的最新人工决策状态
 
 当前实现仍然刻意收敛在以下边界内：
 
 - 仅支持 EMA 参数实验
 - 主 `run` 结果口径仍保持样本内 IS，不改现有执行语义
 - 参数实验执行仍使用本地进程内 worker，不引入外部队列
-- IS/OOS 当前以验证摘要和样本外指标消费为主，尚未形成完整研究工作流
+- IS/OOS 已进入候选推荐硬约束，但策略结构本身仍是 EMA
 
 ## 8. 下一步
 
 下一步优先做：
 
-1. 把 Research Note 从 run 级备注扩展为批次 / 参数组级研究决策，让“候选 / 基准 / 排除 / 观察”能直接挂在研究对象上
-2. 把批次评分从 [api.py](../src/crypto_backtest_workbench/app/api.py) 抽出到独立评分模块，沉淀清晰的输入、输出、阈值和测试
+1. 完成 Research Note 决策状态机的前端筛选、展示和测试收口
+2. 把 Research Note 的状态语义继续用于推荐卡和参数组表，沉淀“候选 / 观察 / 通过 / 拒绝 / 归档”的研究路径
 3. 把总览和参数实验筛选继续下推到服务端查询参数，减轻大 workspace 下的前端过滤压力
 4. 在研究闭环补齐后，再考虑更稳的本地异步执行器
-5. 最后再推进 `StrategyRegistry`，避免在研究语义未稳定前过早抽象
+5. 最后再推进 `StrategyRegistry` 或策略 v2，避免在研究语义未稳定前过早扩张策略空间
 
 ## 9. 多快照批量实验与自动评估
 

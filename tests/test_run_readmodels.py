@@ -12,6 +12,7 @@ from crypto_backtest_workbench.app.readmodels import (
     TradeFilter,
     filter_trade_rows,
     filter_run_summary_views,
+    json_ready,
     list_run_summary_views,
     load_run_detail_view,
 )
@@ -94,6 +95,14 @@ def test_run_readmodels_build_comparison_views_and_multi_run_equity(tmp_path) ->
     assert comparison_views[0].excess_return is not None
     assert f"{details[0].run.run_id}_equity" in equity_rows[0]
     assert f"{details[1].run.run_id}_equity" in equity_rows[0]
+
+
+def test_json_ready_converts_non_finite_numbers_to_null() -> None:
+    assert json_ready({"nan": float("nan"), "inf": float("inf"), "negative_inf": float("-inf")}) == {
+        "nan": None,
+        "inf": None,
+        "negative_inf": None,
+    }
 
 
 def test_run_readmodels_build_trade_explorer_rows(tmp_path) -> None:

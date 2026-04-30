@@ -131,4 +131,9 @@ class ResearchNote:
     content: str
     author: str
     labels: tuple[str, ...] = ()
+    decision_status: str = "candidate"
+    decision_reason: str | None = None
+    confidence_score: float | None = None
+    linked_batch_id: str | None = None
+    linked_parameter_group: str | None = None
     created_at: datetime = field(default_factory=now_utc)

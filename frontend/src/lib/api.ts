@@ -167,13 +167,37 @@ export async function loadParameterExperimentBatchDetail(batchId: string): Promi
   return fetchJson<ParameterExperimentBatchDetailPayload>(`/api/parameter-experiment-batches/${encodeURIComponent(batchId)}`);
 }
 
-export async function loadResearchNotes(targetType?: string, targetId?: string): Promise<ResearchNotesPayload> {
+export interface ResearchNoteFilters {
+  targetType?: string;
+  targetId?: string;
+  decisionStatus?: string;
+  label?: string;
+  linkedBatchId?: string;
+  linkedParameterGroup?: string;
+}
+
+export async function loadResearchNotes(targetTypeOrFilters?: string | ResearchNoteFilters, targetId?: string): Promise<ResearchNotesPayload> {
+  const filters: ResearchNoteFilters = typeof targetTypeOrFilters === 'object'
+    ? targetTypeOrFilters
+    : { targetType: targetTypeOrFilters, targetId };
   const params = new URLSearchParams();
-  if (targetType) {
-    params.set('target_type', targetType);
+  if (filters.targetType) {
+    params.set('target_type', filters.targetType);
   }
-  if (targetId) {
-    params.set('target_id', targetId);
+  if (filters.targetId) {
+    params.set('target_id', filters.targetId);
+  }
+  if (filters.decisionStatus) {
+    params.set('decision_status', filters.decisionStatus);
+  }
+  if (filters.label) {
+    params.set('label', filters.label);
+  }
+  if (filters.linkedBatchId) {
+    params.set('linked_batch_id', filters.linkedBatchId);
+  }
+  if (filters.linkedParameterGroup) {
+    params.set('linked_parameter_group', filters.linkedParameterGroup);
   }
   try {
     return await fetchJson<ResearchNotesPayload>(`/api/research-notes${params.size ? `?${params.toString()}` : ''}`);
@@ -181,8 +205,12 @@ export async function loadResearchNotes(targetType?: string, targetId?: string):
     const workspace = await loadFallbackWorkspace();
     const notes = workspace.analysis.runs.flatMap((run) => run.research_notes ?? []);
     const filteredNotes = notes.filter((note) => (
-      (!targetType || note.target_type === targetType)
-      && (!targetId || note.target_id === targetId)
+      (!filters.targetType || note.target_type === filters.targetType)
+      && (!filters.targetId || note.target_id === filters.targetId)
+      && (!filters.decisionStatus || note.decision_status === filters.decisionStatus)
+      && (!filters.label || (note.labels ?? []).includes(filters.label))
+      && (!filters.linkedBatchId || note.linked_batch_id === filters.linkedBatchId)
+      && (!filters.linkedParameterGroup || note.linked_parameter_group === filters.linkedParameterGroup)
     ));
     return {
       generated_at: workspace.generated_at,

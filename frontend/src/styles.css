@@ -195,6 +195,61 @@ body {
   padding: 14px 16px;
 }
 
+.cbw-experiment-form-card.ant-card > .ant-card-body {
+  padding-top: 16px;
+}
+
+.cbw-experiment-form-card .ant-form-item {
+  margin-bottom: 12px;
+}
+
+.cbw-experiment-form-card .ant-form-item-label {
+  padding-bottom: 4px;
+}
+
+.cbw-experiment-form-card .ant-alert {
+  margin-top: 2px;
+}
+
+.cbw-research-workbench.ant-card > .ant-card-head {
+  align-items: flex-start;
+  min-height: 68px;
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.cbw-research-workbench.ant-card > .ant-card-body {
+  padding-top: 18px;
+}
+
+.cbw-workbench-switcher.ant-segmented {
+  padding: 4px;
+  background: #f2f4f7;
+}
+
+.cbw-workbench-switcher .ant-segmented-item {
+  min-height: 36px;
+  font-weight: 600;
+}
+
+.cbw-filter-panel.ant-card {
+  background: #fbfcfe;
+  border-color: #e4e7ec;
+}
+
+.cbw-filter-panel.ant-card .ant-card-head {
+  min-height: 40px;
+}
+
+.cbw-filter-panel.ant-card .ant-card-body {
+  padding: 12px;
+}
+
+.cbw-context-panel.ant-card {
+  background: #fcfcfd;
+  border-color: #e4e7ec;
+}
+
 .cbw-parameter-meta-table,
 .cbw-parameter-group-table,
 .cbw-parameter-result-table {

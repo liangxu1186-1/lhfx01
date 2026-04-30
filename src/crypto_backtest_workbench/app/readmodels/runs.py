@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from math import isnan
+from math import isfinite, isnan
 
 from crypto_backtest_workbench.domain.models import (
     BacktestRun,
@@ -363,7 +363,7 @@ def _warning_row(warning: StructuredWarning) -> dict[str, object]:
 
 
 def _normalize_float(value: float) -> float | None:
-    if isnan(value):
+    if not isfinite(value) or isnan(value):
         return None
     return value
 

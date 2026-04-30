@@ -49,6 +49,7 @@ class ParameterExperimentBatchRequest:
     max_samples: int | None = None
     seed: int | None = None
     validation_split: object | None = None
+    validation_split_factory: object | None = None
 
 
 @dataclass(slots=True)
@@ -76,6 +77,7 @@ def build_parameter_experiment_batch(
     experiment_ids: list[str] = []
     planned_run_count = 0
     for index, snapshot in enumerate(request.snapshots, start=1):
+        validation_split = _validation_split_for_snapshot(request=request, snapshot=snapshot)
         experiment_id = _batch_experiment_id(
             batch_id=request.batch_id,
             snapshot_id=str(getattr(snapshot, "dataset_snapshot_id", "")),
@@ -98,7 +100,7 @@ def build_parameter_experiment_batch(
             benchmark_enabled=request.benchmark_enabled,
             max_samples=request.max_samples,
             seed=request.seed,
-            validation_split=request.validation_split,
+            validation_split=validation_split,
         )
         _, experiment, combinations = build_parameter_experiment_task(child_request)
         child_requests.append(child_request)
@@ -114,11 +116,7 @@ def build_parameter_experiment_batch(
         batch_id=request.batch_id,
         strategy_name="ema_crossover",
         dataset_snapshot_ids=tuple(snapshot_ids),
-        validation_split_id=(
-            getattr(request.validation_split, "validation_split_id", "validation:none")
-            if request.validation_split is not None
-            else "validation:none"
-        ),
+        validation_split_id=_batch_validation_split_id(request),
         metric_policy_id="metrics_daily_365_v1",
         benchmark_policy_version=DEFAULT_BENCHMARK_POLICY_VERSION,
         search_type=request.search_type,
@@ -137,6 +135,23 @@ def build_parameter_experiment_batch(
         experiment_ids=tuple(experiment_ids),
     )
     return task, batch, child_requests, planned_run_count
+
+
+def _validation_split_for_snapshot(*, request: ParameterExperimentBatchRequest, snapshot: object) -> object | None:
+    if request.validation_split_factory is not None:
+        factory = request.validation_split_factory
+        if not callable(factory):
+            raise ValueError("validation_split_factory must be callable")
+        return factory(snapshot)
+    return request.validation_split
+
+
+def _batch_validation_split_id(request: ParameterExperimentBatchRequest) -> str:
+    if request.validation_split_factory is not None:
+        return f"validation:{request.batch_id}:per-snapshot"
+    if request.validation_split is not None:
+        return str(getattr(request.validation_split, "validation_split_id", "validation:batch"))
+    return "validation:none"
 
 
 def run_parameter_experiment_batch_workflow(
