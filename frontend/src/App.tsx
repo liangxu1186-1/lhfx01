@@ -1,5 +1,5 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import type { ColumnDef } from '@tanstack/react-table';
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import type { ColumnDef, SortingState } from '@tanstack/react-table';
 import dayjs from 'dayjs';
 import {
   Alert,
@@ -8,6 +8,7 @@ import {
   Card,
   Col,
   ConfigProvider,
+  Collapse,
   DatePicker,
   Descriptions,
   Flex,
@@ -17,6 +18,7 @@ import {
   Layout,
   Modal,
   Popconfirm,
+  Progress,
   Row,
   Segmented,
   Select,
@@ -34,12 +36,18 @@ import {
   deleteDataset,
   deleteParameterExperiment,
   deleteParameterExperimentBatch,
+  deleteResearchNote,
   deleteRun,
   loadDatasets,
   loadParameterExperimentBatchDetail,
   loadParameterExperimentBatches,
   loadParameterExperimentDetail,
   loadParameterExperiments,
+  loadParameterGroupDetail,
+  loadParameterResearch,
+  loadResearchCandidateFilterResults,
+  loadResearchCandidateTradeAttribution,
+  loadResearchWorkflow,
   loadOverview,
   loadOverviewEquity,
   loadParameters,
@@ -48,8 +56,13 @@ import {
   loadRuns,
   postIngest,
   postParameterExperimentBatch,
+  postResearchCandidateFilterExperiment,
+  postResearchCandidateRiskMatrix,
   postResearchNote,
+  postResearchPool,
+  postRun,
   postRunEma,
+  postStablePool,
 } from './lib/api';
 import { formatDateRange, formatDateTime, formatNumber, formatPct, shortRunId } from './lib/format';
 import type {
@@ -58,7 +71,19 @@ import type {
   ParameterExperimentBatchSummary,
   ParameterExperimentDetail,
   ParameterExperimentSummary,
+  ParameterGroupDetail,
+  ParameterGroupRunView,
+  ParameterGroupView,
+  ParameterResearchWorkspace,
   ParameterLabRow,
+  ResearchCandidateFilterResults,
+  FilterResultGroup,
+  TradeAttributionBucket,
+  TradeAttributionView,
+  ResearchCandidateView,
+  ResearchWorkflow,
+  ScreeningRunView,
+  StableCandidateView,
   ResearchNote,
   RunAnalysisView,
   RunSummaryView,
@@ -87,6 +112,109 @@ interface AutoLabelInfo {
   reason: string;
 }
 
+interface ResearchRunCandidate {
+  row: ParameterLabRow;
+  score: number;
+  tags: string[];
+  gap: number | null;
+  reason: string;
+}
+
+interface RiskMatrixProgress {
+  batchId: string;
+  status: string;
+  runCount: number;
+  plannedRunCount: number;
+}
+
+interface FilterExperimentProgress {
+  batchId: string;
+  status: string;
+  runCount: number;
+  plannedRunCount: number;
+}
+
+type FilterExperimentMode = 'single' | 'stacked';
+
+type ResearchConclusionBucketKey = 'primary' | 'robust' | 'aggressive' | 'risk_reduction' | 'excluded';
+
+interface ResearchConclusionItem {
+  group: ParameterGroupView;
+  score: number;
+  reasons: string[];
+}
+
+interface ResearchConclusionBucket {
+  key: ResearchConclusionBucketKey;
+  title: string;
+  tone: 'success' | 'info' | 'warning' | 'error';
+  description: string;
+  items: ResearchConclusionItem[];
+}
+
+type ParameterWorkspaceMode = 'launch' | 'screening' | 'research' | 'stable' | 'tracking' | 'batch' | 'experiment' | 'decisions' | 'sensitivity';
+
+interface NeighborhoodRunMatch {
+  row: ParameterLabRow;
+  isSource: boolean;
+  fastDelta: number | null;
+  slowDelta: number | null;
+  distance: number;
+}
+
+type RunCompareSectionKey = 'identity' | 'parameters' | 'performance' | 'risk';
+
+interface RunCompareField {
+  key: string;
+  label: string;
+  section: RunCompareSectionKey;
+  value: (row: ParameterLabRow) => number | string | null | undefined;
+  format?: (value: number | string | null | undefined) => string;
+  better?: 'higher' | 'lower';
+}
+
+interface RunCompareRow {
+  key: string;
+  label: string;
+  leftValue: number | string | null | undefined;
+  rightValue: number | string | null | undefined;
+  leftText: string;
+  rightText: string;
+  same: boolean;
+  leftBetter: boolean;
+  rightBetter: boolean;
+}
+
+interface RunCompareSection {
+  key: RunCompareSectionKey;
+  title: string;
+  rows: RunCompareRow[];
+}
+
+interface RunCompareModel {
+  left: ParameterLabRow;
+  right: ParameterLabRow;
+  sections: RunCompareSection[];
+  sameCount: number;
+  diffCount: number;
+  summary: string;
+}
+
+interface NeighborhoodStabilityStats {
+  sampleCount: number;
+  positiveOosRatio: number | null;
+  positiveReturnRatio: number | null;
+  avgOosReturn: number | null;
+  avgGap: number | null;
+  worstDrawdown: number | null;
+  minTradeCount: number | null;
+  avgProfitFactor: number | null;
+  score: number | null;
+  verdict: 'stable' | 'watch' | 'unstable' | 'insufficient';
+  verdictText: string;
+  reason: string;
+}
+
 const TAB_OPTIONS = [
   { label: '执行台', value: 'execution' },
   { label: '运行总览', value: 'overview' },
@@ -96,11 +224,16 @@ const TAB_OPTIONS = [
 
 const ALL_EXPERIMENTS = '__all__';
 const ALL_BATCHES = '__all_batches__';
+const SCREENING_VIEW_STATE_STORAGE_KEY = 'cbw.screening.view.v1';
+const makeParameterBatchId = () => `batch-${dayjs().format('YYYYMMDDHHmmssSSS')}`;
+const TREND_PERIOD_LADDER = [2, 3, 5, 8, 13, 21, 34, 55, 89];
 const RESEARCH_LABEL_OPTIONS = [
   { label: '基准', value: 'baseline' },
   { label: '候选', value: 'candidate' },
   { label: '稳健候选', value: 'robust_candidate' },
   { label: '高收益候选', value: 'high_return_candidate' },
+  { label: '冻结参数', value: 'frozen_run' },
+  { label: '追踪中', value: 'tracking' },
   { label: '待复核', value: 'review' },
   { label: '排除', value: 'excluded' },
 ];
@@ -109,6 +242,8 @@ const RESEARCH_LABEL_TEXT: Record<string, string> = {
   candidate: '候选',
   robust_candidate: '稳健候选',
   high_return_candidate: '高收益候选',
+  frozen_run: '冻结参数',
+  tracking: '追踪中',
   review: '待复核',
   excluded: '排除',
 };
@@ -133,12 +268,22 @@ const DECISION_STATUS_COLOR: Record<string, string> = {
   rejected: 'red',
   archived: 'default',
 };
+const BATCH_STATUS_TEXT: Record<string, string> = {
+  pending: '等待中',
+  running: '运行中',
+  success: '成功',
+  failed: '失败',
+};
 const AUTO_GROUP_MEMBERSHIP_LABEL_TEXT: Record<string, string> = {
   auto_robust_candidate: '所属稳健参数组',
   auto_high_return_candidate: '所属高收益参数组',
   auto_exploratory_candidate: '所属探索参数组',
   auto_excluded: '所属排除参数组',
 };
+const STRATEGY_OPTIONS = [
+  { label: 'EMA Crossover v1', value: 'ema_crossover' },
+  { label: 'EMA Pullback ATR v2', value: 'ema_pullback_atr_v2' },
+];
 
 const ANALYSIS_FIELD_LABELS: Record<string, string> = {
   strategy_version: '策略版本',
@@ -155,11 +300,13 @@ const ANALYSIS_FIELD_LABELS: Record<string, string> = {
   initial_cash: '初始资金',
   leverage: '杠杆倍数',
   cash_allocation_pct: '资金使用比例 (%)',
+  risk_pct_per_trade: '单笔风险比例',
   fee_rate: '手续费率',
   slippage_bps: '滑点基点',
   min_notional: '最小名义价值',
   qty_by_policy: '按策略下单数量',
   cash_allocation_pct_by_policy: '按策略资金使用比例 (%)',
+  risk_pct_per_trade_by_policy: '按策略单笔风险比例',
 };
 
 const ANALYSIS_VALUE_LABELS: Record<string, Record<string, string>> = {
@@ -175,12 +322,29 @@ const ANALYSIS_VALUE_LABELS: Record<string, Record<string, string>> = {
   },
   name: {
     ema_crossover: 'EMA 均线交叉',
+    ema_pullback_atr_v2: 'EMA Pullback ATR',
   },
   qty_policy_ref: {
     fixed_1: '固定数量 fixed_1',
     percent_of_cash: '按可用资金比例动态开仓 percent_of_cash',
+    risk_pct_of_equity: '按账户权益风险开仓 risk_pct_of_equity',
+    risk_pct_of_cash_allocation: '先圈定资金、再按单笔风险开仓 risk_pct_of_cash_allocation',
   },
 };
+
+const QTY_POLICY_OPTIONS = [
+  { label: '资金比例', value: 'percent_of_cash' },
+  { label: '单笔风险', value: 'risk_pct_of_equity' },
+  { label: '资金内单笔风险', value: 'risk_pct_of_cash_allocation' },
+];
+
+const usesRiskPct = (qtyPolicyRef: string) => (
+  qtyPolicyRef === 'risk_pct_of_equity' || qtyPolicyRef === 'risk_pct_of_cash_allocation'
+);
+
+const usesCashAllocation = (qtyPolicyRef: string) => (
+  qtyPolicyRef === 'percent_of_cash' || qtyPolicyRef === 'risk_pct_of_cash_allocation'
+);
 
 function isTabId(value: string | null): value is TabId {
   return value === 'execution' || value === 'overview' || value === 'analysis' || value === 'parameters';
@@ -217,6 +381,10 @@ function experimentStatusColor(status: string | undefined): string {
   return 'blue';
 }
 
+function experimentStatusText(status: string | undefined): string {
+  return status ? (BATCH_STATUS_TEXT[status] ?? status) : '--';
+}
+
 function experimentSearchTypeLabel(searchType: string | undefined): string {
   return searchType === 'grid' ? '网格搜索' : '随机搜索';
 }
@@ -247,6 +415,572 @@ function targetTypeText(value: string): string {
     return '参数组';
   }
   return value;
+}
+
+function parameterGroupClassificationText(value: string): string {
+  if (value === 'robust_candidate') {
+    return '稳健候选';
+  }
+  if (value === 'high_return_candidate') {
+    return '高收益候选';
+  }
+  if (value === 'exploratory_candidate') {
+    return '探索候选';
+  }
+  if (value === 'excluded') {
+    return '排除';
+  }
+  return value;
+}
+
+function parameterGroupClassificationColor(value: string): string {
+  if (value === 'robust_candidate') {
+    return 'green';
+  }
+  if (value === 'high_return_candidate') {
+    return 'blue';
+  }
+  if (value === 'exploratory_candidate') {
+    return 'purple';
+  }
+  if (value === 'excluded') {
+    return 'red';
+  }
+  return 'default';
+}
+
+type ParameterPoint = { key: string; label: string; value: string };
+type ScreeningRiskItem = {
+  key: string;
+  dimension: string;
+  label: string;
+  sampleCount: number;
+  avgOosReturn: number | null;
+  avgOosExcess: number | null;
+  avgDrawdown: number | null;
+  avgProfitFactor: number | null;
+  negativeOosRatio: number | null;
+  severity: 'danger' | 'warning';
+  reason: string;
+};
+type ScreeningViewState = {
+  labelFilter: string[];
+  strategyFilter: string | null;
+  symbolFilter: string | null;
+  minScoreFilter: number | null;
+  minOosReturnFilter: number | null;
+  minIsExcessReturnFilter: number | null;
+  maxGapFilter: number | null;
+  maxDrawdownFilter: number | null;
+  minProfitFactorFilter: number | null;
+  minTradeCountFilter: number | null;
+  sorting: SortingState;
+};
+
+function markRunAddedToResearchPool(workflow: ResearchWorkflow | null, run: ScreeningRunView | ParameterLabRow): ResearchWorkflow | null {
+  if (!workflow) {
+    return workflow;
+  }
+  const sourceRun = 'auto_labels' in run
+    ? run
+    : workflow.screening_pool.runs.find((item) => item.run_id === run.run_id);
+  if (!sourceRun) {
+    return workflow;
+  }
+  const candidateExists = workflow.research_pool.candidates.some((candidate) => candidate.source_run_ids.includes(sourceRun.run_id));
+  return {
+    ...workflow,
+    screening_pool: {
+      ...workflow.screening_pool,
+      runs: workflow.screening_pool.runs.map((item) => (
+        item.run_id === sourceRun.run_id ? { ...item, pool_status: 'research_pool' } : item
+      )),
+    },
+    research_pool: candidateExists
+      ? workflow.research_pool
+      : {
+        ...workflow.research_pool,
+        candidates: [
+          {
+            candidate_id: `pending:${sourceRun.run_id}`,
+            source_run_ids: [sourceRun.run_id],
+            strategy_name: sourceRun.strategy_name,
+            symbol: sourceRun.symbol,
+            timeframe: sourceRun.timeframe,
+            validation_split_id: sourceRun.validation_split_id,
+            entry_structure: {},
+            risk_profile: {},
+            representative_run_id: sourceRun.run_id,
+            representative_run_score: sourceRun.score,
+            status: '候选',
+            recommendation: '正在刷新研究池视图',
+            neighborhood_summary: { status: '待刷新', verdict: null, score: null },
+            risk_matrix_summary: { status: '待刷新', best_option: null },
+            latest_note: null,
+            updated_at: null,
+          },
+          ...workflow.research_pool.candidates,
+        ],
+      },
+  };
+}
+
+function compactPct(value: number | null | undefined): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return `${formatNumber(value * 100, value * 100 >= 10 ? 0 : 1)}%`;
+}
+
+function formatSignedPct(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return '--';
+  }
+  const sign = value > 0 ? '+' : '';
+  return `${sign}${formatPct(value)}`;
+}
+
+function formatSignedNumber(value: number | null | undefined, digits = 2): string {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return '--';
+  }
+  const sign = value > 0 ? '+' : '';
+  return `${sign}${formatNumber(value, digits)}`;
+}
+
+function compactStrategyName(value: string): string {
+  const knownNames: Record<string, string> = {
+    ema_crossover_v1: 'crossover v1',
+    ema_pullback_atr_v2: 'pullback ATR v2',
+  };
+  return knownNames[value] ?? value.replace(/^ema_/, '').replace(/_/g, ' ');
+}
+
+function formatParameterPointValue(key: string, value: number | string | null | undefined): string | null {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  if (key === 'cash_allocation_pct') {
+    return `${formatNumber(Number(value), 1)}%`;
+  }
+  if (key === 'risk_pct_per_trade') {
+    return compactPct(Number(value));
+  }
+  if (typeof value === 'number') {
+    return Number.isInteger(value) ? String(value) : formatNumber(value, 2);
+  }
+  return String(value);
+}
+
+function loadScreeningViewState(): ScreeningViewState {
+  const fallback: ScreeningViewState = {
+    labelFilter: [],
+    strategyFilter: null,
+    symbolFilter: null,
+    minScoreFilter: null,
+    minOosReturnFilter: null,
+    minIsExcessReturnFilter: null,
+    maxGapFilter: null,
+    maxDrawdownFilter: null,
+    minProfitFactorFilter: null,
+    minTradeCountFilter: null,
+    sorting: [{ id: 'score', desc: true }],
+  };
+  if (typeof window === 'undefined') {
+    return fallback;
+  }
+  try {
+    const raw = window.localStorage.getItem(SCREENING_VIEW_STATE_STORAGE_KEY);
+    if (!raw) {
+      return fallback;
+    }
+    const parsed = JSON.parse(raw) as Partial<ScreeningViewState>;
+    return {
+      ...fallback,
+      ...parsed,
+      labelFilter: Array.isArray(parsed.labelFilter) ? parsed.labelFilter : fallback.labelFilter,
+      sorting: Array.isArray(parsed.sorting) ? parsed.sorting : fallback.sorting,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function parameterGroupPoints(group: ParameterGroupView): ParameterPoint[] {
+  const rawPoints: Array<{ key: string; label: string; value: number | string | null | undefined }> = group.strategy_name === 'ema_pullback_atr_v2'
+    ? [
+      { key: 'trend_fast_period', label: 'tf', value: group.trend_fast_period },
+      { key: 'trend_slow_period', label: 'ts', value: group.trend_slow_period },
+      { key: 'entry_ema_period', label: 'ema', value: group.entry_ema_period },
+      { key: 'atr_period', label: 'atr', value: group.atr_period },
+      { key: 'atr_entry_tolerance', label: 'tol', value: group.atr_entry_tolerance },
+      { key: 'atr_stop_mult', label: 'sl', value: group.atr_stop_mult },
+      { key: 'risk_reward_ratio', label: 'rr', value: group.risk_reward_ratio },
+    ]
+    : [
+      { key: 'fast_period', label: 'fast', value: group.fast_period },
+      { key: 'slow_period', label: 'slow', value: group.slow_period },
+    ];
+  rawPoints.push(
+    { key: 'qty_policy_ref', label: '仓位', value: group.qty_policy_ref },
+    { key: 'cash_allocation_pct', label: 'cash', value: group.cash_allocation_pct },
+    { key: 'risk_pct_per_trade', label: 'risk', value: group.risk_pct_per_trade },
+    { key: 'leverage', label: '杠杆', value: group.leverage },
+  );
+  return rawPoints
+    .map((point) => ({ ...point, value: formatParameterPointValue(point.key, point.value) }))
+    .filter((point): point is ParameterPoint => point.value !== null);
+}
+
+function parameterGroupEntryPoints(group: ParameterGroupView): ParameterPoint[] {
+  const excludedKeys = new Set(['cash_allocation_pct', 'risk_pct_per_trade', 'leverage']);
+  return parameterGroupPoints(group).filter((point) => !excludedKeys.has(point.key));
+}
+
+function parameterGroupRiskPoints(group: ParameterGroupView): ParameterPoint[] {
+  const includedKeys = new Set(['cash_allocation_pct', 'risk_pct_per_trade', 'leverage']);
+  return parameterGroupPoints(group).filter((point) => includedKeys.has(point.key));
+}
+
+function parameterGroupEntryCompareKey(group: ParameterGroupView): string {
+  return [
+    group.strategy_name,
+    group.symbol,
+    group.timeframe,
+    ...parameterGroupEntryPoints(group).map((point) => `${point.key}:${point.value}`),
+  ].join('|');
+}
+
+function commonParameterPointKeys(groups: ParameterGroupView[]): Set<string> {
+  if (!groups.length) {
+    return new Set();
+  }
+  const valuesByKey = new Map<string, Set<string>>();
+  for (const group of groups) {
+    for (const point of parameterGroupPoints(group)) {
+      const values = valuesByKey.get(point.key) ?? new Set<string>();
+      values.add(point.value);
+      valuesByKey.set(point.key, values);
+    }
+  }
+  return new Set([...valuesByKey.entries()].filter(([, values]) => values.size === 1).map(([key]) => key));
+}
+
+function renderParameterPoints(points: ParameterPoint[], color: string = 'default') {
+  if (!points.length) {
+    return <Text type="secondary">--</Text>;
+  }
+  return (
+    <Space size={[4, 4]} wrap>
+      {points.map((point) => (
+        <Tag key={point.key} color={color}>
+          {point.label} {point.value}
+        </Tag>
+      ))}
+    </Space>
+  );
+}
+
+const RUN_COMPARE_SECTION_TITLES: Record<RunCompareSectionKey, string> = {
+  identity: '对象',
+  parameters: '参数',
+  performance: '收益',
+  risk: '风险与交易',
+};
+
+const RUN_COMPARE_FIELDS: RunCompareField[] = [
+  { key: 'strategy_name', label: '策略', section: 'identity', value: (row) => row.strategy_name },
+  { key: 'symbol', label: '标的', section: 'identity', value: (row) => row.symbol },
+  { key: 'timeframe', label: '周期', section: 'identity', value: (row) => row.timeframe.toUpperCase() },
+  { key: 'validation_split_id', label: '验证切分', section: 'identity', value: (row) => row.validation_split_id },
+  { key: 'dataset_snapshot_id', label: '数据快照', section: 'identity', value: (row) => row.dataset_snapshot_id },
+  { key: 'parameter_summary', label: '参数摘要', section: 'parameters', value: (row) => row.parameter_summary },
+  { key: 'fast_period', label: '快线', section: 'parameters', value: (row) => row.fast_period },
+  { key: 'slow_period', label: '慢线', section: 'parameters', value: (row) => row.slow_period },
+  { key: 'trend_fast_period', label: '趋势快线', section: 'parameters', value: (row) => row.trend_fast_period },
+  { key: 'trend_slow_period', label: '趋势慢线', section: 'parameters', value: (row) => row.trend_slow_period },
+  { key: 'entry_ema_period', label: '入场 EMA', section: 'parameters', value: (row) => row.entry_ema_period },
+  { key: 'atr_period', label: 'ATR 周期', section: 'parameters', value: (row) => row.atr_period },
+  { key: 'atr_entry_tolerance', label: 'ATR 容差', section: 'parameters', value: (row) => row.atr_entry_tolerance },
+  { key: 'atr_stop_mult', label: 'ATR 止损倍数', section: 'parameters', value: (row) => row.atr_stop_mult },
+  { key: 'risk_reward_ratio', label: '盈亏比', section: 'parameters', value: (row) => row.risk_reward_ratio },
+  { key: 'qty_policy_ref', label: '仓位模式', section: 'parameters', value: (row) => row.qty_policy_ref },
+  { key: 'cash_allocation_pct', label: '资金使用', section: 'parameters', value: (row) => row.cash_allocation_pct, format: (value) => formatParameterPointValue('cash_allocation_pct', value) ?? '--' },
+  { key: 'risk_pct_per_trade', label: '单笔风险', section: 'parameters', value: (row) => row.risk_pct_per_trade, format: (value) => formatParameterPointValue('risk_pct_per_trade', value) ?? '--', better: 'lower' },
+  { key: 'leverage', label: '杠杆', section: 'parameters', value: (row) => row.leverage, better: 'lower' },
+  { key: 'fee_rate', label: '手续费率', section: 'parameters', value: (row) => row.fee_rate, format: (value) => typeof value === 'number' ? formatPct(value) : '--', better: 'lower' },
+  { key: 'slippage_bps', label: '滑点 bps', section: 'parameters', value: (row) => row.slippage_bps, better: 'lower' },
+  { key: 'total_return', label: '总收益', section: 'performance', value: (row) => row.total_return, format: (value) => typeof value === 'number' ? formatPct(value) : '--', better: 'higher' },
+  { key: 'excess_return', label: '总超额', section: 'performance', value: (row) => row.excess_return, format: (value) => typeof value === 'number' ? formatPct(value) : '--', better: 'higher' },
+  { key: 'is_total_return', label: 'IS 收益', section: 'performance', value: (row) => row.is_total_return, format: (value) => typeof value === 'number' ? formatPct(value) : '--', better: 'higher' },
+  { key: 'is_excess_return', label: 'IS 超额', section: 'performance', value: (row) => row.is_excess_return, format: (value) => typeof value === 'number' ? formatPct(value) : '--', better: 'higher' },
+  { key: 'oos_total_return', label: 'OOS 收益', section: 'performance', value: (row) => row.oos_total_return, format: (value) => typeof value === 'number' ? formatPct(value) : '--', better: 'higher' },
+  { key: 'oos_excess_return', label: 'OOS 超额', section: 'performance', value: (row) => row.oos_excess_return, format: (value) => typeof value === 'number' ? formatPct(value) : '--', better: 'higher' },
+  { key: 'is_oos_gap', label: 'IS/OOS Gap', section: 'performance', value: (row) => (row.is_total_return !== null && row.oos_total_return !== null ? row.is_total_return - row.oos_total_return : null), format: (value) => typeof value === 'number' ? formatPct(value) : '--', better: 'lower' },
+  { key: 'final_equity', label: '最终权益', section: 'performance', value: (row) => row.final_equity, format: (value) => typeof value === 'number' ? formatNumber(value, 2) : '--', better: 'higher' },
+  { key: 'max_drawdown', label: '最大回撤', section: 'risk', value: (row) => row.max_drawdown, format: (value) => typeof value === 'number' ? formatPct(value) : '--', better: 'lower' },
+  { key: 'profit_factor', label: 'PF', section: 'risk', value: (row) => row.profit_factor, format: (value) => typeof value === 'number' ? formatNumber(value, 2) : '--', better: 'higher' },
+  { key: 'trade_count', label: '交易数', section: 'risk', value: (row) => row.trade_count },
+  { key: 'oos_trade_count', label: 'OOS 交易', section: 'risk', value: (row) => row.oos_trade_count },
+  { key: 'win_rate', label: '胜率', section: 'risk', value: (row) => row.win_rate, format: (value) => typeof value === 'number' ? formatPct(value) : '--', better: 'higher' },
+  { key: 'oos_win_rate', label: 'OOS 胜率', section: 'risk', value: (row) => row.oos_win_rate, format: (value) => typeof value === 'number' ? formatPct(value) : '--', better: 'higher' },
+  { key: 'warning_count', label: '告警数', section: 'risk', value: (row) => row.warning_count, better: 'lower' },
+];
+
+function normalizeRunCompareValue(value: number | string | null | undefined): string {
+  if (value === null || value === undefined || value === '') {
+    return '';
+  }
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value.toFixed(10).replace(/0+$/, '').replace(/\.$/, '') : '';
+  }
+  return String(value);
+}
+
+function formatRunCompareValue(field: RunCompareField, value: number | string | null | undefined): string {
+  if (field.format) {
+    return field.format(value);
+  }
+  if (value === null || value === undefined || value === '') {
+    return '--';
+  }
+  if (typeof value === 'number') {
+    return Number.isInteger(value) ? String(value) : formatNumber(value, 2);
+  }
+  return String(value);
+}
+
+function buildRunCompareModel(left: ParameterLabRow, right: ParameterLabRow): RunCompareModel {
+  const sectionRows = new Map<RunCompareSectionKey, RunCompareRow[]>();
+  let sameCount = 0;
+  let diffCount = 0;
+  for (const field of RUN_COMPARE_FIELDS) {
+    const leftValue = field.value(left);
+    const rightValue = field.value(right);
+    if (
+      (leftValue === null || leftValue === undefined || leftValue === '')
+      && (rightValue === null || rightValue === undefined || rightValue === '')
+    ) {
+      continue;
+    }
+    const same = normalizeRunCompareValue(leftValue) === normalizeRunCompareValue(rightValue);
+    sameCount += same ? 1 : 0;
+    diffCount += same ? 0 : 1;
+    const leftNumber = typeof leftValue === 'number' && Number.isFinite(leftValue) ? leftValue : null;
+    const rightNumber = typeof rightValue === 'number' && Number.isFinite(rightValue) ? rightValue : null;
+    const canRank = !same && leftNumber !== null && rightNumber !== null && Boolean(field.better);
+    const leftBetter = canRank ? (field.better === 'higher' ? leftNumber > rightNumber : leftNumber < rightNumber) : false;
+    const rightBetter = canRank ? (field.better === 'higher' ? rightNumber > leftNumber : rightNumber < leftNumber) : false;
+    const rows = sectionRows.get(field.section) ?? [];
+    rows.push({
+      key: field.key,
+      label: field.label,
+      leftValue,
+      rightValue,
+      leftText: formatRunCompareValue(field, leftValue),
+      rightText: formatRunCompareValue(field, rightValue),
+      same,
+      leftBetter,
+      rightBetter,
+    });
+    sectionRows.set(field.section, rows);
+  }
+  const sections = (Object.keys(RUN_COMPARE_SECTION_TITLES) as RunCompareSectionKey[])
+    .map((key) => ({ key, title: RUN_COMPARE_SECTION_TITLES[key], rows: sectionRows.get(key) ?? [] }))
+    .filter((section) => section.rows.length);
+  const parameterDiffs = (sectionRows.get('parameters') ?? []).filter((row) => !row.same).map((row) => row.label);
+  const identitySame = ['strategy_name', 'symbol', 'timeframe'].every((key) => (
+    normalizeRunCompareValue(RUN_COMPARE_FIELDS.find((field) => field.key === key)?.value(left))
+    === normalizeRunCompareValue(RUN_COMPARE_FIELDS.find((field) => field.key === key)?.value(right))
+  ));
+  const oosLeft = left.oos_total_return ?? left.total_return;
+  const oosRight = right.oos_total_return ?? right.total_return;
+  const oosWinner = oosLeft === oosRight ? 'OOS 接近' : `${oosLeft > oosRight ? 'A' : 'B'} 的 OOS 更高`;
+  const drawdownWinner = left.max_drawdown === right.max_drawdown ? '回撤接近' : `${left.max_drawdown < right.max_drawdown ? 'A' : 'B'} 的回撤更低`;
+  const diffText = parameterDiffs.length ? `主要参数差异：${parameterDiffs.slice(0, 6).join('、')}` : '核心参数基本一致';
+  const summary = `${identitySame ? '策略/标的/周期一致' : '研究对象不同'}，${diffText}；${oosWinner}，${drawdownWinner}。`;
+  return { left, right, sections, sameCount, diffCount, summary };
+}
+
+function parameterGroupOosDrawdownRatio(group: ParameterGroupView): number {
+  return (group.avg_oos_total_return ?? group.avg_total_return) / Math.max(group.worst_max_drawdown, 0.01);
+}
+
+function isHighRiskParameterGroup(group: ParameterGroupView): boolean {
+  return (
+    (group.risk_pct_per_trade ?? 0) >= 0.08
+    || (group.leverage ?? 0) >= 10
+    || group.worst_max_drawdown >= 0.6
+  );
+}
+
+function scoreResearchConclusionGroup(group: ParameterGroupView): number {
+  const oos = group.avg_oos_total_return ?? group.avg_total_return;
+  const pf = group.avg_profit_factor ?? 0;
+  const neighbor = group.neighbor_stability_score ?? 0;
+  const positiveOos = group.oos_positive_ratio ?? 0;
+  const efficiency = parameterGroupOosDrawdownRatio(group);
+  const gapPenalty = Math.min(Math.abs(group.avg_gap ?? 0), 5) * 2;
+  const drawdownPenalty = group.worst_max_drawdown * 35;
+  const riskPenalty = isHighRiskParameterGroup(group) ? 12 : 0;
+  return (
+    group.research_score
+    + Math.min(oos * 8, 24)
+    + Math.min(efficiency * 3, 18)
+    + Math.min(Math.max(pf - 1, 0) * 18, 10)
+    + positiveOos * 8
+    + neighbor * 8
+    - drawdownPenalty
+    - gapPenalty
+    - riskPenalty
+  );
+}
+
+function buildResearchConclusionReasons(group: ParameterGroupView): string[] {
+  const reasons = [
+    `${group.symbol} ${group.timeframe.toUpperCase()}`,
+    `OOS ${formatPct(group.avg_oos_total_return)}`,
+    `回撤 ${formatPct(group.worst_max_drawdown)}`,
+    `PF ${formatNumber(group.avg_profit_factor, 2)}`,
+    `交易 ${group.min_trade_count}`,
+  ];
+  const efficiency = parameterGroupOosDrawdownRatio(group);
+  reasons.push(`OOS/DD ${formatNumber(efficiency, 2)}`);
+  if (group.oos_positive_ratio !== null) {
+    reasons.push(`OOS正比 ${formatPct(group.oos_positive_ratio)}`);
+  }
+  if (group.avg_gap !== null && Math.abs(group.avg_gap) >= 1) {
+    reasons.push(`Gap ${formatPct(group.avg_gap)}`);
+  }
+  if (group.neighbor_stability_score !== null) {
+    reasons.push(`邻域 ${formatPct(group.neighbor_stability_score)}`);
+  }
+  if (group.risk_pct_per_trade !== null) {
+    reasons.push(`risk ${compactPct(group.risk_pct_per_trade)}`);
+  }
+  if (group.leverage !== null) {
+    reasons.push(`杠杆 ${group.leverage}`);
+  }
+  return reasons.filter((reason): reason is string => Boolean(reason));
+}
+
+function toResearchConclusionItem(group: ParameterGroupView): ResearchConclusionItem {
+  return {
+    group,
+    score: scoreResearchConclusionGroup(group),
+    reasons: buildResearchConclusionReasons(group),
+  };
+}
+
+function takeResearchConclusionItems(
+  groups: ParameterGroupView[],
+  predicate: (group: ParameterGroupView) => boolean,
+  seenGroupKeys: Set<string>,
+  limit = 3,
+): ResearchConclusionItem[] {
+  const items = groups
+    .filter((group) => !seenGroupKeys.has(group.group_key) && predicate(group))
+    .map(toResearchConclusionItem)
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      const rightOos = right.group.avg_oos_total_return ?? right.group.avg_total_return;
+      const leftOos = left.group.avg_oos_total_return ?? left.group.avg_total_return;
+      return rightOos - leftOos;
+    })
+    .slice(0, limit);
+  for (const item of items) {
+    seenGroupKeys.add(item.group.group_key);
+  }
+  return items;
+}
+
+function buildResearchConclusionBuckets(groups: ParameterGroupView[]): ResearchConclusionBucket[] {
+  const seenGroupKeys = new Set<string>();
+  const hasEnoughSamples = (group: ParameterGroupView) => group.run_count >= 1 && group.snapshot_count >= 1;
+  const isTradable = (group: ParameterGroupView) => (
+    hasEnoughSamples(group)
+    && group.classification !== 'excluded'
+    && (group.avg_oos_total_return ?? -1) > 0
+    && (group.avg_profit_factor ?? 0) >= 1
+    && group.min_trade_count >= 50
+  );
+  const primary = takeResearchConclusionItems(groups, (group) => (
+    isTradable(group)
+    && !isHighRiskParameterGroup(group)
+    && (group.oos_positive_ratio ?? 0) >= 0.75
+    && (group.avg_profit_factor ?? 0) >= 1.1
+    && group.worst_max_drawdown <= 0.5
+    && group.min_trade_count >= 150
+    && (group.neighbor_stability_score ?? 0.5) >= 0.5
+  ), seenGroupKeys);
+  const robust = takeResearchConclusionItems(groups, (group) => (
+    isTradable(group)
+    && !isHighRiskParameterGroup(group)
+    && group.worst_max_drawdown <= 0.45
+    && (group.oos_positive_ratio ?? 0) >= 0.65
+    && group.min_trade_count >= 100
+  ), seenGroupKeys);
+  const aggressive = takeResearchConclusionItems(groups, (group) => (
+    isTradable(group)
+    && (group.avg_oos_total_return ?? group.avg_total_return) >= 1
+    && (group.avg_profit_factor ?? 0) >= 1.05
+    && group.min_trade_count >= 100
+    && (isHighRiskParameterGroup(group) || Math.abs(group.avg_gap ?? 0) >= 1)
+  ), seenGroupKeys);
+  const riskReduction = takeResearchConclusionItems(groups, (group) => (
+    isTradable(group)
+    && isHighRiskParameterGroup(group)
+    && (group.avg_oos_total_return ?? group.avg_total_return) > 0
+  ), seenGroupKeys);
+  const excluded = takeResearchConclusionItems(groups, (group) => (
+    !seenGroupKeys.has(group.group_key)
+    && (
+      group.classification === 'excluded'
+      || (group.avg_oos_total_return ?? -1) <= 0
+      || (group.avg_profit_factor ?? 0) < 1
+      || group.worst_max_drawdown >= 0.85
+      || group.min_trade_count < 30
+    )
+  ), seenGroupKeys);
+  return [
+    {
+      key: 'primary',
+      title: '首选候选',
+      tone: 'success',
+      description: '优先研究：OOS、PF、回撤和样本数同时过线。',
+      items: primary,
+    },
+    {
+      key: 'robust',
+      title: '稳健候选',
+      tone: 'info',
+      description: '收益不一定最高，但风险轮廓更容易继续验证。',
+      items: robust,
+    },
+    {
+      key: 'aggressive',
+      title: '高收益但激进',
+      tone: 'warning',
+      description: '收益显眼，但 Gap、回撤或风险参数偏激，需要降风险复测。',
+      items: aggressive,
+    },
+    {
+      key: 'risk_reduction',
+      title: '需要降风险验证',
+      tone: 'warning',
+      description: '方向可能有效，但 risk 或杠杆过高，不应直接采用。',
+      items: riskReduction,
+    },
+    {
+      key: 'excluded',
+      title: '暂不研究',
+      tone: 'error',
+      description: '样本、OOS、PF 或回撤不过线，先不要投入分析时间。',
+      items: excluded,
+    },
+  ];
 }
 
 function isInactiveDecisionStatus(value: string | null | undefined): boolean {
@@ -306,12 +1040,215 @@ function buildDatasetGroupLabel(snapshot: DatasetSnapshotView): string {
   return `${snapshot.exchange} · ${snapshot.symbol}`;
 }
 
-function buildParameterGroupTargetId(batchId: string, group: { fast_period: number | null; slow_period: number | null; leverage: number | null }): string {
-  return `${batchId}:f${group.fast_period ?? 'na'}:s${group.slow_period ?? 'na'}:l${group.leverage ?? 'na'}`;
+function parameterGroupSummary(group: { parameter_summary?: string; signal_filter_summary?: string | null; fast_period?: number | null; slow_period?: number | null; leverage?: number | null }): string {
+  return group.parameter_summary || `快 ${group.fast_period ?? '--'} / 慢 ${group.slow_period ?? '--'} / 杠杆 ${group.leverage ?? '--'}`;
 }
 
-function buildParameterGroupKey(group: { fast_period: number | null | undefined; slow_period: number | null | undefined; leverage: number | null | undefined }): string {
-  return `${group.fast_period ?? 'na'}:${group.slow_period ?? 'na'}:${group.leverage ?? 'na'}`;
+function buildParameterGroupTargetId(batchId: string, group: { strategy_name?: string; parameter_summary?: string; signal_filter_summary?: string | null; fast_period?: number | null; slow_period?: number | null; leverage?: number | null }): string {
+  const summary = `${parameterGroupSummary(group)} ${group.signal_filter_summary ?? ''}`.trim().replace(/[^a-zA-Z0-9._-]+/g, '-');
+  return `${batchId}:${group.strategy_name ?? 'ema_crossover'}:${summary}`;
+}
+
+function buildParameterGroupKey(group: { strategy_name?: string; parameter_summary?: string; signal_filter_summary?: string | null; fast_period?: number | null | undefined; slow_period?: number | null | undefined; leverage?: number | null | undefined }): string {
+  const base = group.parameter_summary || `${group.fast_period ?? 'na'}:${group.slow_period ?? 'na'}:${group.leverage ?? 'na'}`;
+  return `${group.strategy_name ?? 'ema_crossover'}:${base}:${group.signal_filter_summary ?? 'nofilter'}`;
+}
+
+function runIsoosGap(row: ParameterLabRow): number | null {
+  if (row.is_total_return === null || row.oos_total_return === null) {
+    return null;
+  }
+  return row.is_total_return - row.oos_total_return;
+}
+
+function rowMatchesParameterGroupSignature(group: ParameterGroupView, row: ParameterLabRow): boolean {
+  return group.strategy_name === row.strategy_name
+    && group.symbol === row.symbol
+    && group.timeframe === row.timeframe
+    && group.fast_period === row.fast_period
+    && group.slow_period === row.slow_period
+    && group.trend_fast_period === row.trend_fast_period
+    && group.trend_slow_period === row.trend_slow_period
+    && group.entry_ema_period === row.entry_ema_period
+    && group.atr_period === row.atr_period
+    && group.atr_entry_tolerance === row.atr_entry_tolerance
+    && group.atr_stop_mult === row.atr_stop_mult
+    && group.risk_reward_ratio === row.risk_reward_ratio
+    && group.qty_policy_ref === row.qty_policy_ref
+    && group.cash_allocation_pct === row.cash_allocation_pct
+    && group.risk_pct_per_trade === row.risk_pct_per_trade
+    && group.leverage === row.leverage;
+}
+
+function parameterRowToGroupRunView(row: ParameterLabRow, groupKey: string): ParameterGroupRunView {
+  return {
+    group_key: groupKey,
+    run_id: row.run_id,
+    batch_id: null,
+    experiment_id: null,
+    dataset_snapshot_id: row.dataset_snapshot_id,
+    created_at: row.created_at,
+    total_return: row.total_return,
+    oos_total_return: row.oos_total_return,
+    gap: runIsoosGap(row),
+    max_drawdown: row.max_drawdown,
+    profit_factor: row.profit_factor,
+    trade_count: row.trade_count,
+    oos_trade_count: row.oos_trade_count,
+    win_rate: row.win_rate,
+    oos_win_rate: row.oos_win_rate,
+    final_equity: row.final_equity,
+  };
+}
+
+function buildLocalFilterResultGroup(filterSummary: string, rows: ParameterLabRow[], baseGroup: ParameterGroupView): FilterResultGroup {
+  const oosValues = rows.map((row) => row.oos_total_return).filter((value): value is number => value !== null);
+  const totalValues = rows.map((row) => row.total_return);
+  const drawdowns = rows.map((row) => row.max_drawdown);
+  const profitFactors = rows.map((row) => row.profit_factor).filter((value): value is number => value !== null);
+  const tradeCounts = rows.map((row) => row.trade_count);
+  const oosTradeCounts = rows.map((row) => row.oos_trade_count).filter((value): value is number => value !== null);
+  const average = (values: number[]) => (values.length ? values.reduce((total, value) => total + value, 0) / values.length : null);
+  const avgOos = average(oosValues);
+  const avgDrawdown = average(drawdowns);
+  const avgProfitFactor = average(profitFactors);
+  const minTradeCount = tradeCounts.length ? Math.min(...tradeCounts) : null;
+  return {
+    filter_summary: filterSummary,
+    run_count: rows.length,
+    snapshot_count: new Set(rows.map((row) => row.dataset_snapshot_id)).size,
+    avg_total_return: average(totalValues),
+    avg_oos_total_return: avgOos,
+    avg_oos_delta: avgOos !== null && baseGroup.avg_oos_total_return !== null ? avgOos - baseGroup.avg_oos_total_return : null,
+    avg_max_drawdown: avgDrawdown,
+    avg_drawdown_delta: avgDrawdown !== null ? avgDrawdown - baseGroup.avg_max_drawdown : null,
+    worst_max_drawdown: drawdowns.length ? Math.max(...drawdowns) : null,
+    avg_profit_factor: avgProfitFactor,
+    avg_profit_factor_delta: avgProfitFactor !== null && baseGroup.avg_profit_factor !== null ? avgProfitFactor - baseGroup.avg_profit_factor : null,
+    min_trade_count: minTradeCount,
+    min_oos_trade_count: oosTradeCounts.length ? Math.min(...oosTradeCounts) : null,
+    trade_retention: minTradeCount !== null && baseGroup.min_trade_count ? minTradeCount / baseGroup.min_trade_count : null,
+    run_ids: [...rows].sort((left, right) => dayjs(right.created_at).valueOf() - dayjs(left.created_at).valueOf()).map((row) => row.run_id),
+  };
+}
+
+function buildLocalResearchCandidateFilterResults(
+  candidateId: string,
+  groups: ParameterGroupView[],
+  rows: ParameterLabRow[],
+): ResearchCandidateFilterResults | null {
+  const baseGroup = groups.find((group) => group.group_key === candidateId);
+  if (!baseGroup) {
+    return null;
+  }
+  const filterRuns = rows.filter((row) => row.signal_filter_summary && rowMatchesParameterGroupSignature(baseGroup, row));
+  const filterRowsBySummary = new Map<string, ParameterLabRow[]>();
+  for (const row of filterRuns) {
+    const key = row.signal_filter_summary ?? '';
+    filterRowsBySummary.set(key, [...(filterRowsBySummary.get(key) ?? []), row]);
+  }
+  const filterGroups = [...filterRowsBySummary.entries()]
+    .map(([filterSummary, filterRows]) => buildLocalFilterResultGroup(filterSummary, filterRows, baseGroup))
+    .sort((left, right) => (right.avg_oos_delta ?? -10_000) - (left.avg_oos_delta ?? -10_000));
+  return {
+    candidate_id: candidateId,
+    base_group: baseGroup,
+    base_runs: rows
+      .filter((row) => baseGroup.run_ids.includes(row.run_id))
+      .map((row) => parameterRowToGroupRunView(row, baseGroup.group_key)),
+    filter_groups: filterGroups,
+    filter_runs: filterRuns.sort((left, right) => dayjs(right.created_at).valueOf() - dayjs(left.created_at).valueOf()),
+  };
+}
+
+function scoreResearchRun(row: ParameterLabRow): ResearchRunCandidate {
+  const gap = runIsoosGap(row);
+  const oosReturn = row.oos_total_return ?? row.total_return;
+  const oosExcess = row.oos_excess_return ?? row.excess_return ?? 0;
+  const oosTrades = row.oos_trade_count ?? row.trade_count;
+  const profitFactor = row.profit_factor ?? 0;
+  const score = (
+    oosReturn
+    + oosExcess * 0.35
+    + Math.min(oosTrades / 80, 1) * 0.18
+    + Math.min(Math.max(profitFactor - 1, 0), 1) * 0.18
+    - row.max_drawdown * 0.75
+    - Math.max(0, gap ?? 0) * 0.25
+  );
+  const tags: string[] = [];
+  if (row.oos_total_return !== null && row.oos_total_return >= 1) {
+    tags.push('OOS 强');
+  }
+  if (gap !== null && gap <= 0.35) {
+    tags.push('Gap 小');
+  } else if (gap !== null && gap >= 2) {
+    tags.push('Gap 大');
+  }
+  if (row.max_drawdown <= 0.3) {
+    tags.push('回撤低');
+  }
+  if (oosTrades >= 80) {
+    tags.push('样本充足');
+  }
+  if (profitFactor >= 1.5) {
+    tags.push('PF 高');
+  }
+  if (!tags.length) {
+    tags.push('待复核');
+  }
+  return {
+    row,
+    score,
+    tags,
+    gap,
+    reason: [
+      `OOS ${formatPct(row.oos_total_return)}`,
+      `Gap ${formatPct(gap)}`,
+      `回撤 ${formatPct(row.max_drawdown)}`,
+      `OOS 交易 ${row.oos_trade_count ?? '--'}`,
+      `PF ${formatNumber(row.profit_factor, 2)}`,
+    ].join('，'),
+  };
+}
+
+function buildFrozenRunNoteValues(row: ParameterLabRow): Record<string, unknown> {
+  const candidate = scoreResearchRun(row);
+  const confidence = Math.max(0, Math.min(100, candidate.score));
+  return {
+    author: 'local',
+    decision_status: 'observing',
+    decision_reason: '冻结参数进入追踪，后续重点复测和观察。',
+    confidence_score: Number(confidence.toFixed(1)),
+    labels: ['frozen_run', 'tracking'],
+    content: [
+      '冻结参数进入追踪。',
+      `标的/周期：${row.symbol} · ${row.timeframe.toUpperCase()}`,
+      `参数：${row.parameter_summary}`,
+      `研究分：${formatNumber(candidate.score, 1)}；OOS：${formatPct(row.oos_total_return)}；Gap：${formatPct(candidate.gap)}；回撤：${formatPct(row.max_drawdown)}；PF：${formatNumber(row.profit_factor, 2)}；交易数：${row.trade_count}`,
+      `Run：${row.run_id}`,
+    ].join('\n'),
+  };
+}
+
+function buildFrozenAnalysisNoteValues(run: RunAnalysisView, summary: RunSummaryView | undefined): Record<string, unknown> {
+  const strategyParams = run.manifest.resolved_config_json.strategy_params as Record<string, unknown> | undefined;
+  const executionConstraints = run.manifest.resolved_config_json.execution_constraints as Record<string, unknown> | undefined;
+  const parameterSummary = summary?.parameter_summary
+    ?? Object.entries(strategyParams ?? {}).map(([key, value]) => `${key}=${String(value)}`).join(' ');
+  return {
+    author: 'local',
+    decision_status: 'observing',
+    decision_reason: '从单次分析冻结参数进入追踪。',
+    labels: ['frozen_run', 'tracking'],
+    content: [
+      '冻结参数进入追踪。',
+      `标的/周期：${run.symbol} · ${run.timeframe.toUpperCase()}`,
+      `参数：${parameterSummary || '--'}`,
+      `收益：${formatPct(run.metrics.total_return)}；最终权益：${formatNumber(run.metrics.final_equity)}；交易数：${run.metrics.trade_count}；PF：${formatNumber(run.metrics.profit_factor, 2)}`,
+      executionConstraints ? `执行约束：${JSON.stringify(executionConstraints)}` : null,
+      `Run：${run.run_id}`,
+    ].filter(Boolean).join('\n'),
+  };
 }
 
 function parseIntegerList(value: unknown): number[] {
@@ -326,6 +1263,256 @@ function parsePositiveNumberList(value: unknown): number[] {
     .split(',')
     .map((entry) => Number.parseFloat(entry.trim()))
     .filter((entry) => Number.isFinite(entry) && entry > 0);
+}
+
+function uniqueSortedNumbers(values: number[]): number[] {
+  return [...new Set(values.filter((value) => Number.isFinite(value) && value > 0))]
+    .sort((left, right) => left - right);
+}
+
+function trendPeriodNeighborhood(period: number | null | undefined): number[] {
+  if (!Number.isFinite(period ?? Number.NaN) || !period) {
+    return [];
+  }
+  const ladderIndex = TREND_PERIOD_LADDER.indexOf(period);
+  if (ladderIndex >= 0) {
+    return uniqueSortedNumbers([
+      TREND_PERIOD_LADDER[ladderIndex - 1],
+      period,
+      TREND_PERIOD_LADDER[ladderIndex + 1],
+    ].filter((value): value is number => typeof value === 'number'));
+  }
+  return uniqueSortedNumbers([period - 1, period, period + 1]);
+}
+
+function nullableNumberEquals(left: number | null | undefined, right: number | null | undefined): boolean {
+  if (left === null || left === undefined || right === null || right === undefined) {
+    return left === right;
+  }
+  return Math.abs(left - right) < 1e-9;
+}
+
+function buildTrendNeighborhoodMatches(source: ParameterLabRow | null, rows: ParameterLabRow[]): NeighborhoodRunMatch[] {
+  if (!source || source.strategy_name !== 'ema_pullback_atr_v2' || !source.trend_fast_period || !source.trend_slow_period) {
+    return [];
+  }
+  const fastCandidates = new Set(trendPeriodNeighborhood(source.trend_fast_period));
+  const slowCandidates = new Set(trendPeriodNeighborhood(source.trend_slow_period));
+  return rows
+    .filter((row) => (
+      row.strategy_name === 'ema_pullback_atr_v2'
+      && row.dataset_snapshot_id === source.dataset_snapshot_id
+      && row.symbol === source.symbol
+      && row.timeframe === source.timeframe
+      && row.trend_fast_period !== null
+      && row.trend_slow_period !== null
+      && fastCandidates.has(row.trend_fast_period)
+      && slowCandidates.has(row.trend_slow_period)
+      && nullableNumberEquals(row.atr_entry_tolerance, source.atr_entry_tolerance)
+      && nullableNumberEquals(row.atr_stop_mult, source.atr_stop_mult)
+      && nullableNumberEquals(row.risk_reward_ratio, source.risk_reward_ratio)
+      && nullableNumberEquals(row.leverage, source.leverage)
+      && row.qty_policy_ref === source.qty_policy_ref
+      && nullableNumberEquals(row.cash_allocation_pct, source.cash_allocation_pct)
+      && nullableNumberEquals(row.risk_pct_per_trade, source.risk_pct_per_trade)
+    ))
+    .map((row) => {
+      const fastDelta = row.trend_fast_period === null ? null : row.trend_fast_period - source.trend_fast_period!;
+      const slowDelta = row.trend_slow_period === null ? null : row.trend_slow_period - source.trend_slow_period!;
+      return {
+        row,
+        isSource: row.run_id === source.run_id,
+        fastDelta,
+        slowDelta,
+        distance: Math.abs(fastDelta ?? 0) + Math.abs(slowDelta ?? 0),
+      };
+    })
+    .sort((left, right) => {
+      if (left.isSource !== right.isSource) {
+        return left.isSource ? -1 : 1;
+      }
+      if (left.distance !== right.distance) {
+        return left.distance - right.distance;
+      }
+      return right.row.total_return - left.row.total_return;
+    });
+}
+
+function averageNullable(values: Array<number | null | undefined>): number | null {
+  const numericValues = values.filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+  if (!numericValues.length) {
+    return null;
+  }
+  return numericValues.reduce((sum, value) => sum + value, 0) / numericValues.length;
+}
+
+function negativeRatio(values: Array<number | null | undefined>): number | null {
+  const numericValues = values.filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+  if (!numericValues.length) {
+    return null;
+  }
+  return numericValues.filter((value) => value < 0).length / numericValues.length;
+}
+
+function buildScreeningRiskProfile(rows: ScreeningRunView[]): ScreeningRiskItem[] {
+  const groups = new Map<string, { dimension: string; label: string; rows: ScreeningRunView[] }>();
+  const addGroup = (dimension: string, label: string, row: ScreeningRunView) => {
+    const key = `${dimension}:${label}`;
+    const current = groups.get(key);
+    if (current) {
+      current.rows.push(row);
+      return;
+    }
+    groups.set(key, { dimension, label, rows: [row] });
+  };
+
+  for (const row of rows) {
+    if (row.fast_period !== null && row.slow_period !== null) {
+      addGroup('快慢线', `${row.fast_period}/${row.slow_period}`, row);
+    }
+    if (row.trend_fast_period !== null && row.trend_slow_period !== null) {
+      addGroup('趋势快慢线', `${row.trend_fast_period}/${row.trend_slow_period}`, row);
+    }
+    if (row.atr_entry_tolerance !== null) {
+      addGroup('ATR容忍', formatNumber(row.atr_entry_tolerance, 2), row);
+    }
+    if (row.atr_stop_mult !== null) {
+      addGroup('ATR止损', formatNumber(row.atr_stop_mult, 2), row);
+    }
+    if (row.risk_reward_ratio !== null) {
+      addGroup('盈亏比', formatNumber(row.risk_reward_ratio, 2), row);
+    }
+  }
+
+  return Array.from(groups.values())
+    .filter((group) => group.rows.length >= 3)
+    .map((group) => {
+      const avgOosReturn = averageNullable(group.rows.map((row) => row.oos_total_return));
+      const avgOosExcess = averageNullable(group.rows.map((row) => row.oos_excess_return));
+      const avgDrawdown = averageNullable(group.rows.map((row) => row.max_drawdown));
+      const avgProfitFactor = averageNullable(group.rows.map((row) => row.profit_factor));
+      const negativeOos = negativeRatio(group.rows.map((row) => row.oos_total_return));
+      const severe = (
+        (avgOosExcess !== null && avgOosExcess < -0.2)
+        || (avgOosReturn !== null && avgOosReturn < -0.15)
+        || (negativeOos !== null && negativeOos >= 0.7)
+        || (avgDrawdown !== null && avgDrawdown >= 0.7)
+      );
+      const warning = severe || (
+        (avgOosExcess !== null && avgOosExcess < 0)
+        || (avgOosReturn !== null && avgOosReturn < 0)
+        || (avgProfitFactor !== null && avgProfitFactor < 1)
+        || (avgDrawdown !== null && avgDrawdown >= 0.5)
+      );
+      if (!warning) {
+        return null;
+      }
+      const reasons = [
+        `样本 ${group.rows.length}`,
+        `OOS ${formatPct(avgOosReturn)}`,
+        `OOS超额 ${formatPct(avgOosExcess)}`,
+        `负OOS ${formatPct(negativeOos)}`,
+        `回撤 ${formatPct(avgDrawdown)}`,
+        `PF ${formatNumber(avgProfitFactor, 2)}`,
+      ];
+      return {
+        key: `${group.dimension}:${group.label}`,
+        dimension: group.dimension,
+        label: group.label,
+        sampleCount: group.rows.length,
+        avgOosReturn,
+        avgOosExcess,
+        avgDrawdown,
+        avgProfitFactor,
+        negativeOosRatio: negativeOos,
+        severity: severe ? 'danger' : 'warning',
+        reason: reasons.join(' · '),
+      } satisfies ScreeningRiskItem;
+    })
+    .filter((item): item is ScreeningRiskItem => item !== null)
+    .sort((left, right) => {
+      if (left.severity !== right.severity) {
+        return left.severity === 'danger' ? -1 : 1;
+      }
+      return (left.avgOosExcess ?? 0) - (right.avgOosExcess ?? 0);
+    })
+    .slice(0, 8);
+}
+
+function buildNeighborhoodStabilityStats(matches: NeighborhoodRunMatch[]): NeighborhoodStabilityStats {
+  const neighborRows = matches.filter((match) => !match.isSource).map((match) => match.row);
+  const sampleCount = neighborRows.length;
+  if (!sampleCount) {
+    return {
+      sampleCount,
+      positiveOosRatio: null,
+      positiveReturnRatio: null,
+      avgOosReturn: null,
+      avgGap: null,
+      worstDrawdown: null,
+      minTradeCount: null,
+      avgProfitFactor: null,
+      score: null,
+      verdict: 'insufficient',
+      verdictText: '样本不足',
+      reason: '没有匹配到当前点以外的邻域 run，不能判断稳定性。',
+    };
+  }
+  const positiveReturnRatio = neighborRows.filter((row) => row.total_return > 0).length / sampleCount;
+  const oosRows = neighborRows.filter((row) => row.oos_total_return !== null);
+  const positiveOosRatio = oosRows.length ? oosRows.filter((row) => (row.oos_total_return ?? 0) > 0).length / oosRows.length : null;
+  const avgOosReturn = averageNullable(oosRows.map((row) => row.oos_total_return));
+  const gapValues = neighborRows.map((row) => runIsoosGap(row)).filter((value): value is number => value !== null && Number.isFinite(value));
+  const avgGap = gapValues.length ? gapValues.reduce((sum, value) => sum + Math.max(value, 0), 0) / gapValues.length : null;
+  const worstDrawdown = Math.max(...neighborRows.map((row) => row.max_drawdown));
+  const minTradeCount = Math.min(...neighborRows.map((row) => row.trade_count));
+  const avgProfitFactor = averageNullable(neighborRows.map((row) => row.profit_factor));
+  const oosComponent = positiveOosRatio ?? positiveReturnRatio;
+  const score = Math.max(0, Math.min(100, (
+    oosComponent * 45
+    + positiveReturnRatio * 20
+    + Math.min(Math.max((avgOosReturn ?? 0) / 1, 0), 1) * 15
+    + Math.min(minTradeCount / 80, 1) * 10
+    + Math.min(Math.max((avgProfitFactor ?? 1) - 1, 0), 1) * 10
+    - Math.min(Math.max(worstDrawdown - 0.25, 0) / 0.35, 1) * 15
+    - Math.min(Math.max((avgGap ?? 0) - 0.5, 0) / 1.5, 1) * 15
+  )));
+  const verdict = sampleCount < 3
+    ? 'insufficient'
+    : score >= 70 && oosComponent >= 0.65 && worstDrawdown <= 0.35
+      ? 'stable'
+      : score >= 45 && oosComponent >= 0.5
+        ? 'watch'
+        : 'unstable';
+  const verdictText = verdict === 'stable'
+    ? '邻域稳定'
+    : verdict === 'watch'
+      ? '需要观察'
+      : verdict === 'unstable'
+        ? '邻域不稳'
+        : '样本不足';
+  const reason = [
+    `邻居 ${sampleCount} 个`,
+    `OOS 正比例 ${formatPct(positiveOosRatio)}`,
+    `平均 OOS ${formatPct(avgOosReturn)}`,
+    `平均 Gap ${formatPct(avgGap)}`,
+    `最差回撤 ${formatPct(worstDrawdown)}`,
+    `最少交易 ${minTradeCount}`,
+  ].join('，');
+  return {
+    sampleCount,
+    positiveOosRatio,
+    positiveReturnRatio,
+    avgOosReturn,
+    avgGap,
+    worstDrawdown,
+    minTradeCount,
+    avgProfitFactor,
+    score,
+    verdict,
+    verdictText,
+    reason,
+  };
 }
 
 function validateIntegerListInput(value: unknown, fieldLabel: string): string | null {
@@ -359,6 +1546,25 @@ function validatePositiveNumberListInput(value: unknown, fieldLabel: string): st
   const parsed = parts.map((entry) => Number.parseFloat(entry));
   if (parsed.some((entry) => !Number.isFinite(entry) || entry <= 0)) {
     return `${fieldLabel}必须是逗号分隔的正数`;
+  }
+  if (new Set(parsed).size !== parsed.length) {
+    return `${fieldLabel}不能包含重复值`;
+  }
+  return null;
+}
+
+function validateNonNegativeNumberListInput(value: unknown, fieldLabel: string): string | null {
+  const raw = String(value ?? '').trim();
+  if (!raw) {
+    return `请输入${fieldLabel}`;
+  }
+  const parts = raw.split(',').map((entry) => entry.trim()).filter(Boolean);
+  if (!parts.length) {
+    return `请输入${fieldLabel}`;
+  }
+  const parsed = parts.map((entry) => Number.parseFloat(entry));
+  if (parsed.some((entry) => !Number.isFinite(entry) || entry < 0)) {
+    return `${fieldLabel}必须是逗号分隔的非负数`;
   }
   if (new Set(parsed).size !== parsed.length) {
     return `${fieldLabel}不能包含重复值`;
@@ -413,6 +1619,8 @@ function WorkspaceShell() {
   const [overview, setOverview] = useState<WorkspaceOverview | null>(null);
   const [overviewEquityRows, setOverviewEquityRows] = useState<MultiRunEquityRow[]>([]);
   const [parameterLab, setParameterLab] = useState<WorkspaceParameterLab | null>(null);
+  const [parameterResearch, setParameterResearch] = useState<ParameterResearchWorkspace | null>(null);
+  const [researchWorkflow, setResearchWorkflow] = useState<ResearchWorkflow | null>(null);
   const [parameterExperiments, setParameterExperiments] = useState<ParameterExperimentSummary[]>([]);
   const [parameterExperimentBatches, setParameterExperimentBatches] = useState<ParameterExperimentBatchSummary[]>([]);
   const [researchNotes, setResearchNotes] = useState<ResearchNote[]>([]);
@@ -436,11 +1644,17 @@ function WorkspaceShell() {
   const [parameterQuery, setParameterQuery] = useState(initialState.parameterQuery);
   const [lastActionResult, setLastActionResult] = useState('');
   const [submitting, setSubmitting] = useState<'ingest' | 'run' | 'experiment' | null>(null);
+  const [neighborhoodRunId, setNeighborhoodRunId] = useState<string | null>(null);
+  const [riskMatrixCandidateId, setRiskMatrixCandidateId] = useState<string | null>(null);
+  const [riskMatrixProgressByCandidateId, setRiskMatrixProgressByCandidateId] = useState<Record<string, RiskMatrixProgress>>({});
+  const [filterExperimentCandidateId, setFilterExperimentCandidateId] = useState<string | null>(null);
+  const [filterExperimentProgressByCandidateId, setFilterExperimentProgressByCandidateId] = useState<Record<string, FilterExperimentProgress>>({});
   const [deletingDatasetId, setDeletingDatasetId] = useState<string | null>(null);
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
   const [bulkDeletingRuns, setBulkDeletingRuns] = useState(false);
   const [deletingExperimentId, setDeletingExperimentId] = useState<string | null>(null);
   const [deletingBatchId, setDeletingBatchId] = useState<string | null>(null);
+  const [deletingResearchNoteId, setDeletingResearchNoteId] = useState<string | null>(null);
   const [savingResearchNote, setSavingResearchNote] = useState(false);
   const attemptedParameterResultRefreshKeysRef = useRef<Set<string>>(new Set());
   const [ingestForm] = Form.useForm();
@@ -461,6 +1675,8 @@ function WorkspaceShell() {
     attemptedParameterResultRefreshKeysRef.current.clear();
     setResearchNotes([]);
     setParameterLab(null);
+    setParameterResearch(null);
+    setResearchWorkflow(null);
     setParameterExperimentBatches([]);
     setSelectedBatchId(ALL_BATCHES);
     setSelectedBatchDetail(null);
@@ -487,6 +1703,17 @@ function WorkspaceShell() {
     }
   }
 
+  async function refreshResearchWorkflow() {
+    const [researchPayload, workflowPayload, notesPayload] = await Promise.all([
+      loadParameterResearch(),
+      loadResearchWorkflow(),
+      loadResearchNotes(),
+    ]);
+    setParameterResearch(researchPayload.parameter_research);
+    setResearchWorkflow(workflowPayload.research_workflow);
+    setResearchNotes(notesPayload.research_notes);
+  }
+
   async function refreshParameterWorkspaceMeta() {
     if (
       parameterLab === null
@@ -498,12 +1725,14 @@ function WorkspaceShell() {
       return;
     }
 
-    const [experimentPayload, batchPayload] = await Promise.all([
+    const [experimentPayload, batchPayload, workflowPayload] = await Promise.all([
       loadParameterExperiments(),
       loadParameterExperimentBatches(),
+      loadResearchWorkflow(),
     ]);
     setParameterExperiments(experimentPayload.parameter_experiments);
     setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
+    setResearchWorkflow(workflowPayload.research_workflow);
 
     if (selectedBatchId !== ALL_BATCHES) {
       const batchDetailPayload = await loadParameterExperimentBatchDetail(selectedBatchId);
@@ -653,25 +1882,27 @@ function WorkspaceShell() {
           return;
         }
 
-        if (activeTab === 'parameters' && parameterLab === null) {
+        if (activeTab === 'parameters' && parameterResearch === null) {
           setSectionLoading(true);
-          const [parameterPayload, experimentPayload, batchPayload] = await Promise.all([
-            loadParameters(),
+          const [researchPayload, workflowPayload, experimentPayload, batchPayload] = await Promise.all([
+            loadParameterResearch(),
+            loadResearchWorkflow(),
             loadParameterExperiments(),
             loadParameterExperimentBatches(),
           ]);
           if (cancelled) {
             return;
           }
-          applyPayloadMeta(parameterPayload);
-          setParameterLab(parameterPayload.parameter_lab);
+          applyPayloadMeta(researchPayload);
+          setParameterResearch(researchPayload.parameter_research);
+          setResearchWorkflow(workflowPayload.research_workflow);
           setParameterExperiments(experimentPayload.parameter_experiments);
           setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
           setError(null);
           return;
         }
 
-        if (activeTab === 'parameters' && parameterLab !== null && (!parameterExperiments.length || !parameterExperimentBatches.length)) {
+        if (activeTab === 'parameters' && parameterResearch !== null && (!parameterExperiments.length || !parameterExperimentBatches.length)) {
           setSectionLoading(true);
           const [experimentPayload, batchPayload] = await Promise.all([
             loadParameterExperiments(),
@@ -700,7 +1931,7 @@ function WorkspaceShell() {
     return () => {
       cancelled = true;
     };
-  }, [activeTab, overview, parameterExperimentBatches.length, parameterLab, parameterExperiments.length, runDetailCache, selectedRun, selectedRunId]);
+  }, [activeTab, overview, parameterExperimentBatches.length, parameterResearch, parameterExperiments.length, runDetailCache, selectedRun, selectedRunId]);
 
   useEffect(() => {
     if (activeTab !== 'overview' || overview === null) {
@@ -912,13 +2143,15 @@ function WorkspaceShell() {
     attemptedParameterResultRefreshKeysRef.current.add(refreshKey);
     let cancelled = false;
     setSectionLoading(true);
-    void loadParameters()
-      .then((payload) => {
+    void Promise.all([loadParameters(), loadParameterResearch(), loadResearchWorkflow()])
+      .then(([payload, researchPayload, workflowPayload]) => {
         if (cancelled) {
           return;
         }
         applyPayloadMeta(payload);
         setParameterLab(payload.parameter_lab);
+        setParameterResearch(researchPayload.parameter_research);
+        setResearchWorkflow(workflowPayload.research_workflow);
         setError(null);
       })
       .catch((loadError: unknown) => {
@@ -940,6 +2173,23 @@ function WorkspaceShell() {
     invalidateDerivedData();
     await refreshShell();
   }
+
+  const ensureParameterLabLoaded = useCallback(async () => {
+    if (parameterLab !== null) {
+      return;
+    }
+    setSectionLoading(true);
+    try {
+      const payload = await loadParameters();
+      applyPayloadMeta(payload);
+      setParameterLab(payload.parameter_lab);
+      setError(null);
+    } catch (loadError: unknown) {
+      setError(loadError instanceof Error ? loadError.message : '参数实验明细加载失败');
+    } finally {
+      setSectionLoading(false);
+    }
+  }, [parameterLab]);
 
   async function handleIngest(values: Record<string, unknown>) {
     setSubmitting('ingest');
@@ -986,19 +2236,47 @@ function WorkspaceShell() {
         const runId = snapshotIds.length === 1
           ? baseRunId
           : `${baseRunId}-${snapshot.timeframe.toLowerCase()}`;
-        const result = await postRunEma({
+        const strategyName = String(values.strategy_name ?? 'ema_crossover');
+        const qtyPolicyRef = String(values.qty_policy_ref ?? 'percent_of_cash');
+        const runPayload: Record<string, unknown> = {
           run_id: runId,
           snapshot_id: snapshotId,
-          fast_period: values.fast_period,
-          slow_period: values.slow_period,
-          cash_allocation_pct: values.cash_allocation_pct,
+          strategy_name: strategyName,
+          qty_policy_ref: qtyPolicyRef,
           initial_cash: values.initial_cash,
           leverage: values.leverage,
           fee_rate: values.fee_rate,
           slippage_bps: values.slippage_bps,
           min_notional: values.min_notional,
           benchmark: 'buy_and_hold',
-        });
+        };
+        if (usesRiskPct(qtyPolicyRef)) {
+          runPayload.risk_pct_per_trade = values.risk_pct_per_trade;
+        }
+        if (usesCashAllocation(qtyPolicyRef)) {
+          runPayload.cash_allocation_pct = values.cash_allocation_pct;
+        }
+        if (strategyName === 'ema_pullback_atr_v2') {
+          Object.assign(runPayload, {
+            trend_fast_period: values.trend_fast_period,
+            trend_slow_period: values.trend_slow_period,
+            atr_entry_tolerance: values.atr_entry_tolerance,
+            atr_stop_mult: values.atr_stop_mult,
+            risk_reward_ratio: values.risk_reward_ratio,
+            entry_ema_period: 21,
+            atr_period: 14,
+            min_atr_pct_of_price: 0.002,
+            min_stop_pct: 0.003,
+          });
+        } else {
+          Object.assign(runPayload, {
+            fast_period: values.fast_period,
+            slow_period: values.slow_period,
+          });
+        }
+        const result = strategyName === 'ema_crossover'
+          ? await postRunEma(runPayload)
+          : await postRun(runPayload);
         createdRunIds.push(String(result.run_id ?? runId));
         if (index < snapshotIds.length - 1) {
           setLastActionResult(`已完成 ${index + 1} / ${snapshotIds.length} 个周期回测`);
@@ -1035,16 +2313,18 @@ function WorkspaceShell() {
       if (!snapshotIds.length) {
         throw new Error('请至少选择一个数据快照');
       }
-      const result = await postParameterExperimentBatch({
-        batch_id: values.batch_id,
+      const batchId = makeParameterBatchId();
+      const strategyName = String(values.strategy_name ?? 'ema_crossover');
+      const qtyPolicyRef = String(values.qty_policy_ref ?? 'percent_of_cash');
+      const experimentPayload: Record<string, unknown> = {
+        batch_id: batchId,
         snapshot_ids: snapshotIds,
+        strategy_name: strategyName,
+        strategy_version: strategyName === 'ema_pullback_atr_v2' ? 'v2' : 'v1',
         search_type: values.search_type,
-        fast_periods: parseIntegerList(values.fast_periods),
-        slow_periods: parseIntegerList(values.slow_periods),
         leverage_candidates: parsePositiveNumberList(values.leverage_candidates),
         max_samples: values.max_samples,
-        qty_policy_ref: 'percent_of_cash',
-        cash_allocation_pct: values.cash_allocation_pct,
+        qty_policy_ref: qtyPolicyRef,
         initial_cash: values.initial_cash,
         fee_rate: values.fee_rate,
         slippage_bps: values.slippage_bps,
@@ -1057,10 +2337,35 @@ function WorkspaceShell() {
         is_end: normalizeDateValue(values.is_end),
         oos_start: normalizeDateValue(values.oos_start),
         oos_end: normalizeDateValue(values.oos_end),
-      });
-      const batchId = String(result.batch_id ?? '');
-      setLastActionResult(`参数实验批次已提交：${batchId}`);
-      message.success(`参数实验批次已提交：${batchId}`);
+      };
+      if (usesRiskPct(qtyPolicyRef)) {
+        experimentPayload.risk_pct_per_trade = values.risk_pct_per_trade;
+      }
+      if (usesCashAllocation(qtyPolicyRef)) {
+        experimentPayload.cash_allocation_pct = values.cash_allocation_pct;
+      }
+      if (strategyName === 'ema_pullback_atr_v2') {
+        Object.assign(experimentPayload, {
+          trend_fast_periods: parseIntegerList(values.trend_fast_periods),
+          trend_slow_periods: parseIntegerList(values.trend_slow_periods),
+          atr_entry_tolerances: parsePositiveNumberList(values.atr_entry_tolerances),
+          atr_stop_mults: parsePositiveNumberList(values.atr_stop_mults),
+          risk_reward_ratios: parsePositiveNumberList(values.risk_reward_ratios),
+          entry_ema_period: 21,
+          atr_period: 14,
+          min_atr_pct_of_price: 0.002,
+          min_stop_pct: 0.003,
+        });
+      } else {
+        Object.assign(experimentPayload, {
+          fast_periods: parseIntegerList(values.fast_periods),
+          slow_periods: parseIntegerList(values.slow_periods),
+        });
+      }
+      const result = await postParameterExperimentBatch(experimentPayload);
+      const createdBatchId = String(result.batch_id ?? batchId);
+      setLastActionResult(`参数实验批次已提交：${createdBatchId}`);
+      message.success(`参数实验批次已提交：${createdBatchId}`);
       const [batchPayload, experimentsPayload] = await Promise.all([
         loadParameterExperimentBatches(),
         loadParameterExperiments(),
@@ -1068,7 +2373,7 @@ function WorkspaceShell() {
       applyPayloadMeta(batchPayload);
       setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
       setParameterExperiments(experimentsPayload.parameter_experiments);
-      setSelectedBatchId(batchId || ALL_BATCHES);
+      setSelectedBatchId(createdBatchId || ALL_BATCHES);
       setSelectedExperimentId(ALL_EXPERIMENTS);
       setError(null);
     } catch (submitError: unknown) {
@@ -1077,6 +2382,264 @@ function WorkspaceShell() {
       message.error(text);
     } finally {
       setSubmitting(null);
+    }
+  }
+
+  async function handleRunTrendNeighborhood(row: ParameterLabRow) {
+    setNeighborhoodRunId(row.run_id);
+    try {
+      if (row.strategy_name !== 'ema_pullback_atr_v2') {
+        throw new Error('趋势周期邻域实验仅支持 EMA Pullback ATR v2');
+      }
+      if (!row.trend_fast_period || !row.trend_slow_period) {
+        throw new Error('这个 Run 缺少趋势快慢周期，不能生成邻域实验');
+      }
+      const baseFastCandidates = trendPeriodNeighborhood(row.trend_fast_period);
+      const baseSlowCandidates = trendPeriodNeighborhood(row.trend_slow_period);
+      const fastCandidates = uniqueSortedNumbers(baseFastCandidates.filter((period) => period < row.trend_slow_period!));
+      const slowCandidates = uniqueSortedNumbers(baseSlowCandidates.filter((period) => period > Math.max(...fastCandidates)));
+      if (!fastCandidates.length || !slowCandidates.length) {
+        throw new Error('未能生成有效的 fast < slow 趋势周期邻域');
+      }
+
+      const batchId = makeParameterBatchId();
+      const experimentPayload: Record<string, unknown> = {
+        batch_id: batchId,
+        snapshot_ids: [row.dataset_snapshot_id],
+        strategy_name: 'ema_pullback_atr_v2',
+        strategy_version: 'v2',
+        search_type: 'grid',
+        trend_fast_periods: fastCandidates,
+        trend_slow_periods: slowCandidates,
+        atr_entry_tolerances: [row.atr_entry_tolerance ?? 1],
+        atr_stop_mults: [row.atr_stop_mult ?? 1.5],
+        risk_reward_ratios: [row.risk_reward_ratio ?? 1.5],
+        entry_ema_period: row.entry_ema_period ?? 21,
+        atr_period: row.atr_period ?? 14,
+        min_atr_pct_of_price: 0.002,
+        min_stop_pct: 0.003,
+        leverage_candidates: [row.leverage ?? 1],
+        qty_policy_ref: row.qty_policy_ref ?? 'percent_of_cash',
+        initial_cash: 10000,
+        fee_rate: row.fee_rate ?? 0,
+        slippage_bps: row.slippage_bps ?? 0,
+        min_notional: 0,
+        benchmark: 'buy_and_hold',
+        validation_split_mode: 'auto_ratio',
+        oos_ratio: 0.3,
+        warmup_bars: 0,
+      };
+      const rowQtyPolicyRef = row.qty_policy_ref ?? 'percent_of_cash';
+      if (usesRiskPct(rowQtyPolicyRef)) {
+        experimentPayload.risk_pct_per_trade = row.risk_pct_per_trade ?? 0.01;
+      }
+      if (usesCashAllocation(rowQtyPolicyRef)) {
+        experimentPayload.cash_allocation_pct = row.cash_allocation_pct ?? 95;
+      }
+      const result = await postParameterExperimentBatch(experimentPayload);
+      const createdBatchId = String(result.batch_id ?? batchId);
+      const summaryText = `趋势周期邻域实验已提交：${createdBatchId}（tf ${fastCandidates.join(',')} / ts ${slowCandidates.join(',')}）`;
+      setLastActionResult(summaryText);
+      message.success(summaryText);
+      const [batchPayload, experimentsPayload] = await Promise.all([
+        loadParameterExperimentBatches(),
+        loadParameterExperiments(),
+      ]);
+      applyPayloadMeta(batchPayload);
+      setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
+      setParameterExperiments(experimentsPayload.parameter_experiments);
+      setSelectedBatchId(createdBatchId || ALL_BATCHES);
+      setSelectedBatchDetail(null);
+      setSelectedExperimentId(ALL_EXPERIMENTS);
+      setSelectedExperimentDetail(null);
+      setActiveTab('parameters');
+      setError(null);
+    } catch (submitError: unknown) {
+      const text = submitError instanceof Error ? submitError.message : '趋势周期邻域实验提交失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setNeighborhoodRunId(null);
+    }
+  }
+
+  async function handleRunRiskMatrix(candidate: ResearchCandidateView) {
+    setRiskMatrixCandidateId(candidate.candidate_id);
+    try {
+      const result = await postResearchCandidateRiskMatrix(candidate.candidate_id, {
+        risk_pct_per_trade_candidates: [0.01, 0.03, 0.05, 0.10],
+        cash_allocation_pct_candidates: [30, 50, 95],
+        leverage_candidates: [1, 3, 5, 10],
+        oos_ratio: 0.3,
+        warmup_bars: 0,
+      });
+      const createdBatchId = String(result.batch_id ?? '');
+      const plannedRunCount = Number(result.planned_run_count ?? 0);
+      setRiskMatrixProgressByCandidateId((current) => ({
+        ...current,
+        [candidate.candidate_id]: {
+          batchId: createdBatchId,
+          status: 'pending',
+          runCount: 0,
+          plannedRunCount,
+        },
+      }));
+      const summaryText = `风险矩阵已提交：${createdBatchId}${plannedRunCount ? `（${plannedRunCount} 个 run）` : ''}，完成后会自动刷新`;
+      setLastActionResult(summaryText);
+      message.success(summaryText);
+      let latestBatch: ParameterExperimentBatchSummary | undefined;
+      const deadline = Date.now() + 180_000;
+      while (Date.now() < deadline) {
+        const batchPayload = await loadParameterExperimentBatches();
+        applyPayloadMeta(batchPayload);
+        setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
+        latestBatch = batchPayload.parameter_experiment_batches.find((batch) => batch.batch_id === createdBatchId);
+        if (latestBatch) {
+          setRiskMatrixProgressByCandidateId((current) => ({
+            ...current,
+            [candidate.candidate_id]: {
+              batchId: createdBatchId,
+              status: latestBatch?.status ?? 'pending',
+              runCount: Number(latestBatch?.run_count ?? 0),
+              plannedRunCount: Number(latestBatch?.planned_run_count ?? plannedRunCount),
+            },
+          }));
+          if (latestBatch.status === 'success' || latestBatch.status === 'failed') {
+            break;
+          }
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 1500));
+      }
+      const [batchPayload, experimentsPayload, parameterPayload] = await Promise.all([
+        loadParameterExperimentBatches(),
+        loadParameterExperiments(),
+        loadParameters(),
+      ]);
+      applyPayloadMeta(batchPayload);
+      setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
+      setParameterExperiments(experimentsPayload.parameter_experiments);
+      setParameterLab(parameterPayload.parameter_lab);
+      setSelectedBatchId(createdBatchId || ALL_BATCHES);
+      setSelectedBatchDetail(null);
+      setSelectedExperimentId(ALL_EXPERIMENTS);
+      setSelectedExperimentDetail(null);
+      setActiveTab('parameters');
+      setError(null);
+      await refreshResearchWorkflow();
+      latestBatch = batchPayload.parameter_experiment_batches.find((batch) => batch.batch_id === createdBatchId) ?? latestBatch;
+      const finalStatus = latestBatch?.status ?? 'unknown';
+      setRiskMatrixProgressByCandidateId((current) => ({
+        ...current,
+        [candidate.candidate_id]: {
+          batchId: createdBatchId,
+          status: finalStatus,
+          runCount: Number(latestBatch?.run_count ?? 0),
+          plannedRunCount: Number(latestBatch?.planned_run_count ?? plannedRunCount),
+        },
+      }));
+      if (finalStatus === 'success') {
+        message.success(`风险矩阵已完成：${createdBatchId}，可点击“看风险矩阵”查看`);
+      } else if (finalStatus === 'failed') {
+        message.error(`风险矩阵失败：${createdBatchId}`);
+      } else {
+        message.info(`风险矩阵仍在后台运行：${createdBatchId}，稍后刷新会更新状态`);
+      }
+    } catch (submitError: unknown) {
+      const text = submitError instanceof Error ? submitError.message : '风险矩阵提交失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setRiskMatrixCandidateId(null);
+    }
+  }
+
+  async function handleRunFilterExperiment(candidate: ResearchCandidateView, mode: FilterExperimentMode = 'single') {
+    setFilterExperimentCandidateId(candidate.candidate_id);
+    try {
+      const result = await postResearchCandidateFilterExperiment(candidate.candidate_id, {
+        mode,
+        filter_types: ['higher_timeframe_trend', 'atr_percentile', 'adx'],
+        oos_ratio: 0.3,
+        warmup_bars: 0,
+      });
+      const createdBatchId = String(result.batch_id ?? '');
+      const plannedRunCount = Number(result.planned_run_count ?? 0);
+      setFilterExperimentProgressByCandidateId((current) => ({
+        ...current,
+        [candidate.candidate_id]: {
+          batchId: createdBatchId,
+          status: 'pending',
+          runCount: 0,
+          plannedRunCount,
+        },
+      }));
+      const modeLabel = mode === 'stacked' ? '叠加过滤实验' : '单指标过滤实验';
+      const summaryText = `${modeLabel}已提交：${createdBatchId}${plannedRunCount ? `（${plannedRunCount} 个 run）` : ''}，完成后会自动刷新`;
+      setLastActionResult(summaryText);
+      message.success(summaryText);
+      let latestBatch: ParameterExperimentBatchSummary | undefined;
+      const deadline = Date.now() + 180_000;
+      while (Date.now() < deadline) {
+        const batchPayload = await loadParameterExperimentBatches();
+        applyPayloadMeta(batchPayload);
+        setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
+        latestBatch = batchPayload.parameter_experiment_batches.find((batch) => batch.batch_id === createdBatchId);
+        if (latestBatch) {
+          setFilterExperimentProgressByCandidateId((current) => ({
+            ...current,
+            [candidate.candidate_id]: {
+              batchId: createdBatchId,
+              status: latestBatch?.status ?? 'pending',
+              runCount: Number(latestBatch?.run_count ?? 0),
+              plannedRunCount: Number(latestBatch?.planned_run_count ?? plannedRunCount),
+            },
+          }));
+          if (latestBatch.status === 'success' || latestBatch.status === 'failed') {
+            break;
+          }
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 1500));
+      }
+      const [batchPayload, experimentsPayload, parameterPayload] = await Promise.all([
+        loadParameterExperimentBatches(),
+        loadParameterExperiments(),
+        loadParameters(),
+      ]);
+      applyPayloadMeta(batchPayload);
+      setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
+      setParameterExperiments(experimentsPayload.parameter_experiments);
+      setParameterLab(parameterPayload.parameter_lab);
+      setSelectedBatchId(createdBatchId || ALL_BATCHES);
+      setSelectedBatchDetail(null);
+      setSelectedExperimentId(ALL_EXPERIMENTS);
+      setSelectedExperimentDetail(null);
+      setActiveTab('parameters');
+      setError(null);
+      await refreshResearchWorkflow();
+      latestBatch = batchPayload.parameter_experiment_batches.find((batch) => batch.batch_id === createdBatchId) ?? latestBatch;
+      const finalStatus = latestBatch?.status ?? 'unknown';
+      setFilterExperimentProgressByCandidateId((current) => ({
+        ...current,
+        [candidate.candidate_id]: {
+          batchId: createdBatchId,
+          status: finalStatus,
+          runCount: Number(latestBatch?.run_count ?? 0),
+          plannedRunCount: Number(latestBatch?.planned_run_count ?? plannedRunCount),
+        },
+      }));
+      if (finalStatus === 'success') {
+        message.success(`过滤器实验已完成：${createdBatchId}，可在批次明细或初筛池查看过滤后 run`);
+      } else if (finalStatus === 'failed') {
+        message.error(`过滤器实验失败：${createdBatchId}`);
+      } else {
+        message.info(`过滤器实验仍在后台运行：${createdBatchId}，稍后刷新会更新状态`);
+      }
+    } catch (submitError: unknown) {
+      const text = submitError instanceof Error ? submitError.message : '过滤器实验提交失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setFilterExperimentCandidateId(null);
     }
   }
 
@@ -1299,13 +2862,30 @@ function WorkspaceShell() {
   async function handleSaveTargetResearchNote(targetType: string, targetId: string, values: Record<string, unknown>) {
     setSavingResearchNote(true);
     try {
-      await postResearchNote({
+      const payload: Record<string, unknown> = {
         target_type: targetType,
         target_id: targetId,
         author: String(values.author ?? 'local').trim() || 'local',
         content: String(values.content ?? '').trim(),
         labels: Array.isArray(values.labels) ? values.labels : [],
-      });
+        decision_status: String(values.decision_status ?? 'candidate').trim() || 'candidate',
+      };
+      const decisionReason = String(values.decision_reason ?? '').trim();
+      if (decisionReason) {
+        payload.decision_reason = decisionReason;
+      }
+      if (values.confidence_score !== null && values.confidence_score !== undefined && values.confidence_score !== '') {
+        payload.confidence_score = Number(values.confidence_score);
+      }
+      const linkedBatchId = String(values.linked_batch_id ?? '').trim();
+      if (linkedBatchId) {
+        payload.linked_batch_id = linkedBatchId;
+      }
+      const linkedParameterGroup = String(values.linked_parameter_group ?? '').trim();
+      if (linkedParameterGroup) {
+        payload.linked_parameter_group = linkedParameterGroup;
+      }
+      await postResearchNote(payload);
       const notesPayload = await loadResearchNotes(targetType, targetId);
       setResearchNotes((current) => {
         const retained = current.filter((note) => !(note.target_type === targetType && note.target_id === targetId));
@@ -1314,6 +2894,7 @@ function WorkspaceShell() {
       setLastActionResult(`研究备注已保存：${targetId}`);
       setError(null);
       message.success('研究备注已保存');
+      await refreshResearchWorkflow();
     } catch (submitError: unknown) {
       const text = submitError instanceof Error ? submitError.message : '研究备注保存失败';
       setLastActionResult(text);
@@ -1329,6 +2910,34 @@ function WorkspaceShell() {
     applyPayloadMeta(payload);
     setSelectedRun(payload.run);
     setRunDetailCache((current) => ({ ...current, [payload.run.run_id]: payload.run }));
+  }
+
+  async function handleDeleteResearchNote(note: ResearchNote) {
+    setDeletingResearchNoteId(note.note_id);
+    try {
+      await deleteResearchNote(note.note_id);
+      const notesPayload = await loadResearchNotes(note.target_type, note.target_id);
+      setResearchNotes((current) => {
+        const retained = current.filter((item) => !(item.target_type === note.target_type && item.target_id === note.target_id));
+        return [...notesPayload.research_notes, ...retained];
+      });
+      if (note.target_type === 'run' && selectedRun?.run_id === note.target_id) {
+        const payload = await loadRunDetail(note.target_id);
+        applyPayloadMeta(payload);
+        setSelectedRun(payload.run);
+        setRunDetailCache((current) => ({ ...current, [payload.run.run_id]: payload.run }));
+      }
+      await refreshResearchWorkflow();
+      setLastActionResult(`研究备注已删除：${note.note_id}`);
+      setError(null);
+      message.success('研究备注已删除');
+    } catch (deleteError: unknown) {
+      const text = deleteError instanceof Error ? deleteError.message : '研究备注删除失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setDeletingResearchNoteId(null);
+    }
   }
 
   const manualLabelsByRunId = useMemo(() => {
@@ -1466,18 +3075,24 @@ function WorkspaceShell() {
               deletingRunId={deletingRunId}
               onDeleteRun={handleDeleteRun}
               onSaveResearchNote={handleSaveResearchNote}
+              onDeleteResearchNote={handleDeleteResearchNote}
               savingResearchNote={savingResearchNote}
+              deletingResearchNoteId={deletingResearchNoteId}
             />
           )}
-          {activeTab === 'parameters' && parameterLab && (
+          {activeTab === 'parameters' && (parameterResearch || parameterLab) && (
             <ParametersView
               datasets={datasets}
               rows={filteredParameterRows}
-              allRows={parameterLab.rows}
+              allRows={parameterLab?.rows ?? []}
+              parameterResearch={parameterResearch}
+              researchWorkflow={researchWorkflow}
               researchNotes={researchNotes}
               manualLabelsByRunId={manualLabelsByRunId}
-              fastRows={parameterLab.fast_period_total_return}
-              slowRows={parameterLab.slow_period_total_return}
+              fastRows={parameterLab?.fast_period_total_return ?? []}
+              slowRows={parameterLab?.slow_period_total_return ?? []}
+              parameterLabLoaded={parameterLab !== null}
+              onEnsureParameterLab={ensureParameterLabLoaded}
               batches={parameterExperimentBatches}
               selectedBatchId={selectedBatchId}
               setSelectedBatchId={setSelectedBatchId}
@@ -1493,7 +3108,21 @@ function WorkspaceShell() {
               setParameterQuery={setParameterQuery}
               experimentForm={experimentForm}
               submitting={submitting}
+              neighborhoodRunId={neighborhoodRunId}
               onSubmitExperiment={handleSubmitParameterExperiment}
+              onRunTrendNeighborhood={handleRunTrendNeighborhood}
+              onRunRiskMatrix={handleRunRiskMatrix}
+              onRunFilterExperiment={handleRunFilterExperiment}
+              riskMatrixCandidateId={riskMatrixCandidateId}
+              riskMatrixProgressByCandidateId={riskMatrixProgressByCandidateId}
+              filterExperimentCandidateId={filterExperimentCandidateId}
+              filterExperimentProgressByCandidateId={filterExperimentProgressByCandidateId}
+              onLoadParameterRows={async () => {
+                const parameterPayload = await loadParameters();
+                applyPayloadMeta(parameterPayload);
+                setParameterLab(parameterPayload.parameter_lab);
+                return parameterPayload.parameter_lab.rows;
+              }}
               onOpenRun={(runId) => {
                 setSelectedRunId(runId);
                 setActiveTab('analysis');
@@ -1503,16 +3132,25 @@ function WorkspaceShell() {
               onDeleteBatch={handleDeleteParameterExperimentBatch}
               onSaveResearchNote={handleSaveTargetResearchNote}
               savingResearchNote={savingResearchNote}
+              onResearchWorkflowOptimisticChange={(updater) => setResearchWorkflow((current) => updater(current))}
+              onRefreshResearchWorkflow={refreshResearchWorkflow}
               onRefreshExperiments={async () => {
-                const [experimentPayload, batchPayload, parameterPayload] = await Promise.all([
+                const [experimentPayload, batchPayload, researchPayload, workflowPayload] = await Promise.all([
                   loadParameterExperiments(),
                   loadParameterExperimentBatches(),
-                  loadParameters(),
+                  loadParameterResearch(),
+                  loadResearchWorkflow(),
                 ]);
                 applyPayloadMeta(experimentPayload);
                 setParameterExperiments(experimentPayload.parameter_experiments);
                 setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
-                setParameterLab(parameterPayload.parameter_lab);
+                setParameterResearch(researchPayload.parameter_research);
+                setResearchWorkflow(workflowPayload.research_workflow);
+                if (parameterLab !== null) {
+                  const parameterPayload = await loadParameters();
+                  applyPayloadMeta(parameterPayload);
+                  setParameterLab(parameterPayload.parameter_lab);
+                }
                 if (selectedBatchId !== ALL_BATCHES) {
                   const batchDetailPayload = await loadParameterExperimentBatchDetail(selectedBatchId);
                   applyPayloadMeta(batchDetailPayload);
@@ -1798,9 +3436,17 @@ function ExecutionView({
               run_id: `run-${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}`,
               dataset_key: datasetGroupOptions[0]?.value,
               timeframes: timeframeOptions[0] ? [timeframeOptions[0].value] : [],
+              strategy_name: 'ema_crossover',
               fast_period: 2,
               slow_period: 3,
-              cash_allocation_pct: 100,
+              trend_fast_period: 8,
+              trend_slow_period: 34,
+              atr_entry_tolerance: 0.5,
+              atr_stop_mult: 1.5,
+              risk_reward_ratio: 2,
+              qty_policy_ref: 'percent_of_cash',
+              cash_allocation_pct: 95,
+              risk_pct_per_trade: 0.01,
               initial_cash: 10000,
               leverage: 1,
               fee_rate: 0,
@@ -1843,23 +3489,106 @@ function ExecutionView({
             <Form.Item name="run_id" label="运行 ID 前缀" rules={[{ required: true }]}>
               <Input />
             </Form.Item>
-            <Row gutter={12}>
-              <Col span={8}>
-                <Form.Item name="fast_period" label="快线周期" rules={[{ required: true }]}>
-                  <InputNumber min={1} style={{ width: '100%' }} />
-                </Form.Item>
-              </Col>
-              <Col span={8}>
-                <Form.Item name="slow_period" label="慢线周期" rules={[{ required: true }]}>
-                  <InputNumber min={1} style={{ width: '100%' }} />
-                </Form.Item>
-              </Col>
-              <Col span={8}>
-                <Form.Item name="cash_allocation_pct" label="资金使用比例 (%)" rules={[{ required: true }]}>
-                  <InputNumber min={0.01} max={100} step={1} style={{ width: '100%' }} />
-                </Form.Item>
-              </Col>
-            </Row>
+            <Form.Item name="strategy_name" label="策略" rules={[{ required: true }]}>
+              <Segmented block options={STRATEGY_OPTIONS} />
+            </Form.Item>
+            <Form.Item
+              noStyle
+              shouldUpdate={(prev, current) => prev.strategy_name !== current.strategy_name || prev.qty_policy_ref !== current.qty_policy_ref}
+            >
+              {({ getFieldValue }) => (getFieldValue('strategy_name') === 'ema_pullback_atr_v2' ? (
+                <Row gutter={12}>
+                  <Col span={24}>
+                    <Form.Item name="qty_policy_ref" label="仓位模式" rules={[{ required: true }]}>
+                      <Segmented block options={QTY_POLICY_OPTIONS} />
+                    </Form.Item>
+                  </Col>
+                </Row>
+              ) : null)}
+            </Form.Item>
+            <Form.Item noStyle shouldUpdate={(prev, current) => prev.strategy_name !== current.strategy_name}>
+              {({ getFieldValue }) => (getFieldValue('strategy_name') === 'ema_pullback_atr_v2' ? (
+                <>
+                  <Row gutter={12}>
+                    <Col span={8}>
+                      <Form.Item name="trend_fast_period" label="趋势快线" rules={[{ required: true }]}>
+                        <InputNumber min={1} style={{ width: '100%' }} />
+                      </Form.Item>
+                    </Col>
+                    <Col span={8}>
+                      <Form.Item name="trend_slow_period" label="趋势慢线" rules={[{ required: true }]}>
+                        <InputNumber min={1} style={{ width: '100%' }} />
+                      </Form.Item>
+                    </Col>
+                    <Col span={8}>
+                      <Form.Item name="atr_entry_tolerance" label="ATR 回踩容差" rules={[{ required: true }]}>
+                        <InputNumber min={0} step={0.1} style={{ width: '100%' }} />
+                      </Form.Item>
+                    </Col>
+                  </Row>
+                  <Row gutter={12}>
+                    <Col span={8}>
+                      <Form.Item name="atr_stop_mult" label="ATR 止损倍数" rules={[{ required: true }]}>
+                        <InputNumber min={0.01} step={0.1} style={{ width: '100%' }} />
+                      </Form.Item>
+                    </Col>
+                    <Col span={8}>
+                      <Form.Item name="risk_reward_ratio" label="风险收益比" rules={[{ required: true }]}>
+                        <InputNumber min={0.01} step={0.1} style={{ width: '100%' }} />
+                      </Form.Item>
+                    </Col>
+                    <Col span={8}>
+                      <Descriptions size="small" column={1}>
+                        <Descriptions.Item label="固定参数">Entry EMA 21 · ATR 14 · min ATR/price 0.2% · min stop 0.3%</Descriptions.Item>
+                      </Descriptions>
+                    </Col>
+                  </Row>
+                </>
+              ) : (
+                <Row gutter={12}>
+                  <Col span={8}>
+                    <Form.Item name="fast_period" label="快线周期" rules={[{ required: true }]}>
+                      <InputNumber min={1} style={{ width: '100%' }} />
+                    </Form.Item>
+                  </Col>
+                  <Col span={8}>
+                    <Form.Item name="slow_period" label="慢线周期" rules={[{ required: true }]}>
+                      <InputNumber min={1} style={{ width: '100%' }} />
+                    </Form.Item>
+                  </Col>
+                </Row>
+              ))}
+            </Form.Item>
+            <Form.Item noStyle shouldUpdate={(prev, current) => prev.qty_policy_ref !== current.qty_policy_ref || prev.strategy_name !== current.strategy_name}>
+              {({ getFieldValue }) => {
+                const isV2 = getFieldValue('strategy_name') === 'ema_pullback_atr_v2';
+                const qtyPolicyRef = String(getFieldValue('qty_policy_ref') ?? 'percent_of_cash');
+                const showRiskPct = isV2 && usesRiskPct(qtyPolicyRef);
+                const showCashAllocation = !isV2 || usesCashAllocation(qtyPolicyRef);
+                return (
+                  <Row gutter={12}>
+                    {showRiskPct ? (
+                      <Col span={showCashAllocation ? 12 : 24}>
+                        <Form.Item name="risk_pct_per_trade" label="单笔风险比例" rules={[{ required: true }]}>
+                          <InputNumber min={0.001} max={0.99} step={0.001} style={{ width: '100%' }} />
+                        </Form.Item>
+                      </Col>
+                    ) : null}
+                    {showCashAllocation ? (
+                      <Col span={showRiskPct ? 12 : 24}>
+                        <Form.Item
+                          name="cash_allocation_pct"
+                          label={qtyPolicyRef === 'risk_pct_of_cash_allocation' ? '最多动用资金 (%)' : '资金使用比例 (%)'}
+                          rules={[{ required: true }]}
+                        >
+                          <InputNumber min={0.01} max={100} step={1} style={{ width: '100%' }} />
+                        </Form.Item>
+                      </Col>
+                    ) : null}
+                  </Row>
+                );
+              }}
+            </Form.Item>
             <Row gutter={12}>
               <Col span={12}>
                 <Form.Item name="initial_cash" label="初始资金">
@@ -2032,7 +3761,7 @@ function OverviewView({
       cell: ({ row }) => row.original.timeframe.toUpperCase(),
     },
     { header: '策略', accessorKey: 'strategy_name' },
-    { header: '快 / 慢', cell: ({ row }) => `${row.original.fast_period ?? '--'} / ${row.original.slow_period ?? '--'}` },
+    { header: '参数摘要', accessorKey: 'parameter_summary', cell: ({ row }) => row.original.parameter_summary || `${row.original.fast_period ?? '--'} / ${row.original.slow_period ?? '--'}` },
     { header: '杠杆', cell: ({ row }) => row.original.leverage ?? '--' },
     { header: '收益率', cell: ({ row }) => formatPct(row.original.total_return) },
     {
@@ -2209,7 +3938,9 @@ function AnalysisView({
   deletingRunId,
   onDeleteRun,
   onSaveResearchNote,
+  onDeleteResearchNote,
   savingResearchNote,
+  deletingResearchNoteId,
 }: {
   runs: RunSummaryView[];
   selectedRun: RunAnalysisView | null;
@@ -2218,7 +3949,9 @@ function AnalysisView({
   deletingRunId: string | null;
   onDeleteRun: (runId: string) => Promise<void>;
   onSaveResearchNote: (runId: string, values: Record<string, unknown>) => Promise<void>;
+  onDeleteResearchNote: (note: ResearchNote) => Promise<void>;
   savingResearchNote: boolean;
+  deletingResearchNoteId: string | null;
 }) {
   const [tradeSideFilter, setTradeSideFilter] = useState<string>('all');
   const [tradeOutcomeFilter, setTradeOutcomeFilter] = useState<'all' | 'win' | 'loss' | 'open'>('all');
@@ -2228,20 +3961,26 @@ function AnalysisView({
   const tradeColumns = useMemo<ColumnDef<RunAnalysisView['trade_rows'][number]>[]>(() => [
     {
       id: 'trade_id',
-      header: '交易',
+      header: '#',
+      size: 72,
+      minSize: 64,
       enableSorting: false,
       cell: ({ row }) => (
-        <Space direction="vertical" size={0}>
-          <Text strong>{shortRunId(row.original.trade_id)}</Text>
-          <Text type="secondary">{row.original.symbol}</Text>
-        </Space>
+        <Tooltip title={row.original.trade_id}>
+          <Space direction="vertical" size={0}>
+            <Text strong>{`#${row.index + 1}`}</Text>
+            <Text type="secondary">{row.original.symbol.split('/')[0]}</Text>
+          </Space>
+        </Tooltip>
       ),
     },
-    { header: '方向', accessorKey: 'side' },
-    { id: 'entry_time', header: '开仓', accessorFn: (row) => row.entry_time, cell: ({ row }) => formatDateTime(row.original.entry_time) },
-    { id: 'exit_time', header: '平仓', accessorFn: (row) => row.exit_time ?? '', cell: ({ row }) => row.original.exit_time ? formatDateTime(row.original.exit_time) : '--' },
+    { header: '方向', accessorKey: 'side', size: 72, minSize: 64 },
+    { id: 'entry_time', header: '开仓', size: 120, minSize: 112, accessorFn: (row) => row.entry_time, cell: ({ row }) => formatDateTime(row.original.entry_time) },
+    { id: 'exit_time', header: '平仓', size: 120, minSize: 112, accessorFn: (row) => row.exit_time ?? '', cell: ({ row }) => row.original.exit_time ? formatDateTime(row.original.exit_time) : '--' },
     { id: 'entry_price', header: '开仓价', accessorFn: (row) => row.entry_price, cell: ({ row }) => formatNumber(row.original.entry_price) },
     { id: 'exit_price', header: '平仓价', accessorFn: (row) => row.exit_price ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.exit_price === null ? '--' : formatNumber(row.original.exit_price) },
+    { id: 'planned_stop_loss_price', header: '计划止损', accessorFn: (row) => row.planned_stop_loss_price ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.planned_stop_loss_price === null ? '--' : formatNumber(row.original.planned_stop_loss_price) },
+    { id: 'planned_take_profit_price', header: '计划止盈', accessorFn: (row) => row.planned_take_profit_price ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.planned_take_profit_price === null ? '--' : formatNumber(row.original.planned_take_profit_price) },
     { id: 'qty', header: '数量', accessorFn: (row) => row.qty, cell: ({ row }) => formatNumber(row.original.qty) },
     { id: 'net_pnl', header: '净收益', accessorFn: (row) => row.net_pnl, cell: ({ row }) => formatNumber(row.original.net_pnl) },
     { id: 'return_pct', header: '收益率', accessorFn: (row) => row.return_pct, cell: ({ row }) => formatPct(row.original.return_pct) },
@@ -2339,6 +4078,13 @@ function AnalysisView({
   const validationSummary = selectedRun.validation;
   const latestResearchNote = researchNotes[0] ?? null;
   const aggregatedLabels = Array.from(new Set(researchNotes.flatMap((note) => note.labels ?? [])));
+  const selectedRunSummary = runs.find((run) => run.run_id === selectedRun.run_id);
+  const selectedRunIsTracked = researchNotes.some((note) => (
+    note.labels.includes('tracking')
+    && note.labels.includes('frozen_run')
+    && note.decision_status !== 'rejected'
+    && note.decision_status !== 'archived'
+  ));
   const validationSegments = validationSummary
     ? [
       {
@@ -2361,6 +4107,13 @@ function AnalysisView({
           title="单次分析"
           extra={(
             <Space wrap>
+              <Button
+                loading={savingResearchNote}
+                disabled={selectedRunIsTracked}
+                onClick={() => void onSaveResearchNote(selectedRun.run_id, buildFrozenAnalysisNoteValues(selectedRun, selectedRunSummary))}
+              >
+                {selectedRunIsTracked ? '已追踪' : '冻结追踪'}
+              </Button>
               <Select
                 value={selectedRunId}
                 style={{ minWidth: 360 }}
@@ -2512,132 +4265,147 @@ function AnalysisView({
       </Col>
 
       <Col span={24}>
-        <Card title="研究备注与标记">
-          <Row gutter={[16, 16]}>
-            <Col xs={24} xl={10}>
-              <Space direction="vertical" size={12} style={{ width: '100%' }}>
-                <Paragraph type="secondary" style={{ marginBottom: 0 }}>
-                  给当前 run 留下结论、候选状态和复盘备注。标签用于快速筛出基准、候选和排除项，备注保留具体判断依据。
-                </Paragraph>
-                <Space wrap size={[8, 8]}>
-                  {aggregatedLabels.length ? aggregatedLabels.map((label) => (
-                    <Tag color={label === 'excluded' ? 'red' : label === 'baseline' ? 'gold' : 'blue'} key={label}>
-                      {researchLabelText(label)}
-                    </Tag>
-                  )) : <Text type="secondary">当前还没有标签</Text>}
-                  {latestResearchNote ? (
-                    <Tag color={decisionStatusColor(latestResearchNote.decision_status)}>
-                      {decisionStatusText(latestResearchNote.decision_status)}
-                    </Tag>
-                  ) : null}
-                </Space>
-                <Descriptions size="small" column={1}>
-                  <Descriptions.Item label="备注数">{researchNotes.length}</Descriptions.Item>
-                  <Descriptions.Item label="最近更新">
-                    {latestResearchNote ? formatDateTime(latestResearchNote.created_at) : '--'}
-                  </Descriptions.Item>
-                  <Descriptions.Item label="最近作者">
-                    {latestResearchNote?.author ?? '--'}
-                  </Descriptions.Item>
-                </Descriptions>
+        <Card
+          title="研究记录"
+          extra={latestResearchNote ? (
+            <Tag color={decisionStatusColor(latestResearchNote.decision_status)}>
+              {decisionStatusText(latestResearchNote.decision_status)}
+            </Tag>
+          ) : null}
+        >
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Flex justify="space-between" align="center" wrap="wrap" gap={8}>
+              <Space wrap size={[8, 8]}>
+                <Tag>备注 {researchNotes.length}</Tag>
+                {aggregatedLabels.length ? aggregatedLabels.map((label) => (
+                  <Tag color={label === 'excluded' ? 'red' : label === 'baseline' ? 'gold' : 'blue'} key={label}>
+                    {researchLabelText(label)}
+                  </Tag>
+                )) : <Text type="secondary">无标签</Text>}
               </Space>
-            </Col>
-            <Col xs={24} xl={14}>
-              <Form
-                form={researchNoteForm}
-                layout="vertical"
-                initialValues={{ author: 'local', decision_status: 'candidate', labels: [] }}
-                onFinish={async (values) => {
-                  await onSaveResearchNote(selectedRun.run_id, values);
-                  researchNoteForm.setFieldsValue({
-                    author: values.author,
-                    decision_status: values.decision_status ?? 'candidate',
-                    labels: values.labels ?? [],
-                    decision_reason: '',
-                    confidence_score: null,
-                    content: '',
-                  });
-                }}
-              >
-                <Row gutter={[12, 12]}>
-                  <Col xs={24} md={8}>
-                    <Form.Item name="author" label="作者" rules={[{ required: true, whitespace: true, message: '请输入作者' }]}>
-                      <Input placeholder="local" />
-                    </Form.Item>
-                  </Col>
-                  <Col xs={24} md={16}>
-                    <Form.Item name="labels" label="标签">
-                      <Select
-                        mode="multiple"
-                        options={RESEARCH_LABEL_OPTIONS}
-                        placeholder="选择标签"
-                        optionFilterProp="label"
-                      />
-                    </Form.Item>
-                  </Col>
-                </Row>
-                <Row gutter={[12, 12]}>
-                  <Col xs={24} md={8}>
-                    <Form.Item name="decision_status" label="决策状态" rules={[{ required: true, message: '请选择决策状态' }]}>
-                      <Select options={DECISION_STATUS_OPTIONS} />
-                    </Form.Item>
-                  </Col>
-                  <Col xs={24} md={8}>
-                    <Form.Item name="confidence_score" label="置信度">
-                      <InputNumber min={0} max={100} precision={1} style={{ width: '100%' }} />
-                    </Form.Item>
-                  </Col>
-                  <Col xs={24} md={8}>
-                    <Form.Item name="decision_reason" label="状态原因">
-                      <Input />
-                    </Form.Item>
-                  </Col>
-                </Row>
-                <Form.Item
-                  name="content"
-                  label="研究备注"
-                  rules={[{ required: true, whitespace: true, message: '请输入备注内容' }]}
-                >
-                  <Input.TextArea rows={3} placeholder="例如：样本外收益仍为正，可作为下一轮重点复核候选。" />
-                </Form.Item>
-                <Flex justify="flex-end">
-                  <Button type="primary" htmlType="submit" loading={savingResearchNote}>
-                    保存备注
-                  </Button>
-                </Flex>
-              </Form>
-            </Col>
-            <Col span={24}>
-              <Space direction="vertical" size={12} style={{ width: '100%' }}>
-                {researchNotes.length ? researchNotes.map((note) => (
-                  <Card size="small" className="cbw-note-card" key={note.note_id}>
-                    <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                      <Flex justify="space-between" align="center" wrap="wrap" gap={8}>
-                        <Space wrap size={[8, 8]}>
-                          <Text strong>{note.author}</Text>
-                          <Text type="secondary">{formatDateTime(note.created_at)}</Text>
-                        </Space>
-                        <Space wrap size={[8, 8]}>
-                          <Tag color={decisionStatusColor(note.decision_status)}>
-                            {decisionStatusText(note.decision_status)}
-                          </Tag>
-                          {note.labels.map((label) => (
-                            <Tag color={label === 'excluded' ? 'red' : label === 'baseline' ? 'gold' : 'blue'} key={`${note.note_id}-${label}`}>
-                              {researchLabelText(label)}
-                            </Tag>
-                          ))}
-                        </Space>
-                      </Flex>
-                      {note.decision_reason ? <Text type="secondary">{note.decision_reason}</Text> : null}
-                      <Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>{note.content}</Paragraph>
-                    </Space>
-                  </Card>
-                )) : (
-                  <Alert type="info" showIcon message="当前 run 还没有研究备注。" />
-                )}
-              </Space>
-            </Col>
-          </Row>
+              <Text type="secondary">
+                {latestResearchNote ? `最近更新 ${formatDateTime(latestResearchNote.created_at)}` : '暂无记录'}
+              </Text>
+            </Flex>
+            <Collapse
+              ghost
+              items={[{
+                key: 'research-note-form',
+                label: '备注与标记',
+                children: (
+                  <Row gutter={[16, 16]}>
+                    <Col span={24}>
+                      <Form
+                        form={researchNoteForm}
+                        layout="vertical"
+                        initialValues={{ author: 'local', decision_status: 'candidate', labels: [] }}
+                        onFinish={async (values) => {
+                          await onSaveResearchNote(selectedRun.run_id, values);
+                          researchNoteForm.setFieldsValue({
+                            author: values.author,
+                            decision_status: values.decision_status ?? 'candidate',
+                            labels: values.labels ?? [],
+                            decision_reason: '',
+                            confidence_score: null,
+                            content: '',
+                          });
+                        }}
+                      >
+                        <Row gutter={[12, 12]}>
+                          <Col xs={24} md={8}>
+                            <Form.Item name="author" label="作者" rules={[{ required: true, whitespace: true, message: '请输入作者' }]}>
+                              <Input placeholder="local" />
+                            </Form.Item>
+                          </Col>
+                          <Col xs={24} md={16}>
+                            <Form.Item name="labels" label="标签">
+                              <Select
+                                mode="multiple"
+                                options={RESEARCH_LABEL_OPTIONS}
+                                placeholder="选择标签"
+                                optionFilterProp="label"
+                              />
+                            </Form.Item>
+                          </Col>
+                        </Row>
+                        <Row gutter={[12, 12]}>
+                          <Col xs={24} md={8}>
+                            <Form.Item name="decision_status" label="决策状态" rules={[{ required: true, message: '请选择决策状态' }]}>
+                              <Select options={DECISION_STATUS_OPTIONS} />
+                            </Form.Item>
+                          </Col>
+                          <Col xs={24} md={8}>
+                            <Form.Item name="confidence_score" label="置信度">
+                              <InputNumber min={0} max={100} precision={1} style={{ width: '100%' }} />
+                            </Form.Item>
+                          </Col>
+                          <Col xs={24} md={8}>
+                            <Form.Item name="decision_reason" label="状态原因">
+                              <Input />
+                            </Form.Item>
+                          </Col>
+                        </Row>
+                        <Form.Item
+                          name="content"
+                          label="研究备注"
+                          rules={[{ required: true, whitespace: true, message: '请输入备注内容' }]}
+                        >
+                          <Input.TextArea rows={3} placeholder="例如：样本外收益仍为正，可作为下一轮重点复核候选。" />
+                        </Form.Item>
+                        <Flex justify="flex-end">
+                          <Button type="primary" htmlType="submit" loading={savingResearchNote}>
+                            保存备注
+                          </Button>
+                        </Flex>
+                      </Form>
+                    </Col>
+                    <Col span={24}>
+                      <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                        {researchNotes.length ? researchNotes.map((note) => (
+                          <Card size="small" className="cbw-note-card" key={note.note_id}>
+                            <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                              <Flex justify="space-between" align="center" wrap="wrap" gap={8}>
+                                <Space wrap size={[8, 8]}>
+                                  <Text strong>{note.author}</Text>
+                                  <Text type="secondary">{formatDateTime(note.created_at)}</Text>
+                                </Space>
+                                <Space wrap size={[8, 8]}>
+                                  <Tag color={decisionStatusColor(note.decision_status)}>
+                                    {decisionStatusText(note.decision_status)}
+                                  </Tag>
+                                  {note.labels.map((label) => (
+                                    <Tag color={label === 'excluded' ? 'red' : label === 'baseline' ? 'gold' : 'blue'} key={`${note.note_id}-${label}`}>
+                                      {researchLabelText(label)}
+                                    </Tag>
+                                  ))}
+                                  <Popconfirm
+                                    title="删除这条研究备注？"
+                                    description="删除后，这条备注带来的标签和状态会一起移除。"
+                                    okText="删除"
+                                    cancelText="取消"
+                                    okButtonProps={{ danger: true, loading: deletingResearchNoteId === note.note_id }}
+                                    onConfirm={() => void onDeleteResearchNote(note)}
+                                  >
+                                    <Button size="small" danger loading={deletingResearchNoteId === note.note_id}>
+                                      删除
+                                    </Button>
+                                  </Popconfirm>
+                                </Space>
+                              </Flex>
+                              {note.decision_reason ? <Text type="secondary">{note.decision_reason}</Text> : null}
+                              <Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>{note.content}</Paragraph>
+                            </Space>
+                          </Card>
+                        )) : (
+                          <Alert type="info" showIcon message="当前 run 还没有研究备注。" />
+                        )}
+                      </Space>
+                    </Col>
+                  </Row>
+                ),
+              }]}
+            />
+          </Space>
         </Card>
       </Col>
 
@@ -2697,7 +4465,7 @@ function AnalysisView({
               <Input
                 value={tradeReasonQuery}
                 onChange={(event) => setTradeReasonQuery(event.target.value)}
-                placeholder="搜索交易ID / 原因 / 标的"
+                placeholder="搜索原因 / 标的 / ID"
                 style={{ width: 220 }}
               />
             </Space>
@@ -2729,10 +4497,14 @@ function ParametersView({
   datasets,
   rows,
   allRows,
+  parameterResearch,
+  researchWorkflow,
   researchNotes,
   manualLabelsByRunId,
   fastRows,
   slowRows,
+  parameterLabLoaded,
+  onEnsureParameterLab,
   batches,
   selectedBatchId,
   setSelectedBatchId,
@@ -2748,22 +4520,37 @@ function ParametersView({
   setParameterQuery,
   experimentForm,
   submitting,
+  neighborhoodRunId,
   onSubmitExperiment,
+  onRunTrendNeighborhood,
+  onRunRiskMatrix,
+  onRunFilterExperiment,
+  riskMatrixCandidateId,
+  riskMatrixProgressByCandidateId,
+  filterExperimentCandidateId,
+  filterExperimentProgressByCandidateId,
+  onLoadParameterRows,
   onOpenRun,
   onDeleteRun,
   onDeleteExperiment,
   onDeleteBatch,
   onSaveResearchNote,
   savingResearchNote,
+  onResearchWorkflowOptimisticChange,
+  onRefreshResearchWorkflow,
   onRefreshExperiments,
 }: {
   datasets: DatasetSnapshotView[];
   rows: ParameterLabRow[];
   allRows: ParameterLabRow[];
+  parameterResearch: ParameterResearchWorkspace | null;
+  researchWorkflow: ResearchWorkflow | null;
   researchNotes: ResearchNote[];
   manualLabelsByRunId: Map<string, string[]>;
   fastRows: SensitivityRow[];
   slowRows: SensitivityRow[];
+  parameterLabLoaded: boolean;
+  onEnsureParameterLab: () => Promise<void>;
   batches: ParameterExperimentBatchSummary[];
   selectedBatchId: string;
   setSelectedBatchId: (value: string) => void;
@@ -2779,18 +4566,32 @@ function ParametersView({
   setParameterQuery: (value: string) => void;
   experimentForm: ReturnType<typeof Form.useForm>[0];
   submitting: 'ingest' | 'run' | 'experiment' | null;
+  neighborhoodRunId: string | null;
   onSubmitExperiment: (values: Record<string, unknown>) => Promise<void>;
+  onRunTrendNeighborhood: (row: ParameterLabRow) => Promise<void>;
+  onRunRiskMatrix: (candidate: ResearchCandidateView) => Promise<void>;
+  onRunFilterExperiment: (candidate: ResearchCandidateView, mode?: FilterExperimentMode) => Promise<void>;
+  riskMatrixCandidateId: string | null;
+  riskMatrixProgressByCandidateId: Record<string, RiskMatrixProgress>;
+  filterExperimentCandidateId: string | null;
+  filterExperimentProgressByCandidateId: Record<string, FilterExperimentProgress>;
+  onLoadParameterRows: () => Promise<ParameterLabRow[]>;
   onOpenRun: (runId: string) => void;
   onDeleteRun: (runId: string) => Promise<void>;
   onDeleteExperiment: (experimentId: string) => Promise<void>;
   onDeleteBatch: (batchId: string) => Promise<void>;
   onSaveResearchNote: (targetType: string, targetId: string, values: Record<string, unknown>) => Promise<void>;
   savingResearchNote: boolean;
+  onResearchWorkflowOptimisticChange: (updater: (current: ResearchWorkflow | null) => ResearchWorkflow | null) => void;
+  onRefreshResearchWorkflow: () => Promise<void>;
   onRefreshExperiments: () => Promise<void>;
   }) {
+  const { message } = AntdApp.useApp();
   const experimentSearchType = Form.useWatch('search_type', experimentForm) as string | undefined;
+  const experimentStrategyName = (Form.useWatch('strategy_name', experimentForm) as string | undefined) ?? 'ema_crossover';
   const validationSplitMode = Form.useWatch('validation_split_mode', experimentForm) as string | undefined;
-  const [workspaceMode, setWorkspaceMode] = useState<'batch' | 'experiment' | 'decisions' | 'sensitivity'>('batch');
+  const initialScreeningViewState = useMemo(() => loadScreeningViewState(), []);
+  const [workspaceMode, setWorkspaceMode] = useState<ParameterWorkspaceMode>('screening');
   const [runManualLabelFilter, setRunManualLabelFilter] = useState<string[]>([]);
   const [groupDecisionLabelFilter, setGroupDecisionLabelFilter] = useState<string[]>([]);
   const [batchDecisionLabelFilter, setBatchDecisionLabelFilter] = useState<string[]>([]);
@@ -2801,15 +4602,79 @@ function ParametersView({
   const [decisionLedgerTargetTypeFilter, setDecisionLedgerTargetTypeFilter] = useState<string[]>([]);
   const [decisionLedgerBatchFilter, setDecisionLedgerBatchFilter] = useState<string | null>(null);
   const [decisionLedgerParameterGroupFilter, setDecisionLedgerParameterGroupFilter] = useState<string | null>(null);
-  const [showExperimentForm, setShowExperimentForm] = useState(false);
   const [autoLabelFilter, setAutoLabelFilter] = useState<string[]>([]);
   const [minScoreFilter, setMinScoreFilter] = useState<number | null>(null);
   const [minConfidenceFilter, setMinConfidenceFilter] = useState<number | null>(null);
   const [maxDrawdownFilter, setMaxDrawdownFilter] = useState<number | null>(null);
   const [minReturnDrawdownFilter, setMinReturnDrawdownFilter] = useState<number | null>(null);
   const [topNFilter, setTopNFilter] = useState<number | null>(null);
+  const [screeningLabelFilter, setScreeningLabelFilter] = useState<string[]>(initialScreeningViewState.labelFilter);
+  const [screeningStrategyFilter, setScreeningStrategyFilter] = useState<string | null>(initialScreeningViewState.strategyFilter);
+  const [screeningSymbolFilter, setScreeningSymbolFilter] = useState<string | null>(initialScreeningViewState.symbolFilter);
+  const [screeningMinScoreFilter, setScreeningMinScoreFilter] = useState<number | null>(initialScreeningViewState.minScoreFilter);
+  const [screeningMinOosReturnFilter, setScreeningMinOosReturnFilter] = useState<number | null>(initialScreeningViewState.minOosReturnFilter);
+  const [screeningMinIsExcessReturnFilter, setScreeningMinIsExcessReturnFilter] = useState<number | null>(initialScreeningViewState.minIsExcessReturnFilter);
+  const [screeningMaxGapFilter, setScreeningMaxGapFilter] = useState<number | null>(initialScreeningViewState.maxGapFilter);
+  const [screeningMaxDrawdownFilter, setScreeningMaxDrawdownFilter] = useState<number | null>(initialScreeningViewState.maxDrawdownFilter);
+  const [screeningMinProfitFactorFilter, setScreeningMinProfitFactorFilter] = useState<number | null>(initialScreeningViewState.minProfitFactorFilter);
+  const [screeningMinTradeCountFilter, setScreeningMinTradeCountFilter] = useState<number | null>(initialScreeningViewState.minTradeCountFilter);
+  const [screeningSorting, setScreeningSorting] = useState<SortingState>(initialScreeningViewState.sorting);
+  const [experimentMinResearchScoreFilter, setExperimentMinResearchScoreFilter] = useState<number | null>(null);
+  const [experimentMinOosReturnFilter, setExperimentMinOosReturnFilter] = useState<number | null>(null);
+  const [experimentMinTotalReturnFilter, setExperimentMinTotalReturnFilter] = useState<number | null>(null);
+  const [experimentMinProfitFactorFilter, setExperimentMinProfitFactorFilter] = useState<number | null>(null);
+  const [experimentMaxDrawdownFilter, setExperimentMaxDrawdownFilter] = useState<number | null>(null);
+  const [experimentMinTradeCountFilter, setExperimentMinTradeCountFilter] = useState<number | null>(null);
+  const [selectedResearchSubjectKey, setSelectedResearchSubjectKey] = useState<string | null>(null);
+  const [researchClassificationFilter, setResearchClassificationFilter] = useState<string[]>([]);
+  const [researchQtyPolicyFilter, setResearchQtyPolicyFilter] = useState<string | null>(null);
+  const [selectedParameterGroupKey, setSelectedParameterGroupKey] = useState<string | null>(null);
+  const [selectedParameterGroupDetail, setSelectedParameterGroupDetail] = useState<ParameterGroupDetail | null>(null);
+  const [parameterGroupDetailLoading, setParameterGroupDetailLoading] = useState(false);
+  const [riskCompareGroupKey, setRiskCompareGroupKey] = useState<string | null>(null);
+  const [filterResultsCandidateId, setFilterResultsCandidateId] = useState<string | null>(null);
+  const [filterResults, setFilterResults] = useState<ResearchCandidateFilterResults | null>(null);
+  const [filterResultsLoading, setFilterResultsLoading] = useState(false);
+  const [tradeAttributionCandidateId, setTradeAttributionCandidateId] = useState<string | null>(null);
+  const [tradeAttribution, setTradeAttribution] = useState<TradeAttributionView | null>(null);
+  const [tradeAttributionLoading, setTradeAttributionLoading] = useState(false);
   const [decisionTarget, setDecisionTarget] = useState<{ targetType: string; targetId: string; title: string } | null>(null);
+  const [neighborhoodSourceRunId, setNeighborhoodSourceRunId] = useState<string | null>(null);
   const [decisionForm] = Form.useForm();
+  useEffect(() => {
+    const state: ScreeningViewState = {
+      labelFilter: screeningLabelFilter,
+      strategyFilter: screeningStrategyFilter,
+      symbolFilter: screeningSymbolFilter,
+      minScoreFilter: screeningMinScoreFilter,
+      minOosReturnFilter: screeningMinOosReturnFilter,
+      minIsExcessReturnFilter: screeningMinIsExcessReturnFilter,
+      maxGapFilter: screeningMaxGapFilter,
+      maxDrawdownFilter: screeningMaxDrawdownFilter,
+      minProfitFactorFilter: screeningMinProfitFactorFilter,
+      minTradeCountFilter: screeningMinTradeCountFilter,
+      sorting: screeningSorting,
+    };
+    window.localStorage.setItem(SCREENING_VIEW_STATE_STORAGE_KEY, JSON.stringify(state));
+  }, [
+    screeningLabelFilter,
+    screeningMaxDrawdownFilter,
+    screeningMaxGapFilter,
+    screeningMinOosReturnFilter,
+    screeningMinIsExcessReturnFilter,
+    screeningMinProfitFactorFilter,
+    screeningMinScoreFilter,
+    screeningMinTradeCountFilter,
+    screeningSorting,
+    screeningStrategyFilter,
+    screeningSymbolFilter,
+  ]);
+  useEffect(() => {
+    if (workspaceMode === 'launch' || workspaceMode === 'screening' || workspaceMode === 'research' || workspaceMode === 'stable' || parameterLabLoaded) {
+      return;
+    }
+    void onEnsureParameterLab();
+  }, [onEnsureParameterLab, parameterLabLoaded, workspaceMode]);
   const datasetOptions = useMemo(
     () => datasets.map((snapshot) => ({
       label: `${snapshot.dataset_snapshot_id} · ${snapshot.symbol} · ${snapshot.timeframe.toUpperCase()}`,
@@ -2822,11 +4687,11 @@ function ParametersView({
     if (!experimentForm.getFieldValue('snapshot_ids') && datasets[0]?.dataset_snapshot_id) {
       experimentForm.setFieldValue('snapshot_ids', [datasets[0].dataset_snapshot_id]);
     }
-    if (!experimentForm.getFieldValue('batch_id')) {
-      experimentForm.setFieldValue('batch_id', `batch-${dayjs().format('YYYYMMDDHHmmss')}`);
-    }
     if (!experimentForm.getFieldValue('search_type')) {
       experimentForm.setFieldValue('search_type', 'grid');
+    }
+    if (!experimentForm.getFieldValue('strategy_name')) {
+      experimentForm.setFieldValue('strategy_name', 'ema_crossover');
     }
     if (!experimentForm.getFieldValue('validation_split_mode')) {
       experimentForm.setFieldValue('validation_split_mode', 'auto_ratio');
@@ -2843,8 +4708,29 @@ function ParametersView({
     if (!experimentForm.getFieldValue('slow_periods')) {
       experimentForm.setFieldValue('slow_periods', '13,21,34');
     }
+    if (!experimentForm.getFieldValue('trend_fast_periods')) {
+      experimentForm.setFieldValue('trend_fast_periods', '2,3,5,8');
+    }
+    if (!experimentForm.getFieldValue('trend_slow_periods')) {
+      experimentForm.setFieldValue('trend_slow_periods', '13,21,34');
+    }
+    if (!experimentForm.getFieldValue('atr_entry_tolerances')) {
+      experimentForm.setFieldValue('atr_entry_tolerances', '0.5,1.0');
+    }
+    if (!experimentForm.getFieldValue('atr_stop_mults')) {
+      experimentForm.setFieldValue('atr_stop_mults', '1.5,2.0');
+    }
+    if (!experimentForm.getFieldValue('risk_reward_ratios')) {
+      experimentForm.setFieldValue('risk_reward_ratios', '1.5,2.0');
+    }
     if (experimentForm.getFieldValue('cash_allocation_pct') === undefined) {
-      experimentForm.setFieldValue('cash_allocation_pct', 100);
+      experimentForm.setFieldValue('cash_allocation_pct', 95);
+    }
+    if (experimentForm.getFieldValue('risk_pct_per_trade') === undefined) {
+      experimentForm.setFieldValue('risk_pct_per_trade', 0.01);
+    }
+    if (!experimentForm.getFieldValue('qty_policy_ref')) {
+      experimentForm.setFieldValue('qty_policy_ref', 'percent_of_cash');
     }
     if (experimentForm.getFieldValue('initial_cash') === undefined) {
       experimentForm.setFieldValue('initial_cash', 10000);
@@ -2885,6 +4771,231 @@ function ParametersView({
       : batches.find((batch) => batch.batch_id === selectedBatchId) ?? null),
     [batches, selectedBatchId],
   );
+  const recentBatches = useMemo(
+    () => [...batches]
+      .sort((left, right) => dayjs(right.created_at).valueOf() - dayjs(left.created_at).valueOf())
+      .slice(0, 5),
+    [batches],
+  );
+  const researchSubjects = parameterResearch?.subjects ?? [];
+  const researchParameterGroups = parameterResearch?.parameter_groups ?? [];
+  const screeningPoolRuns = researchWorkflow?.screening_pool.runs ?? [];
+  const researchPoolCandidates = researchWorkflow?.research_pool.candidates ?? [];
+  const stablePoolCandidates = researchWorkflow?.stable_pool.candidates ?? [];
+  const screeningLabelOptions = useMemo(
+    () => Array.from(new Set(screeningPoolRuns.flatMap((run) => [...run.auto_labels, ...run.manual_labels]))).sort(),
+    [screeningPoolRuns],
+  );
+  const screeningStrategyOptions = useMemo(
+    () => Array.from(new Set(screeningPoolRuns.map((run) => run.strategy_name))).sort(),
+    [screeningPoolRuns],
+  );
+  const screeningSymbolOptions = useMemo(
+    () => Array.from(new Set(screeningPoolRuns.map((run) => run.symbol))).sort(),
+    [screeningPoolRuns],
+  );
+
+  useEffect(() => {
+    if (!researchSubjects.length) {
+      if (selectedResearchSubjectKey !== null) {
+        setSelectedResearchSubjectKey(null);
+      }
+      return;
+    }
+    if (!selectedResearchSubjectKey || !researchSubjects.some((subject) => subject.subject_key === selectedResearchSubjectKey)) {
+      setSelectedResearchSubjectKey(researchSubjects[0].subject_key);
+    }
+  }, [researchSubjects, selectedResearchSubjectKey]);
+
+  const selectedResearchSubject = useMemo(
+    () => researchSubjects.find((subject) => subject.subject_key === selectedResearchSubjectKey) ?? null,
+    [researchSubjects, selectedResearchSubjectKey],
+  );
+  const filteredResearchGroups = useMemo(() => {
+    const query = parameterQuery.trim().toLowerCase();
+    return researchParameterGroups
+      .filter((group) => (
+        (!selectedResearchSubjectKey || group.subject_key === selectedResearchSubjectKey)
+        && (!researchClassificationFilter.length || researchClassificationFilter.includes(group.classification))
+        && (!researchQtyPolicyFilter || group.qty_policy_ref === researchQtyPolicyFilter)
+        && (!query || [
+          group.group_key,
+          group.parameter_summary,
+          group.strategy_name,
+          group.symbol,
+          group.timeframe,
+          group.classification,
+        ].join(' ').toLowerCase().includes(query))
+      ))
+      .sort((left, right) => {
+        if (right.research_score !== left.research_score) {
+          return right.research_score - left.research_score;
+        }
+        return (right.avg_oos_total_return ?? -10000) - (left.avg_oos_total_return ?? -10000);
+      });
+  }, [parameterQuery, researchClassificationFilter, researchParameterGroups, researchQtyPolicyFilter, selectedResearchSubjectKey]);
+  const filteredScreeningRuns = useMemo(() => {
+    const query = parameterQuery.trim().toLowerCase();
+    return screeningPoolRuns.filter((run) => (
+      (!query || [
+        run.run_id,
+        run.dataset_snapshot_id,
+        run.symbol,
+        run.strategy_name,
+        run.timeframe,
+        run.parameter_summary,
+        ...run.auto_labels,
+        ...run.manual_labels,
+      ].join(' ').toLowerCase().includes(query))
+      && run.pool_status !== 'excluded'
+      && run.pool_status !== 'research_pool'
+      && run.pool_status !== 'stable_pool'
+      && (!screeningLabelFilter.length || screeningLabelFilter.every((label) => [...run.auto_labels, ...run.manual_labels].includes(label)))
+      && (!screeningStrategyFilter || run.strategy_name === screeningStrategyFilter)
+      && (!screeningSymbolFilter || run.symbol === screeningSymbolFilter)
+      && (screeningMinScoreFilter === null || run.score >= screeningMinScoreFilter)
+      && (screeningMinOosReturnFilter === null || (run.oos_total_return !== null && run.oos_total_return >= screeningMinOosReturnFilter / 100))
+      && (screeningMinIsExcessReturnFilter === null || (run.is_excess_return !== null && run.is_excess_return >= screeningMinIsExcessReturnFilter / 100))
+      && (screeningMaxGapFilter === null || (run.is_oos_gap !== null && Math.abs(run.is_oos_gap) <= screeningMaxGapFilter / 100))
+      && (screeningMaxDrawdownFilter === null || Math.abs(run.max_drawdown) <= screeningMaxDrawdownFilter / 100)
+      && (screeningMinProfitFactorFilter === null || (run.profit_factor !== null && run.profit_factor >= screeningMinProfitFactorFilter))
+      && (screeningMinTradeCountFilter === null || run.trade_count >= screeningMinTradeCountFilter)
+    ));
+  }, [
+    parameterQuery,
+    screeningLabelFilter,
+    screeningMaxDrawdownFilter,
+    screeningMaxGapFilter,
+    screeningMinOosReturnFilter,
+    screeningMinIsExcessReturnFilter,
+    screeningMinProfitFactorFilter,
+    screeningMinScoreFilter,
+    screeningMinTradeCountFilter,
+    screeningPoolRuns,
+    screeningStrategyFilter,
+    screeningSymbolFilter,
+  ]);
+  const screeningRiskProfile = useMemo(
+    () => buildScreeningRiskProfile(screeningPoolRuns.filter((run) => run.pool_status !== 'excluded')),
+    [screeningPoolRuns],
+  );
+  const filteredResearchPoolCandidates = useMemo(() => {
+    const query = parameterQuery.trim().toLowerCase();
+    return researchPoolCandidates.filter((candidate) => (
+      !query || [
+        candidate.candidate_id,
+        candidate.strategy_name,
+        candidate.symbol,
+        candidate.timeframe,
+        candidate.status,
+        candidate.recommendation,
+      ].join(' ').toLowerCase().includes(query)
+    ));
+  }, [parameterQuery, researchPoolCandidates]);
+  const filteredStablePoolCandidates = useMemo(() => {
+    const query = parameterQuery.trim().toLowerCase();
+    return stablePoolCandidates.filter((candidate) => (
+      !query || [
+        candidate.stable_candidate_id,
+        candidate.strategy_name,
+        candidate.symbol,
+        candidate.timeframe,
+        candidate.status,
+        candidate.final_recommendation,
+      ].join(' ').toLowerCase().includes(query)
+    ));
+  }, [parameterQuery, stablePoolCandidates]);
+  const researchGroupCommonKeys = useMemo(
+    () => commonParameterPointKeys(filteredResearchGroups),
+    [filteredResearchGroups],
+  );
+  const researchGroupCommonPoints = useMemo(() => {
+    if (!filteredResearchGroups.length) {
+      return [];
+    }
+    return parameterGroupPoints(filteredResearchGroups[0])
+      .filter((point) => researchGroupCommonKeys.has(point.key));
+  }, [filteredResearchGroups, researchGroupCommonKeys]);
+  const researchGroupTitle = useMemo(() => {
+    if (!selectedResearchSubject) {
+      return {
+        title: '参数组排行榜',
+        common: '共同条件：--',
+      };
+    }
+    const base = [
+      selectedResearchSubject.strategy_name,
+      selectedResearchSubject.symbol,
+      selectedResearchSubject.timeframe.toUpperCase(),
+      selectedResearchSubject.validation_split_id,
+    ].join(' · ');
+    const common = researchGroupCommonPoints.length
+      ? researchGroupCommonPoints.map((point) => `${point.label}${point.value}`).join(' · ')
+      : '无共同固定参数';
+    return {
+      title: `参数组排行榜 · ${base}`,
+      common: `共同条件：${common}`,
+    };
+  }, [researchGroupCommonPoints, selectedResearchSubject]);
+  const recommendedResearchGroups = useMemo(() => {
+    return filteredResearchGroups
+      .filter((group) => (
+        group.classification !== 'excluded'
+        && (group.avg_oos_total_return ?? -1) > 0
+        && (group.oos_positive_ratio ?? 0) >= 0.6
+        && group.min_trade_count >= 200
+        && (group.avg_profit_factor ?? 0) >= 1.05
+        && group.worst_max_drawdown <= 0.5
+        && (group.neighbor_stability_score ?? 0) >= 0.5
+      ))
+      .sort((left, right) => {
+        if (right.research_score !== left.research_score) {
+          return right.research_score - left.research_score;
+        }
+        const leftEfficiency = (left.avg_oos_total_return ?? left.avg_total_return) / Math.max(left.worst_max_drawdown, 0.01);
+        const rightEfficiency = (right.avg_oos_total_return ?? right.avg_total_return) / Math.max(right.worst_max_drawdown, 0.01);
+        if (rightEfficiency !== leftEfficiency) {
+          return rightEfficiency - leftEfficiency;
+        }
+        if ((left.avg_gap ?? Number.POSITIVE_INFINITY) !== (right.avg_gap ?? Number.POSITIVE_INFINITY)) {
+          return (left.avg_gap ?? Number.POSITIVE_INFINITY) - (right.avg_gap ?? Number.POSITIVE_INFINITY);
+        }
+        return (right.avg_profit_factor ?? 0) - (left.avg_profit_factor ?? 0);
+      })
+      .slice(0, 3);
+  }, [filteredResearchGroups]);
+  const researchConclusionBuckets = useMemo(
+    () => buildResearchConclusionBuckets(researchParameterGroups),
+    [researchParameterGroups],
+  );
+  const riskCompareSourceGroup = useMemo(
+    () => researchParameterGroups.find((group) => group.group_key === riskCompareGroupKey) ?? null,
+    [researchParameterGroups, riskCompareGroupKey],
+  );
+  const riskCompareGroups = useMemo(() => {
+    if (!riskCompareSourceGroup) {
+      return [];
+    }
+    const compareKey = parameterGroupEntryCompareKey(riskCompareSourceGroup);
+    return researchParameterGroups
+      .filter((group) => parameterGroupEntryCompareKey(group) === compareKey)
+      .sort((left, right) => {
+        const leftScore = (left.avg_oos_total_return ?? left.avg_total_return) / Math.max(left.worst_max_drawdown, 0.01);
+        const rightScore = (right.avg_oos_total_return ?? right.avg_total_return) / Math.max(right.worst_max_drawdown, 0.01);
+        if (rightScore !== leftScore) {
+          return rightScore - leftScore;
+        }
+        return (right.avg_oos_total_return ?? -10_000) - (left.avg_oos_total_return ?? -10_000);
+      });
+  }, [researchParameterGroups, riskCompareSourceGroup]);
+  const riskCompareEntryText = useMemo(() => {
+    if (!riskCompareSourceGroup) {
+      return '--';
+    }
+    return parameterGroupEntryPoints(riskCompareSourceGroup)
+      .map((point) => `${point.label}${point.value}`)
+      .join(' · ');
+  }, [riskCompareSourceGroup]);
 
   useEffect(() => {
     if (selectedExperimentId === ALL_EXPERIMENTS) {
@@ -2894,6 +5005,98 @@ function ParametersView({
       setSelectedExperimentId(ALL_EXPERIMENTS);
     }
   }, [selectedExperimentId, setSelectedExperimentId, visibleExperiments]);
+  useEffect(() => {
+    if (!selectedParameterGroupKey) {
+      setSelectedParameterGroupDetail(null);
+      return;
+    }
+    let cancelled = false;
+    setParameterGroupDetailLoading(true);
+    void loadParameterGroupDetail(selectedParameterGroupKey)
+      .then((payload) => {
+        if (cancelled) {
+          return;
+        }
+        setSelectedParameterGroupDetail(payload.parameter_group);
+      })
+      .catch((loadError: unknown) => {
+        if (!cancelled) {
+          message.error(loadError instanceof Error ? loadError.message : '参数组详情加载失败');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setParameterGroupDetailLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [message, selectedParameterGroupKey]);
+  useEffect(() => {
+    if (!filterResultsCandidateId) {
+      setFilterResults(null);
+      return;
+    }
+    let cancelled = false;
+    setFilterResultsLoading(true);
+    void loadResearchCandidateFilterResults(filterResultsCandidateId)
+      .then((payload) => {
+        if (cancelled) {
+          return;
+        }
+        setFilterResults(payload.filter_results);
+      })
+      .catch((loadError: unknown) => {
+        if (!cancelled) {
+          const localResults = buildLocalResearchCandidateFilterResults(
+            filterResultsCandidateId,
+            researchParameterGroups,
+            allRows,
+          );
+          if (localResults) {
+            setFilterResults(localResults);
+            return;
+          }
+          message.error(loadError instanceof Error ? loadError.message : '过滤结果加载失败');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setFilterResultsLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [allRows, filterResultsCandidateId, message, researchParameterGroups]);
+  useEffect(() => {
+    if (!tradeAttributionCandidateId) {
+      setTradeAttribution(null);
+      return;
+    }
+    let cancelled = false;
+    setTradeAttributionLoading(true);
+    void loadResearchCandidateTradeAttribution(tradeAttributionCandidateId)
+      .then((payload) => {
+        if (!cancelled) {
+          setTradeAttribution(payload.trade_attribution);
+        }
+      })
+      .catch((loadError: unknown) => {
+        if (!cancelled) {
+          message.error(loadError instanceof Error ? loadError.message : '交易归因加载失败');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setTradeAttributionLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [message, tradeAttributionCandidateId]);
   useEffect(() => {
     if (selectedBatchId !== ALL_BATCHES) {
       return;
@@ -2923,6 +5126,17 @@ function ParametersView({
       setTopNFilter(null);
     }
   }, [autoLabelFilter.length, groupDecisionLabelFilter.length, groupDecisionStatusFilter.length, maxDrawdownFilter, minConfidenceFilter, minReturnDrawdownFilter, minScoreFilter, selectedBatchId, topNFilter]);
+  useEffect(() => {
+    if (selectedBatchId === ALL_BATCHES) {
+      return;
+    }
+    if (batchDecisionLabelFilter.length) {
+      setBatchDecisionLabelFilter([]);
+    }
+    if (batchDecisionStatusFilter.length) {
+      setBatchDecisionStatusFilter([]);
+    }
+  }, [batchDecisionLabelFilter.length, batchDecisionStatusFilter.length, selectedBatchId]);
   const selectedBatchRows = useMemo(() => {
     if (selectedBatchId === ALL_BATCHES) {
       return rows;
@@ -3049,9 +5263,9 @@ function ParametersView({
     () => Array.from(new Set(Array.from(batchDecisionNotesByBatchId.values()).flatMap((notes) => notes.flatMap((note) => note.labels ?? [])))),
     [batchDecisionNotesByBatchId],
   );
-  const availableBatchDecisionStatuses = useMemo(
-    () => Array.from(new Set(Array.from(batchDecisionNotesByBatchId.values()).flatMap((notes) => notes.map((note) => note.decision_status ?? 'candidate')))),
-    [batchDecisionNotesByBatchId],
+  const availableBatchStatuses = useMemo(
+    () => Array.from(new Set(batches.map((batch) => batch.status).filter(Boolean))),
+    [batches],
   );
   const filteredBatches = useMemo(() => {
     if (!batchDecisionLabelFilter.length && !batchDecisionStatusFilter.length) {
@@ -3060,10 +5274,9 @@ function ParametersView({
     return batches.filter((batch) => {
       const notes = batchDecisionNotesByBatchId.get(batch.batch_id) ?? [];
       const labels = Array.from(new Set(notes.flatMap((note) => note.labels ?? [])));
-      const statuses = Array.from(new Set(notes.map((note) => note.decision_status ?? 'candidate')));
       return (
         (!batchDecisionLabelFilter.length || batchDecisionLabelFilter.some((label) => labels.includes(label)))
-        && (!batchDecisionStatusFilter.length || batchDecisionStatusFilter.some((status) => statuses.includes(status)))
+        && (!batchDecisionStatusFilter.length || batchDecisionStatusFilter.includes(batch.status))
       );
     });
   }, [batchDecisionLabelFilter, batchDecisionNotesByBatchId, batchDecisionStatusFilter, batches]);
@@ -3075,14 +5288,13 @@ function ParametersView({
       setSelectedBatchId(ALL_BATCHES);
     }
   }, [batchDecisionLabelFilter.length, batchDecisionStatusFilter.length, filteredBatches, selectedBatchId, setSelectedBatchId]);
-  const autoLabelFilterDisabled = selectedBatchId === ALL_BATCHES;
   const batchGroupLabelsByKey = useMemo(() => {
     const labelMap = new Map<string, AutoLabelInfo[]>();
     if (!selectedBatchDetail) {
       return labelMap;
     }
     const applyLabel = (
-      groups: Array<{ fast_period: number | null; slow_period: number | null; leverage: number | null; reason: string }>,
+      groups: Array<{ strategy_name?: string; parameter_summary?: string; signal_filter_summary?: string | null; fast_period?: number | null; slow_period?: number | null; leverage?: number | null; reason: string }>,
       label: string,
     ) => {
       for (const group of groups) {
@@ -3151,12 +5363,8 @@ function ParametersView({
     return statusMap;
   }, [latestBatchGroupDecisionStatusByKey, selectedBatchDetail]);
   const availableGroupDecisionLabels = useMemo(
-    () => Array.from(new Set(Array.from(batchGroupResearchNotesByKey.values()).flatMap((notes) => notes.flatMap((note) => note.labels ?? [])))),
-    [batchGroupResearchNotesByKey],
-  );
-  const availableGroupDecisionStatuses = useMemo(
-    () => Array.from(new Set(Array.from(batchGroupResearchNotesByKey.values()).flatMap((notes) => notes.map((note) => note.decision_status ?? 'candidate')))),
-    [batchGroupResearchNotesByKey],
+    () => RESEARCH_LABEL_OPTIONS.map((option) => option.value),
+    [],
   );
   const activeManualDecisionGroups = useMemo(() => {
     const groups = (selectedBatchDetail?.parameter_groups ?? []).filter((group) => {
@@ -3241,7 +5449,9 @@ function ParametersView({
     const autoLabels = (batchGroupLabelsByKey.get(groupKey) ?? []).map((item) => item.label);
     const manualNotes = batchGroupResearchNotesByKey.get(groupKey) ?? [];
     const manualLabels = Array.from(new Set(manualNotes.flatMap((note) => note.labels ?? [])));
-    const manualStatuses = Array.from(new Set(manualNotes.map((note) => note.decision_status ?? 'candidate')));
+    const manualStatuses = manualNotes.length
+      ? Array.from(new Set(manualNotes.map((note) => note.decision_status ?? 'candidate')))
+      : ['candidate'];
     if (autoLabelFilter.length && !autoLabelFilter.some((label) => autoLabels.includes(label))) {
       return false;
     }
@@ -3263,6 +5473,26 @@ function ParametersView({
     }
     const latestStatus = latestBatchGroupDecisionStatusByKey.get(buildParameterGroupKey(group));
     return !isInactiveDecisionStatus(latestStatus);
+  }
+
+  async function addRunToResearchPool(run: ScreeningRunView | ParameterLabRow) {
+    await postResearchPool({
+      source_run_id: run.run_id,
+      note: `加入研究池：${run.parameter_summary}`,
+    });
+    onResearchWorkflowOptimisticChange((current) => markRunAddedToResearchPool(current, run));
+    void onRefreshResearchWorkflow();
+    message.success('已加入研究池');
+  }
+
+  async function addCandidateToStablePool(candidate: ResearchCandidateView) {
+    await postStablePool({
+      research_candidate_id: candidate.candidate_id,
+      chosen_run_id: candidate.representative_run_id,
+      decision_reason: candidate.recommendation,
+    });
+    await onRefreshResearchWorkflow();
+    message.success('已加入稳定池');
   }
 
   const filteredBatchParameterGroups = useMemo(() => {
@@ -3296,12 +5526,816 @@ function ParametersView({
     )),
     [batchManualLabelsByRunId, filteredBatchGroupRunIds, hasBatchGroupFilters, selectedBatchRows, autoLabelsByRunId, manualLabelsByRunId, selectedBatchGroupMetricsByRunId, minScoreFilter, minConfidenceFilter],
   );
+  const recommendedResearchRuns = useMemo<ResearchRunCandidate[]>(() => {
+    if (selectedBatchId === ALL_BATCHES) {
+      return [];
+    }
+    const candidates = filteredBatchRunRows
+      .filter((row) => row.oos_total_return !== null || row.total_return > 0)
+      .map((row) => scoreResearchRun(row))
+      .sort((left, right) => {
+        if (right.score !== left.score) {
+          return right.score - left.score;
+        }
+        return (right.row.oos_total_return ?? right.row.total_return) - (left.row.oos_total_return ?? left.row.total_return);
+      });
+    const selected: ResearchRunCandidate[] = [];
+    const seenCategories = new Set<string>();
+    const categoryFor = (candidate: ResearchRunCandidate) => {
+      if (candidate.tags.includes('Gap 小') && (candidate.row.oos_total_return ?? 0) > 0) {
+        return 'consistent';
+      }
+      if ((candidate.row.oos_total_return ?? 0) >= 1) {
+        return 'oos';
+      }
+      if (candidate.tags.includes('PF 高')) {
+        return 'quality';
+      }
+      return 'general';
+    };
+    for (const candidate of candidates) {
+      const category = categoryFor(candidate);
+      if (!seenCategories.has(category) || selected.length >= 3) {
+        selected.push(candidate);
+        seenCategories.add(category);
+      }
+      if (selected.length >= 8) {
+        break;
+      }
+    }
+    return selected;
+  }, [filteredBatchRunRows, selectedBatchId]);
+  const neighborhoodSourceRun = useMemo(
+    () => allRows.find((row) => row.run_id === neighborhoodSourceRunId) ?? null,
+    [allRows, neighborhoodSourceRunId],
+  );
+  const trendNeighborhoodMatches = useMemo(
+    () => buildTrendNeighborhoodMatches(neighborhoodSourceRun, allRows),
+    [allRows, neighborhoodSourceRun],
+  );
+  const trendNeighborhoodStats = useMemo(
+    () => buildNeighborhoodStabilityStats(trendNeighborhoodMatches),
+    [trendNeighborhoodMatches],
+  );
   const filteredExperimentRunRows = useMemo(
     () => selectedExperimentRows.filter((row) => (
       matchesRunLabelFilters(row.run_id, { applyAutoLabelFilters: false, applyBatchScoreFilters: false })
+      && (experimentMinResearchScoreFilter === null || scoreResearchRun(row).score >= experimentMinResearchScoreFilter)
+      && (experimentMinOosReturnFilter === null || (row.oos_total_return ?? Number.NEGATIVE_INFINITY) >= experimentMinOosReturnFilter / 100)
+      && (experimentMinTotalReturnFilter === null || row.total_return >= experimentMinTotalReturnFilter / 100)
+      && (experimentMinProfitFactorFilter === null || (row.profit_factor ?? Number.NEGATIVE_INFINITY) >= experimentMinProfitFactorFilter)
+      && (experimentMaxDrawdownFilter === null || row.max_drawdown <= experimentMaxDrawdownFilter / 100)
+      && (experimentMinTradeCountFilter === null || row.trade_count >= experimentMinTradeCountFilter)
     )),
-    [runManualLabelFilter, selectedExperimentRows, autoLabelsByRunId, manualLabelsByRunId],
+    [
+      runManualLabelFilter,
+      selectedExperimentRows,
+      autoLabelsByRunId,
+      manualLabelsByRunId,
+      experimentMaxDrawdownFilter,
+      experimentMinOosReturnFilter,
+      experimentMinProfitFactorFilter,
+      experimentMinResearchScoreFilter,
+      experimentMinTotalReturnFilter,
+      experimentMinTradeCountFilter,
+    ],
   );
+  const activeTrackingNotes = useMemo(
+    () => researchNotes
+      .filter((note) => (
+        note.target_type === 'run'
+        && note.labels.includes('tracking')
+        && note.labels.includes('frozen_run')
+      ))
+      .sort((left, right) => dayjs(right.created_at).valueOf() - dayjs(left.created_at).valueOf()),
+    [researchNotes],
+  );
+  const trackedRunNotesByRunId = useMemo(() => {
+    const noteMap = new Map<string, ResearchNote>();
+    const seenRunIds = new Set<string>();
+    for (const note of activeTrackingNotes) {
+      if (seenRunIds.has(note.target_id)) {
+        continue;
+      }
+      seenRunIds.add(note.target_id);
+      if (note.decision_status !== 'rejected' && note.decision_status !== 'archived') {
+        noteMap.set(note.target_id, note);
+      }
+    }
+    return noteMap;
+  }, [activeTrackingNotes]);
+  const trackedRunRows = useMemo(
+    () => allRows.filter((row) => trackedRunNotesByRunId.has(row.run_id)),
+    [allRows, trackedRunNotesByRunId],
+  );
+  const filteredTrackedRunRows = useMemo(
+    () => trackedRunRows.filter((row) => matchesRunLabelFilters(row.run_id, { applyAutoLabelFilters: false, applyBatchScoreFilters: false })),
+    [trackedRunRows, runManualLabelFilter, manualLabelsByRunId],
+  );
+  const trackedMissingNotes = useMemo(
+    () => Array.from(trackedRunNotesByRunId.values()).filter((note) => !allRows.some((row) => row.run_id === note.target_id)),
+    [allRows, trackedRunNotesByRunId],
+  );
+  const freezeRunForTracking = useCallback(async (row: ParameterLabRow) => {
+    await onSaveResearchNote('run', row.run_id, buildFrozenRunNoteValues(row));
+  }, [onSaveResearchNote]);
+  const rowsByRunId = useMemo(
+    () => new Map(allRows.map((row) => [row.run_id, row] as const)),
+    [allRows],
+  );
+  const [runCompareIds, setRunCompareIds] = useState<string[]>([]);
+  const [runCompareOpen, setRunCompareOpen] = useState(false);
+  const runCompareRows = useMemo(
+    () => runCompareIds.map((runId) => rowsByRunId.get(runId)).filter((row): row is ParameterLabRow => Boolean(row)),
+    [rowsByRunId, runCompareIds],
+  );
+  const runCompareModel = useMemo(
+    () => (runCompareRows.length === 2 ? buildRunCompareModel(runCompareRows[0], runCompareRows[1]) : null),
+    [runCompareRows],
+  );
+  const addRunToCompare = useCallback(async (runId: string) => {
+    if (!rowsByRunId.has(runId)) {
+      const loadedRows = await onLoadParameterRows();
+      if (!loadedRows.some((row) => row.run_id === runId)) {
+        message.warning('没有找到这条 Run 的完整参数，可能对应结果还未落盘。');
+        return;
+      }
+    }
+    setRunCompareIds((current) => {
+      if (current.includes(runId)) {
+        message.info('这条 Run 已经在对比栏里。');
+        return current;
+      }
+      const next = current.length >= 2 ? [current[1], runId] : [...current, runId];
+      if (next.length === 2) {
+        setRunCompareOpen(true);
+      }
+      return next;
+    });
+  }, [message, onLoadParameterRows, rowsByRunId]);
+  const clearRunCompare = useCallback(() => {
+    setRunCompareIds([]);
+    setRunCompareOpen(false);
+  }, []);
+  const runCompareSelectionText = runCompareRows.length
+    ? runCompareRows.map((row, index) => `${index === 0 ? 'A' : 'B'}: ${shortRunId(row.run_id)}`).join(' / ')
+    : '';
+  const researchParameterGroupColumns = useMemo<ColumnDef<ParameterGroupView>[]>(() => [
+    {
+      id: 'parameter_summary',
+      header: '组合内容',
+      size: 260,
+      minSize: 240,
+      accessorFn: (row) => row.parameter_summary,
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Text strong>{row.original.parameter_summary}</Text>
+          {row.original.signal_filter_summary ? <Tag color="blue">{row.original.signal_filter_summary}</Tag> : null}
+          <Text type="secondary">{row.original.symbol} · {row.original.timeframe.toUpperCase()}</Text>
+        </Space>
+      ),
+    },
+    {
+      id: 'different_points',
+      header: '差异点',
+      size: 260,
+      minSize: 220,
+      enableSorting: false,
+      cell: ({ row }) => renderParameterPoints(
+        parameterGroupPoints(row.original).filter((point) => !researchGroupCommonKeys.has(point.key)),
+        'blue',
+      ),
+    },
+    {
+      id: 'classification',
+      header: '分类',
+      size: 110,
+      minSize: 100,
+      accessorFn: (row) => row.classification,
+      cell: ({ row }) => <Tag color={parameterGroupClassificationColor(row.original.classification)}>{parameterGroupClassificationText(row.original.classification)}</Tag>,
+    },
+    { id: 'research_score', header: '研究分', size: 76, minSize: 68, accessorFn: (row) => row.research_score, cell: ({ row }) => formatNumber(row.original.research_score, 1) },
+    { id: 'run_count', header: 'Run', size: 58, minSize: 54, accessorFn: (row) => row.run_count, cell: ({ row }) => row.original.run_count },
+    { id: 'snapshot_count', header: '快照', size: 58, minSize: 54, accessorFn: (row) => row.snapshot_count, cell: ({ row }) => row.original.snapshot_count },
+    { id: 'avg_oos_total_return', header: '平均 OOS', size: 96, minSize: 88, accessorFn: (row) => row.avg_oos_total_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.avg_oos_total_return) },
+    { id: 'oos_positive_ratio', header: 'OOS 正比', size: 92, minSize: 84, accessorFn: (row) => row.oos_positive_ratio ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.oos_positive_ratio) },
+    { id: 'avg_gap', header: '平均 Gap', size: 92, minSize: 84, accessorFn: (row) => row.avg_gap ?? Number.POSITIVE_INFINITY, cell: ({ row }) => formatPct(row.original.avg_gap) },
+    { id: 'avg_max_drawdown', header: '平均回撤', size: 92, minSize: 84, accessorFn: (row) => row.avg_max_drawdown, cell: ({ row }) => formatPct(row.original.avg_max_drawdown) },
+    { id: 'worst_max_drawdown', header: '最差回撤', size: 92, minSize: 84, accessorFn: (row) => row.worst_max_drawdown, cell: ({ row }) => formatPct(row.original.worst_max_drawdown) },
+    { id: 'avg_profit_factor', header: '平均 PF', size: 78, minSize: 72, accessorFn: (row) => row.avg_profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.avg_profit_factor, 2) },
+    { id: 'min_trade_count', header: '最少交易', size: 76, minSize: 70, accessorFn: (row) => row.min_trade_count, cell: ({ row }) => row.original.min_trade_count },
+    { id: 'neighbor_stability_score', header: '邻域稳定', size: 86, minSize: 78, accessorFn: (row) => row.neighbor_stability_score ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.neighbor_stability_score) },
+    {
+      id: 'filter_experiment',
+      header: '过滤实验',
+      size: 170,
+      minSize: 150,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const progress = filterExperimentProgressByCandidateId[row.original.group_key];
+        const running = Boolean(progress && progress.status !== 'success' && progress.status !== 'failed');
+        const candidateLike = {
+          candidate_id: row.original.group_key,
+          source_run_ids: row.original.run_ids,
+          strategy_name: row.original.strategy_name,
+          symbol: row.original.symbol,
+          timeframe: row.original.timeframe,
+          validation_split_id: row.original.validation_split_id,
+          entry_structure: {},
+          risk_profile: {},
+          representative_run_id: row.original.representative_run_id,
+          representative_run_score: row.original.research_score,
+          status: row.original.classification,
+          recommendation: '',
+          neighborhood_summary: {},
+          risk_matrix_summary: {},
+          latest_note: null,
+          updated_at: null,
+        } as ResearchCandidateView;
+        return (
+          <Space size={[4, 4]} wrap>
+            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '固定当前参数，只测试 HTF 趋势 / ATR 分位 / ADX 三个单指标'}>
+              <Button
+                size="small"
+                loading={filterExperimentCandidateId === row.original.group_key || running}
+                disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2'}
+                onClick={() => void onRunFilterExperiment(candidateLike, 'single')}
+              >
+                单指标
+              </Button>
+            </Tooltip>
+            <Tooltip title="固定当前参数，同时跑单指标和趋势/ATR/ADX核心叠加">
+              <Button
+                size="small"
+                disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2'}
+                onClick={() => void onRunFilterExperiment(candidateLike, 'stacked')}
+              >
+                叠加
+              </Button>
+            </Tooltip>
+          </Space>
+        );
+      },
+    },
+    {
+      id: 'actions',
+      header: '操作',
+      size: 320,
+      minSize: 300,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const representativeRun = row.original.representative_run_id ? rowsByRunId.get(row.original.representative_run_id) : undefined;
+        const canRunNeighborhood = representativeRun?.strategy_name === 'ema_pullback_atr_v2'
+          && Boolean(representativeRun.trend_fast_period && representativeRun.trend_slow_period);
+        return (
+          <Space size={6}>
+            <Button size="small" onClick={() => setSelectedParameterGroupKey(row.original.group_key)}>详情</Button>
+            <Button size="small" onClick={() => setRiskCompareGroupKey(row.original.group_key)}>风险对比</Button>
+            {row.original.representative_run_id ? (
+              <Button size="small" onClick={() => onOpenRun(row.original.representative_run_id as string)}>代表 Run</Button>
+            ) : null}
+            {row.original.representative_run_id ? (
+              <Button size="small" onClick={() => void addRunToCompare(row.original.representative_run_id as string)}>对比</Button>
+            ) : null}
+            <Button
+              size="small"
+              disabled={!representativeRun}
+              onClick={() => representativeRun ? setNeighborhoodSourceRunId(representativeRun.run_id) : undefined}
+            >
+              看邻域
+            </Button>
+            <Tooltip title={canRunNeighborhood ? '固定当前参数组的 tol/sl/rr/仓位/杠杆，只扩展趋势快慢周期邻域' : '需要 v2 代表 Run 才能跑趋势周期邻域'}>
+              <Button
+                size="small"
+                disabled={!canRunNeighborhood || !representativeRun}
+                loading={representativeRun ? neighborhoodRunId === representativeRun.run_id : false}
+                onClick={() => representativeRun ? void onRunTrendNeighborhood(representativeRun) : undefined}
+              >
+                跑邻域
+              </Button>
+            </Tooltip>
+          </Space>
+        );
+      },
+    },
+  ], [addRunToCompare, filterExperimentCandidateId, filterExperimentProgressByCandidateId, neighborhoodRunId, onOpenRun, onRunFilterExperiment, onRunTrendNeighborhood, researchGroupCommonKeys, rowsByRunId]);
+  const screeningRunColumns = useMemo<ColumnDef<ScreeningRunView>[]>(() => [
+    {
+      id: 'run',
+      header: 'Run',
+      size: 230,
+      minSize: 210,
+      accessorFn: (row) => row.run_id,
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Text strong>{shortRunId(row.original.run_id)}</Text>
+          <Text type="secondary">{row.original.symbol} · {row.original.timeframe.toUpperCase()}</Text>
+        </Space>
+      ),
+    },
+    {
+      id: 'parameter_summary',
+      header: '参数摘要',
+      size: 260,
+      minSize: 220,
+      accessorFn: (row) => row.parameter_summary,
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Text>{row.original.parameter_summary}</Text>
+          {row.original.signal_filter_summary ? <Tag color="blue">{row.original.signal_filter_summary}</Tag> : null}
+        </Space>
+      ),
+    },
+    { id: 'score', header: '评分', size: 82, minSize: 76, accessorFn: (row) => row.score, cell: ({ row }) => formatNumber(row.original.score, 1) },
+    {
+      id: 'labels',
+      header: '标签',
+      size: 260,
+      minSize: 220,
+      enableSorting: false,
+      cell: ({ row }) => (
+        <Space size={[4, 4]} wrap>
+          {row.original.auto_labels.map((label) => (
+            <Tag key={`${row.original.run_id}-${label}`} color={label === '建议排除' || label === '回撤过大' ? 'red' : label === '值得研究' || label === 'OOS 强' || label === 'Gap 小' ? 'green' : 'default'}>
+              {label}
+            </Tag>
+          ))}
+          {row.original.manual_labels.map((label) => (
+            <Tag key={`${row.original.run_id}-manual-${label}`} color="blue">{researchLabelText(label)}</Tag>
+          ))}
+        </Space>
+      ),
+    },
+    {
+      id: 'oos_total_return',
+      header: () => <Tooltip title="样本外 OOS 区间收益率。">OOS</Tooltip>,
+      size: 92,
+      minSize: 86,
+      accessorFn: (row) => row.oos_total_return ?? Number.NEGATIVE_INFINITY,
+      cell: ({ row }) => formatPct(row.original.oos_total_return),
+    },
+    {
+      id: 'oos_excess_return',
+      header: () => <Tooltip title="样本外 OOS 收益率减去同期基准收益率。">OOS超额</Tooltip>,
+      size: 104,
+      minSize: 96,
+      accessorFn: (row) => row.oos_excess_return ?? Number.NEGATIVE_INFINITY,
+      cell: ({ row }) => formatPct(row.original.oos_excess_return),
+    },
+    {
+      id: 'is_excess_return',
+      header: () => <Tooltip title="样本内 IS 收益率减去同期基准收益率。">IS超额</Tooltip>,
+      size: 104,
+      minSize: 96,
+      accessorFn: (row) => row.is_excess_return ?? Number.NEGATIVE_INFINITY,
+      cell: ({ row }) => formatPct(row.original.is_excess_return),
+    },
+    {
+      id: 'gap',
+      header: () => <Tooltip title="样本内收益率减样本外收益率，越小通常表示 IS/OOS 落差越小。">Gap</Tooltip>,
+      size: 92,
+      minSize: 86,
+      accessorFn: (row) => row.is_oos_gap ?? Number.POSITIVE_INFINITY,
+      cell: ({ row }) => formatPct(row.original.is_oos_gap),
+    },
+    { id: 'max_drawdown', header: '回撤', size: 92, minSize: 86, accessorFn: (row) => row.max_drawdown, cell: ({ row }) => formatPct(row.original.max_drawdown) },
+    { id: 'profit_factor', header: 'PF', size: 72, minSize: 68, accessorFn: (row) => row.profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.profit_factor, 2) },
+    { id: 'trade_count', header: '交易数', size: 76, minSize: 70, accessorFn: (row) => row.trade_count, cell: ({ row }) => row.original.trade_count },
+    { id: 'oos_trade_count', header: 'OOS 交易', size: 86, minSize: 78, accessorFn: (row) => row.oos_trade_count ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.oos_trade_count ?? '--' },
+    { id: 'leverage', header: '杠杆', size: 70, minSize: 66, accessorFn: (row) => row.leverage ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.leverage ?? '--' },
+    { id: 'risk_pct_per_trade', header: 'risk', size: 78, minSize: 72, accessorFn: (row) => row.risk_pct_per_trade ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => compactPct(row.original.risk_pct_per_trade) ?? '--' },
+    {
+      id: 'actions',
+      header: '操作',
+      size: 330,
+      minSize: 300,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const run = rowsByRunId.get(row.original.run_id);
+        const canRunNeighborhood = row.original.strategy_name === 'ema_pullback_atr_v2' && Boolean(row.original.trend_fast_period && row.original.trend_slow_period);
+        const inResearchPool = row.original.pool_status === 'research_pool' || row.original.manual_labels.includes('research_pool');
+        return (
+          <Space size={6}>
+            <Button size="small" disabled={inResearchPool} loading={savingResearchNote} onClick={() => void addRunToResearchPool(row.original)}>
+              {inResearchPool ? '已加入' : '加入研究池'}
+            </Button>
+            <Button size="small" onClick={() => onOpenRun(row.original.run_id)}>打开分析</Button>
+            <Button size="small" onClick={() => void addRunToCompare(row.original.run_id)}>对比</Button>
+            <Button size="small" disabled={!canRunNeighborhood} onClick={() => setNeighborhoodSourceRunId(row.original.run_id)}>看邻域</Button>
+            <Button
+              size="small"
+              disabled={!canRunNeighborhood || !run}
+              loading={neighborhoodRunId === row.original.run_id}
+              onClick={() => run ? void onRunTrendNeighborhood(run) : undefined}
+            >
+              跑邻域
+            </Button>
+            <Button
+              size="small"
+              danger
+              onClick={() => openDecisionModal('run', row.original.run_id, `排除 Run ${shortRunId(row.original.run_id)}`, { decision_status: 'rejected', labels: ['screening_pool_excluded'] })}
+            >
+              排除
+            </Button>
+          </Space>
+        );
+      },
+    },
+  ], [addRunToCompare, neighborhoodRunId, onOpenRun, onRunTrendNeighborhood, rowsByRunId, savingResearchNote]);
+  const researchPoolColumns = useMemo<ColumnDef<ResearchCandidateView>[]>(() => [
+    {
+      id: 'candidate',
+      header: '研究对象',
+      size: 220,
+      minSize: 190,
+      accessorFn: (row) => row.candidate_id,
+      cell: ({ row }) => (
+        <div className="cbw-research-target">
+          <Text strong className="cbw-research-target-main">
+            {row.original.symbol} · {row.original.timeframe.toUpperCase()}
+          </Text>
+          <Tooltip title={`${row.original.strategy_name} · ${row.original.validation_split_id}`}>
+            <Text type="secondary" className="cbw-research-target-sub">
+              {compactStrategyName(row.original.strategy_name)} · {shortRunId(row.original.validation_split_id)}
+            </Text>
+          </Tooltip>
+        </div>
+      ),
+    },
+    { id: 'status', header: '状态', size: 110, minSize: 100, accessorFn: (row) => row.status, cell: ({ row }) => <Tag color={row.original.status === '可入稳定池' ? 'green' : row.original.status === '拒绝' ? 'red' : 'blue'}>{row.original.status}</Tag> },
+    { id: 'representative_run_score', header: '代表分', size: 82, minSize: 76, accessorFn: (row) => row.representative_run_score, cell: ({ row }) => formatNumber(row.original.representative_run_score, 1) },
+    { id: 'source_run_ids', header: '证据 Run', size: 88, minSize: 80, accessorFn: (row) => row.source_run_ids.length, cell: ({ row }) => row.original.source_run_ids.length },
+    { id: 'neighborhood', header: '邻域', size: 150, minSize: 130, accessorFn: (row) => String(row.neighborhood_summary.verdict ?? ''), cell: ({ row }) => `${row.original.neighborhood_summary.status ?? '--'} · ${row.original.neighborhood_summary.verdict ?? '--'}` },
+    {
+      id: 'filter_experiment',
+      header: '过滤实验',
+      size: 170,
+      minSize: 150,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const progress = filterExperimentProgressByCandidateId[row.original.candidate_id];
+        const running = Boolean(progress && progress.status !== 'success' && progress.status !== 'failed');
+        return (
+          <Space size={[4, 4]} wrap>
+            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '固定当前参数，只测试 HTF 趋势 / ATR 分位 / ADX 三个单指标'}>
+              <Button
+                size="small"
+                loading={filterExperimentCandidateId === row.original.candidate_id || running}
+                disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2'}
+                onClick={() => void onRunFilterExperiment(row.original, 'single')}
+              >
+                单指标
+              </Button>
+            </Tooltip>
+            <Tooltip title="固定当前参数，同时跑单指标和趋势/ATR/ADX核心叠加">
+              <Button
+                size="small"
+                disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2'}
+                onClick={() => void onRunFilterExperiment(row.original, 'stacked')}
+              >
+                叠加
+              </Button>
+            </Tooltip>
+            <Button size="small" onClick={() => setFilterResultsCandidateId(row.original.candidate_id)}>
+              看结果
+            </Button>
+          </Space>
+        );
+      },
+    },
+    {
+      id: 'risk_matrix',
+      header: '风险矩阵',
+      size: 140,
+      minSize: 120,
+      accessorFn: (row) => String(row.risk_matrix_summary.status ?? ''),
+      cell: ({ row }) => {
+        const progress = riskMatrixProgressByCandidateId[row.original.candidate_id];
+        const summary = row.original.risk_matrix_summary;
+        if (progress && progress.status !== 'success' && progress.status !== 'failed') {
+          return <Tag color="processing">运行中 {progress.runCount}/{progress.plannedRunCount || '--'}</Tag>;
+        }
+        if (progress?.status === 'failed') {
+          return <Tag color="red">失败</Tag>;
+        }
+        if (summary.status === '已跑' || progress?.status === 'success') {
+          const groupCount = Number(summary.group_count ?? 0);
+          return <Tag color="green">已跑{groupCount ? ` ${groupCount}组` : ''}</Tag>;
+        }
+        return <Tag>{String(summary.status ?? '--')}</Tag>;
+      },
+    },
+    { id: 'recommendation', header: '综合结论', size: 160, minSize: 140, accessorFn: (row) => row.recommendation, cell: ({ row }) => row.original.recommendation },
+    { id: 'updated_at', header: '最近更新', size: 150, minSize: 130, accessorFn: (row) => row.updated_at ?? '', cell: ({ row }) => row.original.updated_at ? formatDateTime(row.original.updated_at) : '--' },
+    {
+      id: 'actions',
+      header: '操作',
+      size: 420,
+      minSize: 360,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const representativeRun = row.original.representative_run_id ? rowsByRunId.get(row.original.representative_run_id) : undefined;
+        const canRunNeighborhood = representativeRun?.strategy_name === 'ema_pullback_atr_v2' && Boolean(representativeRun.trend_fast_period && representativeRun.trend_slow_period);
+        const riskMatrixProgress = riskMatrixProgressByCandidateId[row.original.candidate_id];
+        const riskMatrixRunning = Boolean(riskMatrixProgress && riskMatrixProgress.status !== 'success' && riskMatrixProgress.status !== 'failed');
+        const riskMatrixReady = row.original.risk_matrix_summary.status === '已跑' || riskMatrixProgress?.status === 'success';
+        return (
+          <Space size={6}>
+            <Button size="small" onClick={() => setSelectedParameterGroupKey(row.original.candidate_id)}>打开研究</Button>
+            {row.original.representative_run_id ? <Button size="small" onClick={() => onOpenRun(row.original.representative_run_id as string)}>代表 Run</Button> : null}
+            {row.original.representative_run_id ? (
+              <Button size="small" onClick={() => void addRunToCompare(row.original.representative_run_id as string)}>对比</Button>
+            ) : null}
+            <Button size="small" disabled={!representativeRun} onClick={() => representativeRun ? setNeighborhoodSourceRunId(representativeRun.run_id) : undefined}>看邻域</Button>
+            <Button size="small" disabled={!canRunNeighborhood || !representativeRun} loading={representativeRun ? neighborhoodRunId === representativeRun.run_id : false} onClick={() => representativeRun ? void onRunTrendNeighborhood(representativeRun) : undefined}>跑邻域</Button>
+            <Button size="small" onClick={() => setTradeAttributionCandidateId(row.original.candidate_id)}>交易归因</Button>
+            {riskMatrixReady ? (
+              <Button size="small" onClick={() => setRiskCompareGroupKey(row.original.candidate_id)}>看风险矩阵</Button>
+            ) : (
+              <Button
+                size="small"
+                loading={riskMatrixCandidateId === row.original.candidate_id || riskMatrixRunning}
+                disabled={riskMatrixRunning}
+                onClick={() => void onRunRiskMatrix(row.original)}
+              >
+                {riskMatrixRunning ? '运行中' : '跑风险矩阵'}
+              </Button>
+            )}
+            <Button size="small" onClick={() => openDecisionModal('research_candidate', row.original.candidate_id, `研究候选 ${row.original.symbol}`, { decision_status: 'observing', labels: ['research_pool'] })}>记录结论</Button>
+            <Button size="small" type="primary" onClick={() => void addCandidateToStablePool(row.original)}>加入稳定池</Button>
+          </Space>
+        );
+      },
+    },
+  ], [addRunToCompare, filterExperimentCandidateId, filterExperimentProgressByCandidateId, neighborhoodRunId, onOpenRun, onRunFilterExperiment, onRunRiskMatrix, onRunTrendNeighborhood, riskMatrixCandidateId, riskMatrixProgressByCandidateId, rowsByRunId]);
+  const stablePoolColumns = useMemo<ColumnDef<StableCandidateView>[]>(() => [
+    {
+      id: 'candidate',
+      header: '稳定组合',
+      size: 260,
+      minSize: 220,
+      accessorFn: (row) => row.stable_candidate_id,
+      cell: ({ row }) => (
+        <div className="cbw-research-target">
+          <Text strong className="cbw-research-target-main">{row.original.symbol} · {row.original.timeframe.toUpperCase()}</Text>
+          <Tooltip title={`${row.original.strategy_name} · ${row.original.validation_split_id}`}>
+            <Text type="secondary" className="cbw-research-target-sub">
+              {compactStrategyName(row.original.strategy_name)} · {shortRunId(row.original.validation_split_id)}
+            </Text>
+          </Tooltip>
+        </div>
+      ),
+    },
+    { id: 'status', header: '状态', size: 90, minSize: 80, accessorFn: (row) => row.status, cell: ({ row }) => <Tag color="green">{decisionStatusText(row.original.status)}</Tag> },
+    { id: 'score', header: '评分', size: 80, minSize: 74, accessorFn: (row) => Number(row.validation_summary.score ?? 0), cell: ({ row }) => formatNumber(Number(row.original.validation_summary.score ?? 0), 1) },
+    { id: 'avg_oos_total_return', header: 'OOS', size: 92, minSize: 86, accessorFn: (row) => Number(row.validation_summary.avg_oos_total_return ?? Number.NEGATIVE_INFINITY), cell: ({ row }) => formatPct(Number(row.original.validation_summary.avg_oos_total_return ?? NaN)) },
+    { id: 'worst_max_drawdown', header: '最大回撤', size: 96, minSize: 88, accessorFn: (row) => Number(row.validation_summary.worst_max_drawdown ?? 0), cell: ({ row }) => formatPct(Number(row.original.validation_summary.worst_max_drawdown ?? NaN)) },
+    { id: 'avg_profit_factor', header: 'PF', size: 72, minSize: 68, accessorFn: (row) => Number(row.validation_summary.avg_profit_factor ?? Number.NEGATIVE_INFINITY), cell: ({ row }) => formatNumber(Number(row.original.validation_summary.avg_profit_factor ?? NaN), 2) },
+    { id: 'neighborhood', header: '邻域结论', size: 130, minSize: 112, accessorFn: (row) => String(row.neighborhood_summary.verdict ?? ''), cell: ({ row }) => String(row.original.neighborhood_summary.verdict ?? '--') },
+    {
+      id: 'filter_experiment',
+      header: '过滤实验',
+      size: 190,
+      minSize: 170,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const progress = filterExperimentProgressByCandidateId[row.original.stable_candidate_id];
+        const running = Boolean(progress && progress.status !== 'success' && progress.status !== 'failed');
+        const candidateLike = {
+          candidate_id: row.original.stable_candidate_id,
+          source_run_ids: row.original.evidence_run_ids,
+          strategy_name: row.original.strategy_name,
+          symbol: row.original.symbol,
+          timeframe: row.original.timeframe,
+          validation_split_id: row.original.validation_split_id,
+          entry_structure: row.original.entry_structure,
+          risk_profile: row.original.chosen_risk_profile,
+          representative_run_id: row.original.representative_run_id,
+          representative_run_score: Number(row.original.validation_summary.score ?? 0),
+          status: row.original.status,
+          recommendation: row.original.final_recommendation,
+          neighborhood_summary: row.original.neighborhood_summary,
+          risk_matrix_summary: row.original.risk_matrix_summary,
+          latest_note: row.original.latest_note,
+          updated_at: null,
+        } as ResearchCandidateView;
+        return (
+          <Space size={[4, 4]} wrap>
+            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '固定当前稳定组合，只测试 HTF 趋势 / ATR 分位 / ADX 三个单指标'}>
+              <Button
+                size="small"
+                loading={filterExperimentCandidateId === row.original.stable_candidate_id || running}
+                disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2'}
+                onClick={() => void onRunFilterExperiment(candidateLike, 'single')}
+              >
+                单指标
+              </Button>
+            </Tooltip>
+            <Tooltip title="固定当前稳定组合，同时跑单指标和趋势/ATR/ADX核心叠加">
+              <Button
+                size="small"
+                disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2'}
+                onClick={() => void onRunFilterExperiment(candidateLike, 'stacked')}
+              >
+                叠加
+              </Button>
+            </Tooltip>
+            <Button size="small" onClick={() => setFilterResultsCandidateId(row.original.stable_candidate_id)}>
+              看结果
+            </Button>
+          </Space>
+        );
+      },
+    },
+    { id: 'final_recommendation', header: '最终建议', size: 220, minSize: 180, accessorFn: (row) => row.final_recommendation, cell: ({ row }) => row.original.final_recommendation },
+    {
+      id: 'actions',
+      header: '操作',
+      size: 320,
+      minSize: 280,
+      enableSorting: false,
+      cell: ({ row }) => (
+          <Space size={6}>
+            <Button size="small" onClick={() => setSelectedParameterGroupKey(row.original.stable_candidate_id)}>打开详情</Button>
+            {row.original.representative_run_id ? <Button size="small" onClick={() => onOpenRun(row.original.representative_run_id as string)}>查看证据</Button> : null}
+            {row.original.representative_run_id ? (
+              <Button size="small" onClick={() => void addRunToCompare(row.original.representative_run_id as string)}>对比</Button>
+            ) : null}
+            <Button size="small" onClick={() => setTradeAttributionCandidateId(row.original.stable_candidate_id)}>交易归因</Button>
+            <Button size="small" onClick={() => openDecisionModal('stable_candidate', row.original.stable_candidate_id, `稳定组合 ${row.original.symbol}`, { decision_status: 'archived', labels: ['stable_pool'] })}>归档</Button>
+          </Space>
+      ),
+    },
+  ], [addRunToCompare, filterExperimentCandidateId, filterExperimentProgressByCandidateId, onOpenRun, onRunFilterExperiment]);
+  const filterResultGroupColumns = useMemo<ColumnDef<FilterResultGroup>[]>(() => [
+    {
+      id: 'filter_summary',
+      header: '过滤器',
+      size: 210,
+      minSize: 180,
+      accessorFn: (row) => row.filter_summary,
+      cell: ({ row }) => <Tag color="blue">{row.original.filter_summary}</Tag>,
+    },
+    { id: 'run_count', header: 'Run', size: 62, minSize: 58, accessorFn: (row) => row.run_count, cell: ({ row }) => row.original.run_count },
+    { id: 'snapshot_count', header: '快照', size: 68, minSize: 62, accessorFn: (row) => row.snapshot_count, cell: ({ row }) => row.original.snapshot_count },
+    { id: 'avg_oos_total_return', header: '平均 OOS', size: 96, minSize: 88, accessorFn: (row) => row.avg_oos_total_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.avg_oos_total_return) },
+    {
+      id: 'avg_oos_delta',
+      header: 'OOS 变化',
+      size: 96,
+      minSize: 88,
+      accessorFn: (row) => row.avg_oos_delta ?? Number.NEGATIVE_INFINITY,
+      cell: ({ row }) => <Text type={Number(row.original.avg_oos_delta ?? 0) >= 0 ? 'success' : 'danger'}>{formatSignedPct(row.original.avg_oos_delta)}</Text>,
+    },
+    { id: 'avg_max_drawdown', header: '平均回撤', size: 96, minSize: 88, accessorFn: (row) => row.avg_max_drawdown ?? Number.POSITIVE_INFINITY, cell: ({ row }) => formatPct(row.original.avg_max_drawdown) },
+    {
+      id: 'avg_drawdown_delta',
+      header: '回撤变化',
+      size: 96,
+      minSize: 88,
+      accessorFn: (row) => row.avg_drawdown_delta ?? Number.POSITIVE_INFINITY,
+      cell: ({ row }) => <Text type={Number(row.original.avg_drawdown_delta ?? 0) <= 0 ? 'success' : 'danger'}>{formatSignedPct(row.original.avg_drawdown_delta)}</Text>,
+    },
+    { id: 'avg_profit_factor', header: '平均 PF', size: 82, minSize: 76, accessorFn: (row) => row.avg_profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.avg_profit_factor, 2) },
+    { id: 'avg_profit_factor_delta', header: 'PF 变化', size: 82, minSize: 76, accessorFn: (row) => row.avg_profit_factor_delta ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatSignedNumber(row.original.avg_profit_factor_delta, 2) },
+    { id: 'trade_retention', header: '交易保留', size: 92, minSize: 84, accessorFn: (row) => row.trade_retention ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.trade_retention) },
+  ], []);
+  const filterResultRunColumns = useMemo<ColumnDef<ParameterLabRow>[]>(() => [
+    {
+      id: 'run',
+      header: 'Run',
+      size: 210,
+      minSize: 190,
+      accessorFn: (row) => row.run_id,
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Text strong>{shortRunId(row.original.run_id)}</Text>
+          <Text type="secondary">{row.original.dataset_snapshot_id}</Text>
+        </Space>
+      ),
+    },
+    {
+      id: 'filter',
+      header: '过滤器',
+      size: 200,
+      minSize: 180,
+      accessorFn: (row) => row.signal_filter_summary ?? '',
+      cell: ({ row }) => row.original.signal_filter_summary ? <Tag color="blue">{row.original.signal_filter_summary}</Tag> : '--',
+    },
+    { id: 'total_return', header: '收益率', size: 92, minSize: 86, accessorFn: (row) => row.total_return, cell: ({ row }) => formatPct(row.original.total_return) },
+    { id: 'oos_total_return', header: 'OOS', size: 92, minSize: 86, accessorFn: (row) => row.oos_total_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.oos_total_return) },
+    { id: 'oos_excess_return', header: 'OOS超额', size: 100, minSize: 92, accessorFn: (row) => row.oos_excess_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.oos_excess_return) },
+    { id: 'max_drawdown', header: '回撤', size: 92, minSize: 86, accessorFn: (row) => row.max_drawdown, cell: ({ row }) => formatPct(row.original.max_drawdown) },
+    { id: 'profit_factor', header: 'PF', size: 72, minSize: 68, accessorFn: (row) => row.profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.profit_factor, 2) },
+    { id: 'trade_count', header: '交易数', size: 76, minSize: 70, accessorFn: (row) => row.trade_count, cell: ({ row }) => row.original.trade_count },
+    { id: 'created_at', header: '时间', size: 140, minSize: 128, accessorFn: (row) => row.created_at, cell: ({ row }) => formatDateTime(row.original.created_at) },
+    {
+      id: 'actions',
+      header: '操作',
+      size: 126,
+      minSize: 116,
+      enableSorting: false,
+      cell: ({ row }) => (
+        <Space size={6}>
+          <Button size="small" onClick={() => onOpenRun(row.original.run_id)}>打开</Button>
+          <Button size="small" onClick={() => void addRunToCompare(row.original.run_id)}>对比</Button>
+        </Space>
+      ),
+    },
+  ], [addRunToCompare, onOpenRun]);
+  const tradeAttributionBucketColumns = useMemo<ColumnDef<TradeAttributionBucket>[]>(() => [
+    { id: 'dimension', header: '维度', size: 130, minSize: 110, accessorFn: (row) => row.dimension, cell: ({ row }) => row.original.dimension },
+    {
+      id: 'label',
+      header: '分桶',
+      size: 220,
+      minSize: 180,
+      accessorFn: (row) => row.label,
+      cell: ({ row }) => <Tag color={row.original.sample_ok ? 'blue' : 'default'}>{row.original.label}</Tag>,
+    },
+    { id: 'trade_count', header: '交易', size: 72, minSize: 66, accessorFn: (row) => row.trade_count, cell: ({ row }) => row.original.trade_count },
+    { id: 'oos_trade_count', header: 'OOS', size: 72, minSize: 66, accessorFn: (row) => row.oos_trade_count, cell: ({ row }) => row.original.oos_trade_count },
+    { id: 'win_rate', header: '胜率', size: 82, minSize: 76, accessorFn: (row) => row.win_rate, cell: ({ row }) => formatPct(row.original.win_rate) },
+    { id: 'net_pnl', header: '净盈亏', size: 96, minSize: 88, accessorFn: (row) => row.net_pnl, cell: ({ row }) => formatNumber(row.original.net_pnl, 2) },
+    { id: 'avg_return_pct', header: '均收益', size: 88, minSize: 80, accessorFn: (row) => row.avg_return_pct, cell: ({ row }) => formatPct(row.original.avg_return_pct) },
+    { id: 'profit_factor', header: 'PF', size: 72, minSize: 66, accessorFn: (row) => row.profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.profit_factor, 2) },
+    { id: 'loss_contribution', header: '亏损贡献', size: 96, minSize: 88, accessorFn: (row) => row.loss_contribution, cell: ({ row }) => formatPct(row.original.loss_contribution) },
+    { id: 'big_loss_count', header: '大亏', size: 68, minSize: 62, accessorFn: (row) => row.big_loss_count, cell: ({ row }) => row.original.big_loss_count },
+  ], []);
+  const riskCompareColumns = useMemo<ColumnDef<ParameterGroupView>[]>(() => [
+    {
+      id: 'risk_points',
+      header: '风险 / 杠杆',
+      size: 240,
+      minSize: 220,
+      enableSorting: false,
+      cell: ({ row }) => renderParameterPoints(parameterGroupRiskPoints(row.original), 'blue'),
+    },
+    { id: 'research_score', header: '研究分', accessorFn: (row) => row.research_score, cell: ({ row }) => formatNumber(row.original.research_score, 1) },
+    { id: 'avg_oos_total_return', header: '平均 OOS', accessorFn: (row) => row.avg_oos_total_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.avg_oos_total_return) },
+    { id: 'avg_gap', header: '平均 Gap', accessorFn: (row) => row.avg_gap ?? Number.POSITIVE_INFINITY, cell: ({ row }) => formatPct(row.original.avg_gap) },
+    { id: 'worst_max_drawdown', header: '最差回撤', accessorFn: (row) => row.worst_max_drawdown, cell: ({ row }) => formatPct(row.original.worst_max_drawdown) },
+    {
+      id: 'oos_drawdown_ratio',
+      header: 'OOS/DD',
+      accessorFn: (row) => (row.avg_oos_total_return ?? row.avg_total_return) / Math.max(row.worst_max_drawdown, 0.01),
+      cell: ({ row }) => formatNumber((row.original.avg_oos_total_return ?? row.original.avg_total_return) / Math.max(row.original.worst_max_drawdown, 0.01), 2),
+    },
+    { id: 'avg_profit_factor', header: '平均 PF', accessorFn: (row) => row.avg_profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.avg_profit_factor, 2) },
+    { id: 'min_trade_count', header: '最少交易', accessorFn: (row) => row.min_trade_count, cell: ({ row }) => row.original.min_trade_count },
+    {
+      id: 'classification',
+      header: '分类',
+      accessorFn: (row) => row.classification,
+      cell: ({ row }) => <Tag color={parameterGroupClassificationColor(row.original.classification)}>{parameterGroupClassificationText(row.original.classification)}</Tag>,
+    },
+    {
+      id: 'actions',
+      header: '操作',
+      enableSorting: false,
+      cell: ({ row }) => (
+        <Space>
+          <Button size="small" onClick={() => setSelectedParameterGroupKey(row.original.group_key)}>详情</Button>
+          {row.original.representative_run_id ? (
+            <Button size="small" onClick={() => onOpenRun(row.original.representative_run_id as string)}>代表 Run</Button>
+          ) : null}
+        </Space>
+      ),
+    },
+  ], [onOpenRun]);
+  const parameterGroupRunColumns = useMemo<ColumnDef<ParameterGroupRunView>[]>(() => [
+    {
+      id: 'run_id',
+      header: 'Run',
+      size: 260,
+      minSize: 220,
+      accessorFn: (row) => row.run_id,
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Text strong>{shortRunId(row.original.run_id)}</Text>
+          <Text type="secondary">{row.original.batch_id ?? row.original.experiment_id ?? '--'}</Text>
+        </Space>
+      ),
+    },
+    { id: 'total_return', header: '总收益', accessorFn: (row) => row.total_return, cell: ({ row }) => formatPct(row.original.total_return) },
+    { id: 'oos_total_return', header: 'OOS', accessorFn: (row) => row.oos_total_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.oos_total_return) },
+    { id: 'gap', header: 'Gap', accessorFn: (row) => row.gap ?? Number.POSITIVE_INFINITY, cell: ({ row }) => formatPct(row.original.gap) },
+    { id: 'max_drawdown', header: '回撤', accessorFn: (row) => row.max_drawdown, cell: ({ row }) => formatPct(row.original.max_drawdown) },
+    { id: 'profit_factor', header: 'PF', accessorFn: (row) => row.profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.profit_factor, 2) },
+    { id: 'trade_count', header: '交易数', accessorFn: (row) => row.trade_count, cell: ({ row }) => row.original.trade_count },
+    { id: 'created_at', header: '时间', accessorFn: (row) => row.created_at, cell: ({ row }) => formatDateTime(row.original.created_at) },
+    {
+      id: 'actions',
+      header: '操作',
+      enableSorting: false,
+      cell: ({ row }) => (
+        <Space size={6}>
+          <Button size="small" onClick={() => onOpenRun(row.original.run_id)}>打开分析</Button>
+          <Button size="small" onClick={() => void addRunToCompare(row.original.run_id)}>对比</Button>
+        </Space>
+      ),
+    },
+  ], [addRunToCompare, onOpenRun]);
   const experimentResultColumns = useMemo<ColumnDef<ParameterLabRow>[]>(() => [
     {
       header: 'Run',
@@ -3324,19 +6358,26 @@ function ParametersView({
       cell: ({ row }) => row.original.timeframe.toUpperCase(),
     },
     {
-      id: 'fast_slow',
-      header: '快 / 慢',
+      id: 'parameter_summary',
+      header: '参数摘要',
       size: 88,
       minSize: 88,
-      accessorFn: (row) => `${row.fast_period ?? ''}/${row.slow_period ?? ''}`,
-      cell: ({ row }) => `${row.original.fast_period ?? '--'} / ${row.original.slow_period ?? '--'}`,
+      accessorFn: (row) => row.parameter_summary || `${row.fast_period ?? ''}/${row.slow_period ?? ''}`,
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Text>{row.original.parameter_summary || `${row.original.fast_period ?? '--'} / ${row.original.slow_period ?? '--'}`}</Text>
+          {row.original.signal_filter_summary ? <Tag color="blue">{row.original.signal_filter_summary}</Tag> : null}
+        </Space>
+      ),
     },
     { id: 'leverage', header: '杠杆', size: 68, minSize: 68, accessorFn: (row) => row.leverage ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.leverage ?? '--' },
+    { id: 'research_score', header: '评分', size: 76, minSize: 72, accessorFn: (row) => scoreResearchRun(row).score, cell: ({ row }) => formatNumber(scoreResearchRun(row.original).score, 1) },
     { id: 'total_return', header: '收益率', size: 104, minSize: 104, accessorFn: (row) => row.total_return, cell: ({ row }) => formatPct(row.original.total_return) },
     { id: 'max_drawdown', header: '最大回撤', size: 104, minSize: 104, accessorFn: (row) => row.max_drawdown, cell: ({ row }) => formatPct(row.original.max_drawdown) },
     { id: 'excess_return', header: '超额收益', size: 108, minSize: 108, accessorFn: (row) => row.excess_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.excess_return) },
     { id: 'oos_total_return', header: '样本外收益', size: 120, minSize: 120, accessorFn: (row) => row.oos_total_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.oos_total_return) },
     { id: 'oos_excess_return', header: '样本外超额', size: 120, minSize: 120, accessorFn: (row) => row.oos_excess_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.oos_excess_return) },
+    { id: 'profit_factor', header: 'PF', size: 76, minSize: 72, accessorFn: (row) => row.profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.profit_factor, 2) },
     { id: 'final_equity', header: '最终权益', size: 120, minSize: 120, accessorFn: (row) => row.final_equity, cell: ({ row }) => formatNumber(row.original.final_equity) },
     { id: 'trade_count', header: '交易数', size: 84, minSize: 84, accessorFn: (row) => row.trade_count, cell: ({ row }) => row.original.trade_count },
     { id: 'win_rate', header: '胜率', size: 88, minSize: 88, accessorFn: (row) => row.win_rate, cell: ({ row }) => formatPct(row.original.win_rate) },
@@ -3383,26 +6424,217 @@ function ParametersView({
     {
       id: 'actions',
       header: '操作',
-      size: 160,
-      minSize: 160,
+      size: 220,
+      minSize: 210,
       enableSorting: false,
+      cell: ({ row }) => {
+        const isTracked = trackedRunNotesByRunId.has(row.original.run_id);
+        return (
+          <Space>
+            <Button size="small" onClick={() => onOpenRun(row.original.run_id)}>打开分析</Button>
+            <Button size="small" disabled={isTracked} loading={savingResearchNote} onClick={() => void freezeRunForTracking(row.original)}>
+              {isTracked ? '已追踪' : '冻结'}
+            </Button>
+            <Popconfirm
+              title="删除这个实验 Run？"
+              description={`run_id: ${row.original.run_id}`}
+              okText="删除"
+              cancelText="取消"
+              okButtonProps={{ danger: true }}
+              onConfirm={() => onDeleteRun(row.original.run_id)}
+            >
+              <Button size="small" danger>删除</Button>
+            </Popconfirm>
+          </Space>
+        );
+      },
+    },
+  ], [autoLabelsByRunId, batchManualDecisionStatusByRunId, batchManualLabelsByRunId, freezeRunForTracking, manualLabelsByRunId, onDeleteRun, onOpenRun, savingResearchNote, trackedRunNotesByRunId, workspaceMode]);
+  const researchRunColumns = useMemo<ColumnDef<ResearchRunCandidate>[]>(() => [
+    {
+      id: 'run',
+      header: 'Run',
+      size: 220,
+      minSize: 200,
+      accessorFn: (candidate) => candidate.row.run_id,
       cell: ({ row }) => (
-        <Space>
-          <Button size="small" onClick={() => onOpenRun(row.original.run_id)}>打开分析</Button>
-          <Popconfirm
-            title="删除这个实验 Run？"
-            description={`run_id: ${row.original.run_id}`}
-            okText="删除"
-            cancelText="取消"
-            okButtonProps={{ danger: true }}
-            onConfirm={() => onDeleteRun(row.original.run_id)}
-          >
-            <Button size="small" danger>删除</Button>
-          </Popconfirm>
+        <Space direction="vertical" size={0}>
+          <Text strong>{shortRunId(row.original.row.run_id)}</Text>
+          <Text type="secondary">{row.original.row.symbol} · {row.original.row.timeframe.toUpperCase()}</Text>
         </Space>
       ),
     },
-  ], [autoLabelsByRunId, batchManualDecisionStatusByRunId, batchManualLabelsByRunId, manualLabelsByRunId, onDeleteRun, onOpenRun, workspaceMode]);
+    {
+      id: 'parameter_summary',
+      header: '参数',
+      size: 260,
+      minSize: 220,
+      accessorFn: (candidate) => candidate.row.parameter_summary,
+      cell: ({ row }) => row.original.row.parameter_summary,
+    },
+    {
+      id: 'tags',
+      header: '判断',
+      size: 220,
+      minSize: 200,
+      enableSorting: false,
+      cell: ({ row }) => (
+        <Space size={[4, 4]} wrap>
+          {row.original.tags.map((tag) => (
+            <Tag
+              key={`${row.original.row.run_id}-${tag}`}
+              color={tag === 'Gap 大' ? 'orange' : tag === 'OOS 强' ? 'blue' : tag === 'Gap 小' ? 'green' : 'default'}
+            >
+              {tag}
+            </Tag>
+          ))}
+        </Space>
+      ),
+    },
+    { id: 'score', header: '研究分', size: 92, minSize: 88, accessorFn: (candidate) => candidate.score, cell: ({ row }) => formatNumber(row.original.score, 2) },
+    { id: 'oos_total_return', header: 'OOS', size: 96, minSize: 92, accessorFn: (candidate) => candidate.row.oos_total_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.row.oos_total_return) },
+    { id: 'is_oos_gap', header: 'Gap', size: 96, minSize: 92, accessorFn: (candidate) => candidate.gap ?? Number.POSITIVE_INFINITY, cell: ({ row }) => formatPct(row.original.gap) },
+    { id: 'max_drawdown', header: '回撤', size: 96, minSize: 92, accessorFn: (candidate) => candidate.row.max_drawdown, cell: ({ row }) => formatPct(row.original.row.max_drawdown) },
+    { id: 'oos_trade_count', header: 'OOS 交易', size: 92, minSize: 88, accessorFn: (candidate) => candidate.row.oos_trade_count ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.row.oos_trade_count ?? '--' },
+    { id: 'profit_factor', header: 'PF', size: 80, minSize: 76, accessorFn: (candidate) => candidate.row.profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.row.profit_factor, 2) },
+    { id: 'total_return', header: '总收益', size: 96, minSize: 92, accessorFn: (candidate) => candidate.row.total_return, cell: ({ row }) => formatPct(row.original.row.total_return) },
+    {
+      id: 'actions',
+      header: '操作',
+      size: 320,
+      minSize: 300,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const run = row.original.row;
+        const canRunNeighborhood = run.strategy_name === 'ema_pullback_atr_v2' && Boolean(run.trend_fast_period && run.trend_slow_period);
+        const isTracked = trackedRunNotesByRunId.has(run.run_id);
+        return (
+          <Space size={6}>
+            <Button size="small" onClick={() => onOpenRun(run.run_id)}>打开分析</Button>
+            <Button size="small" disabled={isTracked} loading={savingResearchNote} onClick={() => void freezeRunForTracking(run)}>
+              {isTracked ? '已追踪' : '冻结'}
+            </Button>
+            <Button size="small" disabled={!canRunNeighborhood} onClick={() => setNeighborhoodSourceRunId(run.run_id)}>看邻域</Button>
+            <Tooltip title={canRunNeighborhood ? '固定 tol/sl/rr/杠杆，只扩展趋势快慢周期邻域' : '仅 v2 Run 可跑趋势周期邻域'}>
+              <Button
+                size="small"
+                disabled={!canRunNeighborhood}
+                loading={neighborhoodRunId === run.run_id}
+                onClick={() => onRunTrendNeighborhood(run)}
+              >
+                跑邻域
+              </Button>
+            </Tooltip>
+          </Space>
+        );
+      },
+    },
+  ], [freezeRunForTracking, neighborhoodRunId, onOpenRun, onRunTrendNeighborhood, savingResearchNote, trackedRunNotesByRunId]);
+  const trackingRunColumns = useMemo<ColumnDef<ParameterLabRow>[]>(() => [
+    {
+      id: 'run',
+      header: 'Run',
+      size: 220,
+      minSize: 200,
+      accessorFn: (row) => row.run_id,
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Text strong>{shortRunId(row.original.run_id)}</Text>
+          <Text type="secondary">{row.original.symbol} · {row.original.timeframe.toUpperCase()}</Text>
+        </Space>
+      ),
+    },
+    {
+      id: 'parameter_summary',
+      header: '冻结参数',
+      size: 280,
+      minSize: 240,
+      accessorFn: (row) => row.parameter_summary,
+      cell: ({ row }) => row.original.parameter_summary,
+    },
+    {
+      id: 'decision',
+      header: '追踪状态',
+      size: 160,
+      minSize: 140,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const note = trackedRunNotesByRunId.get(row.original.run_id);
+        return (
+          <Space size={[4, 4]} wrap>
+            <Tag color={decisionStatusColor(note?.decision_status)}>{decisionStatusText(note?.decision_status)}</Tag>
+            {note?.labels.map((label) => (
+              <Tag key={`${note.note_id}-${label}`} color={label === 'tracking' ? 'purple' : 'blue'}>
+                {researchLabelText(label)}
+              </Tag>
+            ))}
+          </Space>
+        );
+      },
+    },
+    { id: 'research_score', header: '评分', size: 76, minSize: 72, accessorFn: (row) => scoreResearchRun(row).score, cell: ({ row }) => formatNumber(scoreResearchRun(row.original).score, 1) },
+    { id: 'total_return', header: '收益率', size: 96, minSize: 92, accessorFn: (row) => row.total_return, cell: ({ row }) => formatPct(row.original.total_return) },
+    { id: 'oos_total_return', header: 'OOS', size: 96, minSize: 92, accessorFn: (row) => row.oos_total_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.oos_total_return) },
+    { id: 'gap', header: 'Gap', size: 92, minSize: 88, accessorFn: (row) => runIsoosGap(row) ?? Number.POSITIVE_INFINITY, cell: ({ row }) => formatPct(runIsoosGap(row.original)) },
+    { id: 'max_drawdown', header: '回撤', size: 92, minSize: 88, accessorFn: (row) => row.max_drawdown, cell: ({ row }) => formatPct(row.original.max_drawdown) },
+    { id: 'profit_factor', header: 'PF', size: 72, minSize: 68, accessorFn: (row) => row.profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.profit_factor, 2) },
+    { id: 'trade_count', header: '交易数', size: 76, minSize: 72, accessorFn: (row) => row.trade_count, cell: ({ row }) => row.original.trade_count },
+    {
+      id: 'tracked_at',
+      header: '冻结时间',
+      size: 150,
+      minSize: 140,
+      accessorFn: (row) => trackedRunNotesByRunId.get(row.run_id)?.created_at ?? '',
+      cell: ({ row }) => {
+        const note = trackedRunNotesByRunId.get(row.original.run_id);
+        return note ? formatDateTime(note.created_at) : '--';
+      },
+    },
+    {
+      id: 'actions',
+      header: '操作',
+      size: 300,
+      minSize: 280,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const run = row.original;
+        const canRunNeighborhood = run.strategy_name === 'ema_pullback_atr_v2' && Boolean(run.trend_fast_period && run.trend_slow_period);
+        return (
+          <Space size={6}>
+            <Button size="small" onClick={() => onOpenRun(run.run_id)}>打开分析</Button>
+            <Button
+              size="small"
+              disabled={!canRunNeighborhood}
+              onClick={() => setNeighborhoodSourceRunId(run.run_id)}
+            >
+              看邻域
+            </Button>
+            <Tooltip title={canRunNeighborhood ? '基于冻结 Run 固定 tol/sl/rr/仓位/杠杆，只扩展趋势快慢周期邻域' : '仅 v2 Run 可跑趋势周期邻域'}>
+              <Button
+                size="small"
+                disabled={!canRunNeighborhood}
+                loading={neighborhoodRunId === run.run_id}
+                onClick={() => void onRunTrendNeighborhood(run)}
+              >
+                跑邻域
+              </Button>
+            </Tooltip>
+            <Button
+              size="small"
+              onClick={() => openDecisionModal(
+                'run',
+                run.run_id,
+                `追踪 Run ${shortRunId(run.run_id)}`,
+                { decision_status: 'observing', labels: ['frozen_run', 'tracking'] },
+              )}
+            >
+              记录
+            </Button>
+          </Space>
+        );
+      },
+    },
+  ], [neighborhoodRunId, onOpenRun, onRunTrendNeighborhood, trackedRunNotesByRunId]);
   const experimentColumns = useMemo<ColumnDef<ParameterExperimentSummary>[]>(() => [
     {
       header: '实验 ID',
@@ -3539,15 +6771,26 @@ function ParametersView({
       ),
     },
   ], [batchDecisionNotesByBatchId, deletingBatchId, onDeleteBatch, selectedBatchId, setSelectedBatchId]);
-  function openDecisionModal(targetType: string, targetId: string, title: string) {
+  function openDecisionModal(targetType: string, targetId: string, title: string, initialValues: Record<string, unknown> = {}) {
     decisionForm.resetFields();
-    decisionForm.setFieldsValue({ author: 'local', decision_status: 'candidate', labels: [] });
+    decisionForm.setFieldsValue({ author: 'local', decision_status: 'candidate', labels: [], ...initialValues });
     setDecisionTarget({ targetType, targetId, title });
   }
 
   const batchParameterGroupColumns = useMemo<ColumnDef<NonNullable<ParameterExperimentBatchDetail['parameter_groups']>[number]>[]>(() => [
-    { id: 'fast_slow', header: '快 / 慢', accessorFn: (row) => `${row.fast_period ?? ''}/${row.slow_period ?? ''}`, cell: ({ row }) => `${row.original.fast_period ?? '--'} / ${row.original.slow_period ?? '--'}` },
-    { id: 'leverage', header: '杠杆', accessorFn: (row) => row.leverage ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.leverage ?? '--' },
+    {
+      id: 'parameter_summary',
+      header: '参数组',
+      size: 260,
+      minSize: 220,
+      accessorFn: (row) => parameterGroupSummary(row),
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Text>{parameterGroupSummary(row.original)}</Text>
+          {row.original.signal_filter_summary ? <Tag color="blue">{row.original.signal_filter_summary}</Tag> : null}
+        </Space>
+      ),
+    },
     {
       id: 'labels',
       header: '参数组推荐标签',
@@ -3555,7 +6798,7 @@ function ParametersView({
       size: 240,
       minSize: 220,
       cell: ({ row }) => {
-        const key = `${row.original.fast_period ?? 'na'}:${row.original.slow_period ?? 'na'}:${row.original.leverage ?? 'na'}`;
+        const key = buildParameterGroupKey(row.original);
         const autoLabels = batchGroupLabelsByKey.get(key) ?? [];
         if (!autoLabels.length) {
           return <Text type="secondary">--</Text>;
@@ -3608,24 +6851,14 @@ function ParametersView({
         );
       },
     },
-    { id: 'snapshot_count', header: '覆盖快照', accessorFn: (row) => row.snapshot_count, cell: ({ row }) => row.original.snapshot_count },
-    { id: 'run_count', header: 'Run 数', accessorFn: (row) => row.run_count, cell: ({ row }) => row.original.run_count },
     { id: 'score', header: '总分', accessorFn: (row) => row.score, cell: ({ row }) => formatNumber(row.original.score, 1) },
     { id: 'confidence', header: '置信度', accessorFn: (row) => row.confidence, cell: ({ row }) => formatNumber(row.original.confidence, 1) },
-    { id: 'avg_total_return', header: '平均收益率', accessorFn: (row) => row.avg_total_return, cell: ({ row }) => formatPct(row.original.avg_total_return) },
-    { id: 'avg_max_drawdown', header: '平均最大回撤', accessorFn: (row) => row.avg_max_drawdown, cell: ({ row }) => formatPct(row.original.avg_max_drawdown) },
-    { id: 'worst_max_drawdown', header: '最差最大回撤', accessorFn: (row) => row.worst_max_drawdown, cell: ({ row }) => formatPct(row.original.worst_max_drawdown) },
-    { id: 'return_over_drawdown', header: '收益回撤比', accessorFn: (row) => row.return_over_drawdown, cell: ({ row }) => formatNumber(row.original.return_over_drawdown, 2) },
-    { id: 'avg_excess_return', header: '平均超额收益', accessorFn: (row) => row.avg_excess_return, cell: ({ row }) => formatPct(row.original.avg_excess_return) },
     { id: 'avg_oos_total_return', header: '平均样本外收益', accessorFn: (row) => row.avg_oos_total_return, cell: ({ row }) => formatPct(row.original.avg_oos_total_return) },
-    { id: 'avg_oos_excess_return', header: '平均样本外超额', accessorFn: (row) => row.avg_oos_excess_return, cell: ({ row }) => formatPct(row.original.avg_oos_excess_return) },
     { id: 'is_oos_gap', header: 'IS/OOS 差', accessorFn: (row) => row.is_oos_gap ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.is_oos_gap) },
-    { id: 'best_total_return', header: '最佳收益率', accessorFn: (row) => row.best_total_return, cell: ({ row }) => formatPct(row.original.best_total_return) },
-    { id: 'positive_ratio', header: '正收益占比', accessorFn: (row) => row.positive_ratio, cell: ({ row }) => formatPct(row.original.positive_ratio) },
-    { id: 'oos_positive_ratio', header: '样本外正收益占比', accessorFn: (row) => row.oos_positive_ratio ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.oos_positive_ratio) },
+    { id: 'avg_max_drawdown', header: '平均最大回撤', accessorFn: (row) => row.avg_max_drawdown, cell: ({ row }) => formatPct(row.original.avg_max_drawdown) },
+    { id: 'min_oos_trade_count', header: '最少 OOS 交易', accessorFn: (row) => row.min_oos_trade_count ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.min_oos_trade_count ?? '--' },
+    { id: 'return_over_drawdown', header: '收益回撤比', accessorFn: (row) => row.return_over_drawdown, cell: ({ row }) => formatNumber(row.original.return_over_drawdown, 2) },
     { id: 'neighbor_stability_score', header: '邻域稳定度', accessorFn: (row) => row.neighbor_stability_score ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.neighbor_stability_score) },
-    { id: 'stable_neighbor_count', header: '稳定邻居', accessorFn: (row) => row.stable_neighbor_count, cell: ({ row }) => `${row.original.stable_neighbor_count} / ${row.original.neighbor_count}` },
-    { id: 'min_trade_count', header: '最少交易数', accessorFn: (row) => row.min_trade_count ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.min_trade_count ?? '--' },
     {
       id: 'decision',
       header: '研究决策',
@@ -3651,7 +6884,7 @@ function ParametersView({
                 onClick={() => openDecisionModal(
                   'parameter_group',
                   targetId,
-                  `参数组 快 ${row.original.fast_period ?? '--'} / 慢 ${row.original.slow_period ?? '--'} / 杠杆 ${row.original.leverage ?? '--'}`,
+                  `参数组 ${parameterGroupSummary(row.original)}`,
                 )}
               >
                 记录
@@ -3750,10 +6983,69 @@ function ParametersView({
     { id: 'author', header: '记录人', size: 100, minSize: 90, accessorFn: (row) => row.author, cell: ({ row }) => row.original.author },
     { id: 'created_at', header: '时间', size: 160, minSize: 150, accessorFn: (row) => row.created_at, cell: ({ row }) => formatDateTime(row.original.created_at) },
   ], []);
+  const trendNeighborhoodColumns = useMemo<ColumnDef<NeighborhoodRunMatch>[]>(() => [
+    {
+      id: 'run',
+      header: 'Run',
+      size: 190,
+      minSize: 180,
+      accessorFn: (match) => match.row.run_id,
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Space size={6}>
+            <Text strong={row.original.isSource}>{shortRunId(row.original.row.run_id)}</Text>
+            {row.original.isSource ? <Tag color="blue">当前</Tag> : null}
+          </Space>
+          <Text type="secondary">{row.original.row.symbol} · {row.original.row.timeframe.toUpperCase()}</Text>
+        </Space>
+      ),
+    },
+    {
+      id: 'periods',
+      header: '趋势周期',
+      size: 132,
+      minSize: 124,
+      accessorFn: (match) => `${match.row.trend_fast_period ?? ''}/${match.row.trend_slow_period ?? ''}`,
+      cell: ({ row }) => `tf${row.original.row.trend_fast_period ?? '--'} / ts${row.original.row.trend_slow_period ?? '--'}`,
+    },
+    {
+      id: 'delta',
+      header: '偏移',
+      size: 112,
+      minSize: 104,
+      accessorFn: (match) => match.distance,
+      cell: ({ row }) => {
+        const formatDelta = (value: number | null) => (value === null ? '--' : value > 0 ? `+${value}` : `${value}`);
+        return `tf ${formatDelta(row.original.fastDelta)} / ts ${formatDelta(row.original.slowDelta)}`;
+      },
+    },
+    { id: 'total_return', header: '收益率', size: 96, minSize: 92, accessorFn: (match) => match.row.total_return, cell: ({ row }) => formatPct(row.original.row.total_return) },
+    { id: 'oos_total_return', header: 'OOS', size: 96, minSize: 92, accessorFn: (match) => match.row.oos_total_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.row.oos_total_return) },
+    { id: 'gap', header: 'Gap', size: 92, minSize: 88, accessorFn: (match) => runIsoosGap(match.row) ?? Number.POSITIVE_INFINITY, cell: ({ row }) => formatPct(runIsoosGap(row.original.row)) },
+    { id: 'max_drawdown', header: '回撤', size: 92, minSize: 88, accessorFn: (match) => match.row.max_drawdown, cell: ({ row }) => formatPct(row.original.row.max_drawdown) },
+    { id: 'trade_count', header: '交易数', size: 76, minSize: 72, accessorFn: (match) => match.row.trade_count, cell: ({ row }) => row.original.row.trade_count },
+    { id: 'profit_factor', header: 'PF', size: 72, minSize: 68, accessorFn: (match) => match.row.profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.row.profit_factor, 2) },
+    {
+      id: 'actions',
+      header: '操作',
+      size: 92,
+      minSize: 88,
+      enableSorting: false,
+      cell: ({ row }) => <Button size="small" onClick={() => onOpenRun(row.original.row.run_id)}>打开</Button>,
+    },
+  ], [onOpenRun]);
 
   const resultStats = useMemo(() => {
-    const sourceRows = workspaceMode === 'batch' ? filteredBatchRunRows : filteredExperimentRunRows;
-    const baseRows = workspaceMode === 'batch' ? selectedBatchRows : selectedExperimentRows;
+    const sourceRows = workspaceMode === 'batch'
+      ? filteredBatchRunRows
+      : workspaceMode === 'tracking'
+        ? filteredTrackedRunRows
+        : filteredExperimentRunRows;
+    const baseRows = workspaceMode === 'batch'
+      ? selectedBatchRows
+      : workspaceMode === 'tracking'
+        ? trackedRunRows
+        : selectedExperimentRows;
     const avgReturn = sourceRows.length
       ? sourceRows.reduce((sum, row) => sum + row.total_return, 0) / sourceRows.length
       : null;
@@ -3768,7 +7060,7 @@ function ParametersView({
       avgReturn,
       bestReturn,
     };
-  }, [allRows.length, filteredBatchRunRows, filteredExperimentRunRows, selectedBatchRows, selectedExperimentRows, workspaceMode]);
+  }, [allRows.length, filteredBatchRunRows, filteredExperimentRunRows, filteredTrackedRunRows, selectedBatchRows, selectedExperimentRows, trackedRunRows, workspaceMode]);
 
   const batchRecommendationSections = selectedBatchDetail
     ? [
@@ -3836,14 +7128,64 @@ function ParametersView({
   return (
     <>
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
-      {showExperimentForm ? (
+      <Card
+        className="cbw-workspace-nav"
+        title={(
+          <Space direction="vertical" size={0}>
+            <Text strong>参数实验工作区</Text>
+            <Text type="secondary" style={{ fontWeight: 400 }}>按初筛池、研究池、稳定池组织研究动作，批次和实验明细保留在高级区。</Text>
+          </Space>
+        )}
+        extra={(
+          <Space wrap>
+            {workspaceMode !== 'launch' ? (
+              <Input
+                placeholder="搜索 run / 数据集 / 标的 / 参数"
+                value={parameterQuery}
+                onChange={(event) => setParameterQuery(event.target.value)}
+                style={{ width: 260 }}
+              />
+            ) : null}
+            <Button onClick={() => void onRefreshExperiments()}>刷新状态</Button>
+          </Space>
+        )}
+      >
+        <Segmented<ParameterWorkspaceMode>
+          block
+          className="cbw-workbench-switcher"
+          value={workspaceMode}
+          onChange={setWorkspaceMode}
+          options={[
+            { label: '发起实验', value: 'launch' },
+            { label: '初筛池', value: 'screening' },
+            { label: '研究池', value: 'research' },
+            { label: '稳定池', value: 'stable' },
+          ]}
+        />
+      </Card>
+
+      {runCompareRows.length ? (
+        <Alert
+          type={runCompareRows.length === 2 ? 'success' : 'info'}
+          showIcon
+          message={`Run 对比：已选择 ${runCompareRows.length} / 2`}
+          description={runCompareSelectionText}
+          action={(
+            <Space>
+              <Button size="small" disabled={!runCompareModel} onClick={() => setRunCompareOpen(true)}>打开对比</Button>
+              <Button size="small" onClick={clearRunCompare}>清空</Button>
+            </Space>
+          )}
+        />
+      ) : null}
+
+      {workspaceMode === 'launch' ? (
         <Card
           className="cbw-experiment-form-card"
           title="发起实验批次"
           extra={(
             <Space>
               <Button onClick={() => void onRefreshExperiments()}>刷新状态</Button>
-              <Button onClick={() => setShowExperimentForm(false)}>收起</Button>
             </Space>
           )}
         >
@@ -3852,11 +7194,6 @@ function ParametersView({
           </Paragraph>
           <Form form={experimentForm} layout="vertical" onFinish={(values) => void onSubmitExperiment(values as Record<string, unknown>)}>
             <Row gutter={12}>
-              <Col xs={24} md={12} xl={8}>
-                <Form.Item name="batch_id" label="批次 ID" rules={[{ required: true, whitespace: true, message: '请输入批次 ID' }]}>
-                  <Input />
-                </Form.Item>
-              </Col>
               <Col xs={24} md={12} xl={8}>
                 <Form.Item name="search_type" label="搜索方式" rules={[{ required: true }]}>
                   <Select
@@ -3893,6 +7230,11 @@ function ParametersView({
               <Col span={24}>
                 <Form.Item name="snapshot_ids" label="数据快照" rules={[{ required: true, type: 'array', min: 1, message: '请至少选择一个数据快照' }]}>
                   <Select mode="multiple" options={datasetOptions} showSearch optionFilterProp="label" />
+                </Form.Item>
+              </Col>
+              <Col span={24}>
+                <Form.Item name="strategy_name" label="策略" rules={[{ required: true }]}>
+                  <Segmented block options={STRATEGY_OPTIONS} />
                 </Form.Item>
               </Col>
               <Col xs={24} md={8}>
@@ -3960,66 +7302,195 @@ function ParametersView({
                   </Col>
                 </>
               ) : null}
-              <Col xs={24} md={8}>
-                <Form.Item
-                  name="fast_periods"
-                  label="快线候选"
-                  rules={[
-                    {
-                      validator: async (_, value) => {
-                        const message = validateIntegerListInput(value, '快线候选');
-                        if (message) {
-                          throw new Error(message);
-                        }
-                        const slowValue = experimentForm.getFieldValue('slow_periods');
-                        const slowMessage = validateIntegerListInput(slowValue, '慢线候选');
-                        if (!slowMessage) {
-                          const fastPeriods = parseIntegerList(value);
-                          const slowPeriods = parseIntegerList(slowValue);
-                          const invalidPair = fastPeriods.flatMap((fastPeriod) => (
-                            slowPeriods.filter((slowPeriod) => fastPeriod >= slowPeriod).map((slowPeriod) => `${fastPeriod}/${slowPeriod}`)
-                          ))[0];
-                          if (invalidPair) {
-                            throw new Error(`所有组合都必须满足快线周期 < 慢线周期，当前存在 ${invalidPair}`);
-                          }
-                        }
-                      },
-                    },
-                  ]}
-                >
-                  <Input placeholder="例如 2,3,5,8" />
-                </Form.Item>
-              </Col>
-              <Col xs={24} md={8}>
-                <Form.Item
-                  name="slow_periods"
-                  label="慢线候选"
-                  rules={[
-                    {
-                      validator: async (_, value) => {
-                        const message = validateIntegerListInput(value, '慢线候选');
-                        if (message) {
-                          throw new Error(message);
-                        }
-                        const fastValue = experimentForm.getFieldValue('fast_periods');
-                        const fastMessage = validateIntegerListInput(fastValue, '快线候选');
-                        if (!fastMessage) {
-                          const fastPeriods = parseIntegerList(fastValue);
-                          const slowPeriods = parseIntegerList(value);
-                          const invalidPair = fastPeriods.flatMap((fastPeriod) => (
-                            slowPeriods.filter((slowPeriod) => fastPeriod >= slowPeriod).map((slowPeriod) => `${fastPeriod}/${slowPeriod}`)
-                          ))[0];
-                          if (invalidPair) {
-                            throw new Error(`所有组合都必须满足快线周期 < 慢线周期，当前存在 ${invalidPair}`);
-                          }
-                        }
-                      },
-                    },
-                  ]}
-                >
-                  <Input placeholder="例如 13,21,34" />
-                </Form.Item>
-              </Col>
+              {experimentStrategyName === 'ema_pullback_atr_v2' ? (
+                <>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="trend_fast_periods"
+                      label="趋势快线候选"
+                      rules={[
+                        {
+                          validator: async (_, value) => {
+                            const message = validateIntegerListInput(value, '趋势快线候选');
+                            if (message) {
+                              throw new Error(message);
+                            }
+                            const slowValue = experimentForm.getFieldValue('trend_slow_periods');
+                            const slowMessage = validateIntegerListInput(slowValue, '趋势慢线候选');
+                            if (!slowMessage) {
+                              const fastPeriods = parseIntegerList(value);
+                              const slowPeriods = parseIntegerList(slowValue);
+                              const invalidPair = fastPeriods.flatMap((fastPeriod) => (
+                                slowPeriods.filter((slowPeriod) => fastPeriod >= slowPeriod).map((slowPeriod) => `${fastPeriod}/${slowPeriod}`)
+                              ))[0];
+                              if (invalidPair) {
+                                throw new Error(`所有组合都必须满足趋势快线周期 < 趋势慢线周期，当前存在 ${invalidPair}`);
+                              }
+                            }
+                          },
+                        },
+                      ]}
+                    >
+                      <Input placeholder="例如 8,13" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="trend_slow_periods"
+                      label="趋势慢线候选"
+                      rules={[
+                        {
+                          validator: async (_, value) => {
+                            const message = validateIntegerListInput(value, '趋势慢线候选');
+                            if (message) {
+                              throw new Error(message);
+                            }
+                            const fastValue = experimentForm.getFieldValue('trend_fast_periods');
+                            const fastMessage = validateIntegerListInput(fastValue, '趋势快线候选');
+                            if (!fastMessage) {
+                              const fastPeriods = parseIntegerList(fastValue);
+                              const slowPeriods = parseIntegerList(value);
+                              const invalidPair = fastPeriods.flatMap((fastPeriod) => (
+                                slowPeriods.filter((slowPeriod) => fastPeriod >= slowPeriod).map((slowPeriod) => `${fastPeriod}/${slowPeriod}`)
+                              ))[0];
+                              if (invalidPair) {
+                                throw new Error(`所有组合都必须满足趋势快线周期 < 趋势慢线周期，当前存在 ${invalidPair}`);
+                              }
+                            }
+                          },
+                        },
+                      ]}
+                    >
+                      <Input placeholder="例如 34,55" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="atr_entry_tolerances"
+                      label="ATR 入场容忍候选"
+                      rules={[
+                        {
+                          validator: async (_, value) => {
+                            const message = validateNonNegativeNumberListInput(value, 'ATR 入场容忍候选');
+                            if (message) {
+                              throw new Error(message);
+                            }
+                          },
+                        },
+                      ]}
+                    >
+                      <Input placeholder="例如 0.5,1.0" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="atr_stop_mults"
+                      label="ATR 止损倍数候选"
+                      rules={[
+                        {
+                          validator: async (_, value) => {
+                            const message = validatePositiveNumberListInput(value, 'ATR 止损倍数候选');
+                            if (message) {
+                              throw new Error(message);
+                            }
+                          },
+                        },
+                      ]}
+                    >
+                      <Input placeholder="例如 1.5,2.0" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="risk_reward_ratios"
+                      label="盈亏比候选"
+                      rules={[
+                        {
+                          validator: async (_, value) => {
+                            const message = validatePositiveNumberListInput(value, '盈亏比候选');
+                            if (message) {
+                              throw new Error(message);
+                            }
+                          },
+                        },
+                      ]}
+                    >
+                      <Input placeholder="例如 1.5,2.0" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Descriptions size="small" bordered column={2} style={{ marginTop: 30 }}>
+                      <Descriptions.Item label="Entry EMA">21</Descriptions.Item>
+                      <Descriptions.Item label="ATR">14</Descriptions.Item>
+                      <Descriptions.Item label="Min ATR/Price">0.2%</Descriptions.Item>
+                      <Descriptions.Item label="Min Stop">0.3%</Descriptions.Item>
+                    </Descriptions>
+                  </Col>
+                </>
+              ) : (
+                <>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="fast_periods"
+                      label="快线候选"
+                      rules={[
+                        {
+                          validator: async (_, value) => {
+                            const message = validateIntegerListInput(value, '快线候选');
+                            if (message) {
+                              throw new Error(message);
+                            }
+                            const slowValue = experimentForm.getFieldValue('slow_periods');
+                            const slowMessage = validateIntegerListInput(slowValue, '慢线候选');
+                            if (!slowMessage) {
+                              const fastPeriods = parseIntegerList(value);
+                              const slowPeriods = parseIntegerList(slowValue);
+                              const invalidPair = fastPeriods.flatMap((fastPeriod) => (
+                                slowPeriods.filter((slowPeriod) => fastPeriod >= slowPeriod).map((slowPeriod) => `${fastPeriod}/${slowPeriod}`)
+                              ))[0];
+                              if (invalidPair) {
+                                throw new Error(`所有组合都必须满足快线周期 < 慢线周期，当前存在 ${invalidPair}`);
+                              }
+                            }
+                          },
+                        },
+                      ]}
+                    >
+                      <Input placeholder="例如 2,3,5,8" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="slow_periods"
+                      label="慢线候选"
+                      rules={[
+                        {
+                          validator: async (_, value) => {
+                            const message = validateIntegerListInput(value, '慢线候选');
+                            if (message) {
+                              throw new Error(message);
+                            }
+                            const fastValue = experimentForm.getFieldValue('fast_periods');
+                            const fastMessage = validateIntegerListInput(fastValue, '快线候选');
+                            if (!fastMessage) {
+                              const fastPeriods = parseIntegerList(fastValue);
+                              const slowPeriods = parseIntegerList(value);
+                              const invalidPair = fastPeriods.flatMap((fastPeriod) => (
+                                slowPeriods.filter((slowPeriod) => fastPeriod >= slowPeriod).map((slowPeriod) => `${fastPeriod}/${slowPeriod}`)
+                              ))[0];
+                              if (invalidPair) {
+                                throw new Error(`所有组合都必须满足快线周期 < 慢线周期，当前存在 ${invalidPair}`);
+                              }
+                            }
+                          },
+                        },
+                      ]}
+                    >
+                      <Input placeholder="例如 13,21,34" />
+                    </Form.Item>
+                  </Col>
+                </>
+              )}
               <Col xs={24} md={8}>
                 <Form.Item
                   name="leverage_candidates"
@@ -4038,11 +7509,43 @@ function ParametersView({
                   <Input placeholder="例如 1,2,3,5" />
                 </Form.Item>
               </Col>
-              <Col xs={24} md={8} xl={4}>
-                <Form.Item name="cash_allocation_pct" label="资金使用比例 (%)" rules={[{ required: true, message: '请输入资金使用比例' }]}>
-                  <InputNumber min={0.01} max={100} step={1} style={{ width: '100%' }} />
-                </Form.Item>
-              </Col>
+              <Form.Item noStyle shouldUpdate={(prev, current) => prev.strategy_name !== current.strategy_name || prev.qty_policy_ref !== current.qty_policy_ref}>
+                {({ getFieldValue }) => {
+                  const isV2 = getFieldValue('strategy_name') === 'ema_pullback_atr_v2';
+                  const qtyPolicyRef = String(getFieldValue('qty_policy_ref') ?? 'percent_of_cash');
+                  const showRiskPct = isV2 && usesRiskPct(qtyPolicyRef);
+                  const showCashAllocation = !isV2 || usesCashAllocation(qtyPolicyRef);
+                  return (
+                    <>
+                      {isV2 ? (
+                        <Col xs={24} md={8} xl={4}>
+                          <Form.Item name="qty_policy_ref" label="仓位模式" rules={[{ required: true, message: '请选择仓位模式' }]}>
+                            <Select options={QTY_POLICY_OPTIONS} />
+                          </Form.Item>
+                        </Col>
+                      ) : null}
+                      {showRiskPct ? (
+                        <Col xs={24} md={8} xl={4}>
+                          <Form.Item name="risk_pct_per_trade" label="单笔风险比例" rules={[{ required: true, message: '请输入单笔风险比例' }]}>
+                            <InputNumber min={0.001} max={0.99} step={0.001} style={{ width: '100%' }} />
+                          </Form.Item>
+                        </Col>
+                      ) : null}
+                      {showCashAllocation ? (
+                        <Col xs={24} md={8} xl={4}>
+                          <Form.Item
+                            name="cash_allocation_pct"
+                            label={qtyPolicyRef === 'risk_pct_of_cash_allocation' ? '最多动用资金 (%)' : '资金使用比例 (%)'}
+                            rules={[{ required: true, message: '请输入资金使用比例' }]}
+                          >
+                            <InputNumber min={0.01} max={100} step={1} style={{ width: '100%' }} />
+                          </Form.Item>
+                        </Col>
+                      ) : null}
+                    </>
+                  );
+                }}
+              </Form.Item>
               <Col xs={24} md={8} xl={4}>
                 <Form.Item name="initial_cash" label="初始资金" rules={[{ required: true, message: '请输入初始资金' }]}>
                   <InputNumber min={0.01} style={{ width: '100%' }} />
@@ -4078,28 +7581,74 @@ function ParametersView({
           </Form>
         </Card>
       ) : null}
+      {workspaceMode === 'launch' ? (
+        <Card
+          className="cbw-launch-progress-card"
+          title="最近批次进度"
+          extra={<Button onClick={() => void onRefreshExperiments()}>刷新状态</Button>}
+        >
+          {recentBatches.length ? (
+            <Space direction="vertical" size={12} style={{ width: '100%' }}>
+              {recentBatches.map((batch) => {
+                const plannedRuns = batch.planned_run_count || 0;
+                const completedRuns = batch.run_count || 0;
+                const failedCount = batch.failed_experiment_count || 0;
+                const isRunning = batch.status === 'pending' || batch.status === 'running';
+                const percent = plannedRuns > 0
+                  ? Math.min(100, Math.round(((completedRuns + failedCount) / plannedRuns) * 100))
+                  : batch.status === 'success' ? 100 : 0;
+                return (
+                  <div className="cbw-batch-progress-row" key={batch.batch_id}>
+                    <Flex justify="space-between" align="center" wrap="wrap" gap={8}>
+                      <Space wrap size={[8, 8]}>
+                        <Text strong>{shortRunId(batch.batch_id)}</Text>
+                        <Tag color={experimentStatusColor(batch.status)}>{experimentStatusText(batch.status)}</Tag>
+                        <Text type="secondary">{experimentSearchTypeLabel(batch.search_type)} · {batch.snapshot_count} 快照</Text>
+                      </Space>
+                      <Space>
+                        <Button
+                          size="small"
+                          onClick={() => {
+                            setSelectedBatchId(batch.batch_id);
+                            setWorkspaceMode('batch');
+                          }}
+                        >
+                          查看明细
+                        </Button>
+                        {batch.status === 'success' ? (
+                          <Button size="small" type="primary" onClick={() => setWorkspaceMode('screening')}>
+                            去初筛池
+                          </Button>
+                        ) : null}
+                      </Space>
+                    </Flex>
+                    <Progress
+                      percent={percent}
+                      status={batch.status === 'failed' ? 'exception' : batch.status === 'success' ? 'success' : 'active'}
+                      showInfo
+                    />
+                    <Flex justify="space-between" align="center" wrap="wrap" gap={8}>
+                      <Text type="secondary">
+                        Run {completedRuns} / {plannedRuns || '--'} · 失败实验 {failedCount}
+                      </Text>
+                      <Text type="secondary">{formatDateTime(batch.created_at)}</Text>
+                    </Flex>
+                    {isRunning ? (
+                      <Text type="secondary">状态会自动刷新。</Text>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </Space>
+          ) : (
+            <Alert type="info" showIcon message="还没有提交过实验批次。" />
+          )}
+        </Card>
+      ) : null}
+      {workspaceMode !== 'launch' ? (
         <Card
           className="cbw-research-workbench"
-          title={(
-            <Space direction="vertical" size={0}>
-              <Text strong>参数实验工作区</Text>
-              <Text type="secondary" style={{ fontWeight: 400 }}>先看批次推荐和人工关注，再进入参数组、Run 和台账明细。</Text>
-            </Space>
-          )}
-          extra={(
-            <Space wrap>
-              <Input
-                placeholder="搜索 run / 数据集 / 标的"
-                value={parameterQuery}
-                onChange={(event) => setParameterQuery(event.target.value)}
-                style={{ width: 260 }}
-              />
-              <Button onClick={() => setShowExperimentForm((value) => !value)}>
-                {showExperimentForm ? '收起实验表单' : '新建实验批次'}
-              </Button>
-              <Button onClick={() => void onRefreshExperiments()}>刷新状态</Button>
-            </Space>
-          )}
+          title={workspaceMode === 'screening' ? '初筛池' : workspaceMode === 'research' ? '研究池' : workspaceMode === 'stable' ? '稳定池' : '高级区'}
         >
           <Space direction="vertical" size={16} style={{ width: '100%' }}>
             <Row gutter={[12, 12]}>
@@ -4108,23 +7657,50 @@ function ParametersView({
               <Col xs={12} md={6}><Card size="small" className="cbw-summary-card"><Statistic className="cbw-summary-stat" title="平均收益率" value={resultStats.avgReturn === null ? '--' : formatPct(resultStats.avgReturn)} /></Card></Col>
               <Col xs={12} md={6}><Card size="small" className="cbw-summary-card"><Statistic className="cbw-summary-stat" title="最佳收益率" value={resultStats.bestReturn === null ? '--' : formatPct(resultStats.bestReturn)} /></Card></Col>
             </Row>
-            <Segmented<'batch' | 'experiment' | 'decisions' | 'sensitivity'>
-              block
-              className="cbw-workbench-switcher"
-              value={workspaceMode}
-              onChange={setWorkspaceMode}
-              options={[
-                { label: '批次结果', value: 'batch' },
-                { label: '单实验明细', value: 'experiment' },
-                { label: '研究决策台账', value: 'decisions' },
-                { label: '参数敏感度', value: 'sensitivity' },
-              ]}
-            />
-            <Card size="small" className="cbw-filter-panel" title="筛选与定位">
-              <Space direction="vertical" size={12} style={{ width: '100%' }}>
-                <Space wrap>
-                  {workspaceMode === 'batch' ? (
+            {workspaceMode !== 'screening' && workspaceMode !== 'stable' ? (
+              <Card size="small" className="cbw-filter-panel" title="筛选与定位">
+                <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                  {workspaceMode === 'research' ? (
+                    <Space wrap>
+                    <Select
+                      showSearch
+                      value={selectedResearchSubjectKey ?? undefined}
+                      style={{ minWidth: 360 }}
+                      placeholder="选择研究对象"
+                      onChange={(value) => setSelectedResearchSubjectKey(value)}
+                      options={researchSubjects.map((subject) => ({
+                        label: `${subject.strategy_name} · ${subject.symbol} · ${subject.timeframe.toUpperCase()} · ${subject.validation_split_id}`,
+                        value: subject.subject_key,
+                      }))}
+                    />
+                    <Select
+                      mode="multiple"
+                      allowClear
+                      value={researchClassificationFilter}
+                      style={{ minWidth: 220 }}
+                      placeholder="参数组分类"
+                      onChange={setResearchClassificationFilter}
+                      options={['robust_candidate', 'high_return_candidate', 'exploratory_candidate', 'excluded'].map((value) => ({
+                        label: parameterGroupClassificationText(value),
+                        value,
+                      }))}
+                    />
+                    <Select
+                      allowClear
+                      value={researchQtyPolicyFilter ?? undefined}
+                      style={{ minWidth: 180 }}
+                      placeholder="仓位模式"
+                      onChange={(value) => setResearchQtyPolicyFilter(value ?? null)}
+                      options={Array.from(new Set(researchParameterGroups.map((group) => group.qty_policy_ref).filter((value): value is string => Boolean(value)))).map((value) => ({
+                        label: value,
+                        value,
+                      }))}
+                    />
+                    </Space>
+                  ) : null}
+                  {workspaceMode === 'batch' && selectedBatchId === ALL_BATCHES ? (
                     <>
+                      <Space wrap>
                       <Select
                         mode="multiple"
                         allowClear
@@ -4132,58 +7708,67 @@ function ParametersView({
                         style={{ minWidth: 200 }}
                         placeholder="批次状态"
                         onChange={setBatchDecisionStatusFilter}
-                        options={DECISION_STATUS_OPTIONS.filter((option) => availableBatchDecisionStatuses.includes(option.value))}
+                        options={availableBatchStatuses.map((status) => ({
+                          label: BATCH_STATUS_TEXT[status] ?? status,
+                          value: status,
+                        }))}
                       />
                       <Select
                         mode="multiple"
                         allowClear
+                        disabled={!availableBatchDecisionLabels.length}
                         value={batchDecisionLabelFilter}
-                        style={{ minWidth: 210 }}
-                        placeholder="批次标签"
+                        style={{ minWidth: 230 }}
+                        placeholder={availableBatchDecisionLabels.length ? '批次级人工标签' : '暂无批次级人工标签'}
                         onChange={setBatchDecisionLabelFilter}
                         options={availableBatchDecisionLabels.map((label) => ({
                           label: RESEARCH_LABEL_TEXT[label] ?? label,
                           value: label,
                         }))}
                       />
-                      <Select
-                        mode="multiple"
-                        allowClear
-                        disabled={autoLabelFilterDisabled}
-                        value={autoLabelFilter}
-                        style={{ minWidth: 220 }}
-                        placeholder={autoLabelFilterDisabled ? '选择单个批次后筛自动标签' : '参数组自动标签'}
-                        onChange={setAutoLabelFilter}
-                        options={availableAutoLabels.map((label) => ({
-                          label: AUTO_GROUP_MEMBERSHIP_LABEL_TEXT[label] ?? label,
-                          value: label,
-                        }))}
-                      />
-                      <Select
-                        mode="multiple"
-                        allowClear
-                        disabled={selectedBatchId === ALL_BATCHES}
-                        value={groupDecisionStatusFilter}
-                        style={{ minWidth: 220 }}
-                        placeholder={selectedBatchId === ALL_BATCHES ? '选择单个批次后筛参数组状态' : '参数组状态'}
-                        onChange={setGroupDecisionStatusFilter}
-                        options={DECISION_STATUS_OPTIONS.filter((option) => availableGroupDecisionStatuses.includes(option.value))}
-                      />
-                      <Select
-                        mode="multiple"
-                        allowClear
-                        disabled={selectedBatchId === ALL_BATCHES}
-                        value={groupDecisionLabelFilter}
-                        style={{ minWidth: 220 }}
-                        placeholder={selectedBatchId === ALL_BATCHES ? '选择单个批次后筛参数组标签' : '参数组标签'}
-                        onChange={setGroupDecisionLabelFilter}
-                        options={availableGroupDecisionLabels.map((label) => ({
-                          label: RESEARCH_LABEL_TEXT[label] ?? label,
-                          value: label,
-                        }))}
-                      />
+                      </Space>
+                      <Text type="secondary">批次标签只匹配批次级 Research Note，不包含 Run 或参数组标签。</Text>
                     </>
-                  ) : (
+                  ) : null}
+                  {workspaceMode === 'batch' && selectedBatchId !== ALL_BATCHES ? (
+                    <Space wrap>
+                    <Select
+                      mode="multiple"
+                      allowClear
+                      value={autoLabelFilter}
+                      style={{ minWidth: 220 }}
+                      placeholder="参数组自动标签"
+                      onChange={setAutoLabelFilter}
+                      options={availableAutoLabels.map((label) => ({
+                        label: AUTO_GROUP_MEMBERSHIP_LABEL_TEXT[label] ?? label,
+                        value: label,
+                      }))}
+                    />
+                    <Select
+                      mode="multiple"
+                      allowClear
+                      value={groupDecisionStatusFilter}
+                      style={{ minWidth: 220 }}
+                      placeholder="参数组决策状态"
+                      onChange={setGroupDecisionStatusFilter}
+                      options={DECISION_STATUS_OPTIONS}
+                    />
+                    <Select
+                      mode="multiple"
+                      allowClear
+                      value={groupDecisionLabelFilter}
+                      style={{ minWidth: 220 }}
+                      placeholder="参数组人工标签"
+                      onChange={setGroupDecisionLabelFilter}
+                      options={availableGroupDecisionLabels.map((label) => ({
+                        label: RESEARCH_LABEL_TEXT[label] ?? label,
+                        value: label,
+                      }))}
+                    />
+                    </Space>
+                  ) : null}
+                  {(workspaceMode === 'tracking' || workspaceMode === 'experiment' || workspaceMode === 'decisions' || workspaceMode === 'sensitivity') ? (
+                    <Space wrap>
                     <Select
                       mode="multiple"
                       allowClear
@@ -4196,16 +7781,15 @@ function ParametersView({
                         value: label,
                       }))}
                     />
-                  )}
-                </Space>
-                {workspaceMode === 'batch' ? (
-                  <Space wrap>
+                    </Space>
+                  ) : null}
+                  {workspaceMode === 'batch' && selectedBatchId !== ALL_BATCHES ? (
+                    <Space wrap>
                     <InputNumber
                       min={0}
                       max={100}
                       step={5}
                       style={{ width: 132 }}
-                      disabled={selectedBatchId === ALL_BATCHES}
                       value={minScoreFilter}
                       placeholder="最小总分"
                       onChange={(value) => setMinScoreFilter(value === null ? null : Number(value))}
@@ -4215,7 +7799,6 @@ function ParametersView({
                       max={100}
                       step={5}
                       style={{ width: 132 }}
-                      disabled={selectedBatchId === ALL_BATCHES}
                       value={minConfidenceFilter}
                       placeholder="最小置信度"
                       onChange={(value) => setMinConfidenceFilter(value === null ? null : Number(value))}
@@ -4225,7 +7808,6 @@ function ParametersView({
                       max={100}
                       step={5}
                       style={{ width: 146 }}
-                      disabled={selectedBatchId === ALL_BATCHES}
                       value={maxDrawdownFilter}
                       placeholder="最大回撤%"
                       onChange={(value) => setMaxDrawdownFilter(value === null ? null : Number(value))}
@@ -4234,7 +7816,6 @@ function ParametersView({
                       min={0}
                       step={0.1}
                       style={{ width: 150 }}
-                      disabled={selectedBatchId === ALL_BATCHES}
                       value={minReturnDrawdownFilter}
                       placeholder="最小收益回撤比"
                       onChange={(value) => setMinReturnDrawdownFilter(value === null ? null : Number(value))}
@@ -4244,22 +7825,427 @@ function ParametersView({
                       max={100}
                       step={1}
                       style={{ width: 120 }}
-                      disabled={selectedBatchId === ALL_BATCHES}
                       value={topNFilter}
                       placeholder="Top N"
                       onChange={(value) => setTopNFilter(value === null ? null : Number(value))}
                     />
-                  </Space>
+                    </Space>
+                  ) : null}
+                </Space>
+              </Card>
+            ) : null}
+
+            {workspaceMode === 'screening' && (
+              <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                <Row gutter={[12, 12]}>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="初筛 Run" value={filteredScreeningRuns.length} suffix={`/ ${screeningPoolRuns.length}`} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="值得研究" value={filteredScreeningRuns.filter((run) => run.auto_labels.includes('值得研究')).length} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="平均 OOS" value={formatPct(averageNullable(filteredScreeningRuns.map((run) => run.oos_total_return)))} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="平均评分" value={formatNumber(averageNullable(filteredScreeningRuns.map((run) => run.score)), 1)} /></Card></Col>
+                </Row>
+                {screeningRiskProfile.length ? (
+                  <Card size="small" title="参数风险提示">
+                    <Row gutter={[12, 12]}>
+                      {screeningRiskProfile.map((item) => (
+                        <Col xs={24} lg={12} xxl={8} key={item.key}>
+                          <Alert
+                            type={item.severity === 'danger' ? 'error' : 'warning'}
+                            showIcon
+                            message={(
+                              <Space size={8} wrap>
+                                <Text strong>{item.dimension}</Text>
+                                <Tag color={item.severity === 'danger' ? 'red' : 'orange'}>{item.label}</Tag>
+                                <Text>{item.severity === 'danger' ? '不建议继续扩大' : '谨慎复测'}</Text>
+                              </Space>
+                            )}
+                            description={item.reason}
+                          />
+                        </Col>
+                      ))}
+                    </Row>
+                  </Card>
                 ) : null}
+                <Card size="small" title="初筛池">
+                  <Paragraph type="secondary">
+                    汇总所有已落盘 run，用自动评分和标签排序。Run 是初筛证据，进入研究池后会升维成同一入场结构与风险配置的研究候选。
+                  </Paragraph>
+                  <Space direction="vertical" size={12} style={{ width: '100%', marginBottom: 12 }}>
+                    <Space wrap>
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        value={screeningLabelFilter}
+                        style={{ minWidth: 260 }}
+                        placeholder="标签"
+                        onChange={setScreeningLabelFilter}
+                        options={screeningLabelOptions.map((label) => ({ label: researchLabelText(label), value: label }))}
+                      />
+                      <Select
+                        allowClear
+                        value={screeningStrategyFilter ?? undefined}
+                        style={{ minWidth: 190 }}
+                        placeholder="策略"
+                        onChange={(value) => setScreeningStrategyFilter(value ?? null)}
+                        options={screeningStrategyOptions.map((strategy) => ({ label: strategy, value: strategy }))}
+                      />
+                      <Select
+                        allowClear
+                        value={screeningSymbolFilter ?? undefined}
+                        style={{ minWidth: 180 }}
+                        placeholder="标的"
+                        onChange={(value) => setScreeningSymbolFilter(value ?? null)}
+                        options={screeningSymbolOptions.map((symbol) => ({ label: symbol, value: symbol }))}
+                      />
+                      <InputNumber
+                        min={0}
+                        max={100}
+                        step={1}
+                        style={{ width: 120 }}
+                        value={screeningMinScoreFilter}
+                        placeholder="最低评分"
+                        onChange={(value) => setScreeningMinScoreFilter(value === null ? null : Number(value))}
+                      />
+                      <InputNumber
+                        step={5}
+                        style={{ width: 128 }}
+                        value={screeningMinOosReturnFilter}
+                        placeholder="最低 OOS%"
+                        onChange={(value) => setScreeningMinOosReturnFilter(value === null ? null : Number(value))}
+                      />
+                      <InputNumber
+                        step={5}
+                        style={{ width: 138 }}
+                        value={screeningMinIsExcessReturnFilter}
+                        placeholder="最低 IS超额%"
+                        onChange={(value) => setScreeningMinIsExcessReturnFilter(value === null ? null : Number(value))}
+                      />
+                      <InputNumber
+                        min={0}
+                        step={5}
+                        style={{ width: 128 }}
+                        value={screeningMaxGapFilter}
+                        placeholder="最大 Gap%"
+                        onChange={(value) => setScreeningMaxGapFilter(value === null ? null : Number(value))}
+                      />
+                      <InputNumber
+                        min={0}
+                        step={5}
+                        style={{ width: 132 }}
+                        value={screeningMaxDrawdownFilter}
+                        placeholder="最大回撤%"
+                        onChange={(value) => setScreeningMaxDrawdownFilter(value === null ? null : Number(value))}
+                      />
+                      <InputNumber
+                        min={0}
+                        step={0.1}
+                        style={{ width: 110 }}
+                        value={screeningMinProfitFactorFilter}
+                        placeholder="最低 PF"
+                        onChange={(value) => setScreeningMinProfitFactorFilter(value === null ? null : Number(value))}
+                      />
+                      <InputNumber
+                        min={0}
+                        step={1}
+                        style={{ width: 120 }}
+                        value={screeningMinTradeCountFilter}
+                        placeholder="最少交易"
+                        onChange={(value) => setScreeningMinTradeCountFilter(value === null ? null : Number(value))}
+                      />
+                      <Button
+                        onClick={() => {
+                          setScreeningLabelFilter([]);
+                          setScreeningStrategyFilter(null);
+                          setScreeningSymbolFilter(null);
+                          setScreeningMinScoreFilter(null);
+                          setScreeningMinOosReturnFilter(null);
+                          setScreeningMinIsExcessReturnFilter(null);
+                          setScreeningMaxGapFilter(null);
+                          setScreeningMaxDrawdownFilter(null);
+                          setScreeningMinProfitFactorFilter(null);
+                          setScreeningMinTradeCountFilter(null);
+                          setScreeningSorting([{ id: 'score', desc: true }]);
+                        }}
+                      >
+                        重置筛选
+                      </Button>
+                    </Space>
+                  </Space>
+                  {filteredScreeningRuns.length ? (
+                    <DataTable
+                      columns={screeningRunColumns}
+                      data={filteredScreeningRuns}
+                      tableClassName="cbw-parameter-result-table"
+                      initialPageSize={12}
+                      pageSizeOptions={[12, 24, 48]}
+                      initialSorting={[{ id: 'score', desc: true }]}
+                      sorting={screeningSorting}
+                      onSortingChange={setScreeningSorting}
+                    />
+                  ) : (
+                    <Alert type="info" showIcon message="当前初筛池没有可展示的 run" />
+                  )}
+                </Card>
               </Space>
-            </Card>
+            )}
+
+            {false && workspaceMode === 'screening' && (
+              <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                {!researchSubjects.length ? (
+                  <Alert type="info" showIcon message="当前还没有可横向对比的参数实验结果" />
+                ) : (
+                  <>
+                    <Row gutter={[12, 12]}>
+                      <Col xs={12} md={6}>
+                        <Card size="small">
+                          <Statistic title="研究对象" value={researchSubjects.length} />
+                        </Card>
+                      </Col>
+                      <Col xs={12} md={6}>
+                        <Card size="small">
+                          <Statistic title="参数组" value={filteredResearchGroups.length} />
+                        </Card>
+                      </Col>
+                      <Col xs={12} md={6}>
+                        <Card size="small">
+                          <Statistic
+                            title="平均 OOS"
+                            value={formatPct(averageNullable(filteredResearchGroups.map((group) => group.avg_oos_total_return)))}
+                          />
+                        </Card>
+                      </Col>
+                      <Col xs={12} md={6}>
+                        <Card size="small">
+                          <Statistic
+                            title="最差回撤"
+                            value={formatPct(filteredResearchGroups.length ? Math.max(...filteredResearchGroups.map((group) => group.worst_max_drawdown)) : null)}
+                          />
+                        </Card>
+                      </Col>
+                    </Row>
+
+                    <Card size="small" title="全局研究结论">
+                      <Paragraph type="secondary">
+                        跨所有研究对象、批次和快照自动筛选参数组。优先看首选候选和稳健候选；高收益但激进、需要降风险验证只能作为下一轮复测来源。
+                      </Paragraph>
+                      <Row gutter={[12, 12]}>
+                        {researchConclusionBuckets.map((bucket) => (
+                          <Col key={bucket.key} xs={24} xl={bucket.key === 'excluded' ? 24 : 12} xxl={bucket.key === 'excluded' ? 24 : 8}>
+                            <Alert
+                              type={bucket.tone}
+                              showIcon
+                              message={(
+                                <Space size={8} wrap>
+                                  <Text strong>{bucket.title}</Text>
+                                  <Tag>{bucket.items.length}</Tag>
+                                </Space>
+                              )}
+                              description={(
+                                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                                  <Text type="secondary">{bucket.description}</Text>
+                                  {bucket.items.length ? (
+                                    bucket.items.map((item, index) => (
+                                      <div key={item.group.group_key}>
+                                        <Space size={[6, 4]} wrap>
+                                          <Text strong>{index + 1}.</Text>
+                                          <Text strong>{item.group.symbol} · {item.group.timeframe.toUpperCase()}</Text>
+                                          {renderParameterPoints(parameterGroupPoints(item.group), bucket.tone === 'error' ? 'default' : 'blue')}
+                                        </Space>
+                                        <Flex justify="space-between" align="center" wrap="wrap" gap={8} style={{ marginTop: 4 }}>
+                                          <Text type="secondary">{item.reasons.join(' · ')}</Text>
+                                          <Space size={6}>
+                                            <Button size="small" onClick={() => setSelectedParameterGroupKey(item.group.group_key)}>详情</Button>
+                                            <Button size="small" onClick={() => setRiskCompareGroupKey(item.group.group_key)}>风险对比</Button>
+                                            {item.group.representative_run_id ? (
+                                              <Button size="small" onClick={() => onOpenRun(item.group.representative_run_id as string)}>代表 Run</Button>
+                                            ) : null}
+                                          </Space>
+                                        </Flex>
+                                      </div>
+                                    ))
+                                  ) : (
+                                    <Text type="secondary">暂无命中</Text>
+                                  )}
+                                </Space>
+                              )}
+                            />
+                          </Col>
+                        ))}
+                      </Row>
+                    </Card>
+                  </>
+                )}
+              </Space>
+            )}
+
+            {workspaceMode === 'research' && (
+              <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                {!researchPoolCandidates.length ? (
+                  <Alert type="info" showIcon message="研究池还没有候选" description="在初筛池点击“加入研究池”后，候选会按入场结构和风险配置合并到这里。" />
+                ) : (
+                  <>
+                    <Row gutter={[12, 12]}>
+                      <Col xs={12} md={6}><Card size="small"><Statistic title="研究候选" value={filteredResearchPoolCandidates.length} suffix={`/ ${researchPoolCandidates.length}`} /></Card></Col>
+                      <Col xs={12} md={6}><Card size="small"><Statistic title="可入稳定池" value={filteredResearchPoolCandidates.filter((candidate) => candidate.status === '可入稳定池').length} /></Card></Col>
+                      <Col xs={12} md={6}><Card size="small"><Statistic title="邻域已跑" value={filteredResearchPoolCandidates.filter((candidate) => candidate.neighborhood_summary.status === '已跑').length} /></Card></Col>
+                      <Col xs={12} md={6}><Card size="small"><Statistic title="风险矩阵已跑" value={filteredResearchPoolCandidates.filter((candidate) => candidate.risk_matrix_summary.status === '已跑').length} /></Card></Col>
+                    </Row>
+
+                    <Card size="small" title="研究池">
+                      <DataTable
+                        columns={researchPoolColumns}
+                        data={filteredResearchPoolCandidates}
+                        tableClassName="cbw-parameter-group-table"
+                        initialPageSize={8}
+                        pageSizeOptions={[8, 16, 32]}
+                        initialSorting={[{ id: 'representative_run_score', desc: true }]}
+                      />
+                    </Card>
+
+                    {false ? <Card
+                      size="small"
+                      title={(
+                        <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                          <Text strong>{researchGroupTitle.title}</Text>
+                          <Text type="secondary" style={{ whiteSpace: 'normal' }}>{researchGroupTitle.common}</Text>
+                        </Space>
+                      )}
+                    >
+                      <Paragraph type="secondary">
+                        同一参数组会合并来自不同批次和快照的 run；列表中只展示每行真正变化的参数。
+                      </Paragraph>
+                      {recommendedResearchGroups.length ? (
+                        <Alert
+                          type="success"
+                          showIcon
+                          message="直接推荐参数组"
+                          description={(
+                            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                              {recommendedResearchGroups.map((group, index) => {
+                                const efficiency = (group.avg_oos_total_return ?? group.avg_total_return) / Math.max(group.worst_max_drawdown, 0.01);
+                                return (
+                                  <Space key={group.group_key} size={[6, 6]} wrap>
+                                    <Text strong>{index + 1}.</Text>
+                                    {renderParameterPoints(parameterGroupPoints(group).filter((point) => !researchGroupCommonKeys.has(point.key)), 'blue')}
+                                    <Text type="secondary">
+                                      OOS {formatPct(group.avg_oos_total_return)} · 最差回撤 {formatPct(group.worst_max_drawdown)} · PF {formatNumber(group.avg_profit_factor, 2)} · OOS/DD {formatNumber(efficiency, 2)}
+                                    </Text>
+                                  </Space>
+                                );
+                              })}
+                            </Space>
+                          )}
+                          style={{ marginBottom: 12 }}
+                        />
+                      ) : null}
+                      {filteredResearchGroups.length ? (
+                        <DataTable
+                          columns={researchParameterGroupColumns}
+                          data={filteredResearchGroups}
+                          tableClassName="cbw-parameter-group-table"
+                          initialPageSize={12}
+                          pageSizeOptions={[12, 24, 48]}
+                          initialSorting={[{ id: 'research_score', desc: true }]}
+                        />
+                      ) : (
+                        <Alert type="info" showIcon message="当前筛选下没有参数组" />
+                      )}
+                    </Card> : null}
+                  </>
+                )}
+              </Space>
+            )}
+
+            {workspaceMode === 'stable' && (
+              <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                <Row gutter={[12, 12]}>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="稳定组合" value={filteredStablePoolCandidates.length} suffix={`/ ${stablePoolCandidates.length}`} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="证据 Run" value={filteredStablePoolCandidates.reduce((total, candidate) => total + candidate.evidence_run_ids.length, 0)} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="平均 OOS" value={formatPct(averageNullable(filteredStablePoolCandidates.map((candidate) => Number(candidate.validation_summary.avg_oos_total_return ?? NaN)).filter((value) => Number.isFinite(value))))} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="平均评分" value={formatNumber(averageNullable(filteredStablePoolCandidates.map((candidate) => Number(candidate.validation_summary.score ?? NaN)).filter((value) => Number.isFinite(value))), 1)} /></Card></Col>
+                </Row>
+                <Card size="small" title="稳定池">
+                  <Paragraph type="secondary">
+                    稳定池只放已经人工确认的候选配置，包含入场结构、风险配置和证据 Run。后续复测、导出配置和归档从这里进入。
+                  </Paragraph>
+                  {filteredStablePoolCandidates.length ? (
+                    <DataTable
+                      columns={stablePoolColumns}
+                      data={filteredStablePoolCandidates}
+                      tableClassName="cbw-parameter-group-table"
+                      initialPageSize={8}
+                      pageSizeOptions={[8, 16, 32]}
+                      initialSorting={[{ id: 'score', desc: true }]}
+                    />
+                  ) : (
+                    <Alert type="info" showIcon message="稳定池还没有候选" description="在研究池点击“加入稳定池”后会出现在这里。" />
+                  )}
+                </Card>
+              </Space>
+            )}
+
+            <Collapse
+              items={[
+                {
+                  key: 'advanced',
+                  label: '高级区：批次、单实验、台账与敏感度',
+                  children: (
+                    <Space wrap>
+                      <Button onClick={() => setWorkspaceMode('tracking')}>追踪 Run</Button>
+                      <Button onClick={() => setWorkspaceMode('batch')}>批次明细</Button>
+                      <Button onClick={() => setWorkspaceMode('experiment')}>单实验</Button>
+                      <Button onClick={() => setWorkspaceMode('decisions')}>决策台账</Button>
+                      <Button onClick={() => setWorkspaceMode('sensitivity')}>敏感度</Button>
+                    </Space>
+                  ),
+                },
+              ]}
+            />
+
+            {workspaceMode === 'tracking' && (
+              <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                <Alert
+                  type="info"
+                  showIcon
+                  message="追踪中的 Run"
+                  description="从推荐表、实验结果或单次分析里冻结的 run 会集中到这里。这个视图只保留你主动关注的参数，后续可以打开分析、记录观察结论，或在决策台账中归档。"
+                />
+                <Row gutter={[12, 12]}>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="追踪 Run" value={filteredTrackedRunRows.length} suffix={`/ ${trackedRunRows.length}`} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="平均 OOS" value={formatPct(averageNullable(filteredTrackedRunRows.map((row) => row.oos_total_return)))} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="最差回撤" value={formatPct(filteredTrackedRunRows.length ? Math.max(...filteredTrackedRunRows.map((row) => row.max_drawdown)) : null)} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="平均 PF" value={formatNumber(averageNullable(filteredTrackedRunRows.map((row) => row.profit_factor)), 2)} /></Card></Col>
+                </Row>
+                {trackedMissingNotes.length ? (
+                  <Alert
+                    type="warning"
+                    showIcon
+                    message={`${trackedMissingNotes.length} 条追踪记录没有匹配到当前参数实验行`}
+                    description="通常是 run 已删除，或当前本地参数实验 readmodel 尚未包含这条 run。仍可在决策台账里按“追踪中”标签查看原始记录。"
+                  />
+                ) : null}
+                <Card size="small" title="冻结参数列表">
+                  {filteredTrackedRunRows.length ? (
+                    <DataTable
+                      columns={trackingRunColumns}
+                      data={filteredTrackedRunRows}
+                      tableClassName="cbw-parameter-result-table"
+                      initialPageSize={8}
+                      pageSizeOptions={[8, 16, 32]}
+                      initialSorting={[{ id: 'tracked_at', desc: true }]}
+                    />
+                  ) : (
+                    <Alert type="info" showIcon message="还没有冻结追踪的 run" description="在推荐研究 Run、实验 Run 结果或单次分析里点击“冻结”，就会出现在这里。" />
+                  )}
+                </Card>
+              </Space>
+            )}
 
             {workspaceMode === 'batch' && (
               <Spin spinning={experimentDetailLoading}>
                 <Space direction="vertical" size={16} style={{ width: '100%' }}>
                   <Space wrap style={{ width: '100%', justifyContent: 'space-between' }}>
                     <Text type="secondary">
-                      批次视角优先看跨快照聚合后的推荐和参数稳定性，再决定是否进入单次 run 分析。
+                      批次视角优先看推荐研究 Run 和参数组结论，完整明细放在高级区。
                     </Text>
                     <Space wrap>
                       <Select
@@ -4309,31 +8295,22 @@ function ParametersView({
                         initialSorting={[{ id: 'created_at', desc: true }]}
                       />
                       {batchDecisionLabelFilter.length && !filteredBatches.length ? (
-                        <Alert type="info" showIcon message="当前批次人工决策筛选没有命中批次" />
+                        <Alert type="info" showIcon message="当前批次人工标签筛选没有命中批次" />
                       ) : null}
-                      <Card size="small" title="全部批次结果">
-                        <Paragraph type="secondary">
-                          当前显示 {filteredBatchRunRows.length} 条 run。先整体排序筛掉明显差的组合，再进入具体批次查看推荐。
-                        </Paragraph>
-                        <DataTable
-                          columns={experimentResultColumns}
-                          data={filteredBatchRunRows}
-                          tableClassName="cbw-parameter-result-table"
-                          initialPageSize={8}
-                          pageSizeOptions={[8, 16, 32]}
-                          initialSorting={[{ id: 'total_return', desc: true }]}
-                        />
-                      </Card>
+                      <Alert
+                        type="info"
+                        showIcon
+                        message="先从批次列表进入单个批次，再查看参数组推荐和 Run 明细。"
+                      />
                     </>
                   ) : (
                     <>
                       <Card size="small" className="cbw-context-panel">
                         <Flex justify="space-between" align="flex-start" wrap="wrap" gap={12}>
                           <Descriptions size="small" column={{ xs: 1, md: 3 }} style={{ flex: 1, minWidth: 520 }}>
-                            <Descriptions.Item label="批次 ID">{selectedBatchDetail?.batch.batch_id ?? selectedBatchId}</Descriptions.Item>
                             <Descriptions.Item label="搜索方式">{experimentSearchTypeLabel(selectedBatchDetail?.batch.search_type ?? selectedBatchSummary?.search_type)}</Descriptions.Item>
                             <Descriptions.Item label="快照 / 实验">{selectedBatchDetail?.batch.dataset_snapshot_ids.length ?? selectedBatchSummary?.snapshot_count ?? 0} / {selectedBatchDetail?.batch.experiment_ids.length ?? selectedBatchSummary?.experiment_count ?? 0}</Descriptions.Item>
-                            <Descriptions.Item label="父任务">{selectedBatchDetail?.execution.task_id ?? selectedBatchSummary?.task_id ?? '--'}</Descriptions.Item>
+                            <Descriptions.Item label="Run">{selectedBatchDetail?.execution.run_ids?.length ?? selectedBatchSummary?.run_count ?? 0}</Descriptions.Item>
                             <Descriptions.Item label="提交时间">{selectedBatchDetail?.batch.created_at ? formatDateTime(selectedBatchDetail.batch.created_at) : (selectedBatchSummary ? formatDateTime(selectedBatchSummary.created_at) : '--')}</Descriptions.Item>
                           </Descriptions>
                           {selectedBatchDetail ? (
@@ -4361,6 +8338,23 @@ function ParametersView({
                           ) : <Text type="secondary">当前批次还没有人工结论。</Text>}
                         </Space>
                       </Card>
+                      <Card size="small" title="推荐研究 Run">
+                        <Paragraph type="secondary">
+                          按样本外收益、超额、交易数、回撤和 IS/OOS 差综合排序。可直接打开分析，或固定风险参数后跑趋势周期邻域。
+                        </Paragraph>
+                        {recommendedResearchRuns.length ? (
+                          <DataTable
+                            columns={researchRunColumns}
+                            data={recommendedResearchRuns}
+                            tableClassName="cbw-parameter-result-table"
+                            initialPageSize={8}
+                            pageSizeOptions={[8]}
+                            initialSorting={[{ id: 'score', desc: true }]}
+                          />
+                        ) : (
+                          <Alert type="info" showIcon message="当前筛选下没有可推荐的 Run" />
+                        )}
+                      </Card>
                       <Row gutter={[12, 12]} align="top">
                         <Col xs={24} xl={16}>
                           <Row gutter={[12, 12]}>
@@ -4373,7 +8367,7 @@ function ParametersView({
                                         key={`${section.key}-${item.fast_period}-${item.slow_period}-${item.leverage}`}
                                         type={section.type}
                                         showIcon
-                                        message={`快 ${item.fast_period ?? '--'} / 慢 ${item.slow_period ?? '--'} / 杠杆 ${item.leverage ?? '--'}`}
+                                        message={parameterGroupSummary(item)}
                                         description={section.description(item)}
                                       />
                                     )) : <Text type="secondary">{section.empty}</Text>}
@@ -4392,7 +8386,7 @@ function ParametersView({
                                     key={`${excludedRecommendationSection.key}-${item.fast_period}-${item.slow_period}-${item.leverage}`}
                                     type={excludedRecommendationSection.type}
                                     showIcon
-                                    message={`快 ${item.fast_period ?? '--'} / 慢 ${item.slow_period ?? '--'} / 杠杆 ${item.leverage ?? '--'}`}
+                                    message={parameterGroupSummary(item)}
                                     description={excludedRecommendationSection.description(item)}
                                   />
                                 )) : <Text type="secondary">{excludedRecommendationSection.empty}</Text>}
@@ -4417,7 +8411,7 @@ function ParametersView({
                                     message={(
                                       <Space size={[6, 6]} wrap>
                                         <Tag color={decisionStatusColor(latestStatus)}>{decisionStatusText(latestStatus)}</Tag>
-                                        <Text>快 {group.fast_period ?? '--'} / 慢 {group.slow_period ?? '--'} / 杠杆 {group.leverage ?? '--'}</Text>
+                                        <Text>{parameterGroupSummary(group)}</Text>
                                       </Space>
                                     )}
                                     description={`总分 ${formatNumber(group.score, 1)}，置信度 ${formatNumber(group.confidence, 1)}，平均收益 ${formatPct(group.avg_total_return)}，样本外收益 ${formatPct(group.avg_oos_total_return)}，最大回撤 ${formatPct(group.avg_max_drawdown)}${latestNote?.decision_reason ? `；${latestNote.decision_reason}` : ''}。`}
@@ -4430,9 +8424,9 @@ function ParametersView({
                           <Text type="secondary">还没有通过或观察中的参数组。对参数组点“记录”，状态选择“观察”或“通过”后会出现在这里。</Text>
                         )}
                       </Card>
-                      <Card size="small" title="批次聚合结果">
+                      <Card size="small" title="参数组结论">
                         <Paragraph type="secondary">
-                          这里已经把同一组快慢参数和杠杆按跨快照结果聚合。现在应优先看样本外收益、最大回撤、收益回撤比，再看样本内收益和覆盖快照数。
+                          聚合后只保留研究判断相关列：样本外收益、IS/OOS 差、回撤、交易数和稳定度。
                         </Paragraph>
                         <DataTable
                           columns={batchParameterGroupColumns}
@@ -4443,42 +8437,49 @@ function ParametersView({
                           initialSorting={[{ id: 'score', desc: true }]}
                         />
                       </Card>
-                      <Card size="small" title="批次 Run 结果">
-                        <Paragraph type="secondary">
-                          当前显示 {filteredBatchRunRows.length} 条来自该批次的 run，可继续按收益、超额收益、胜率排序后跳转单次分析。
-                        </Paragraph>
-                        <DataTable
-                          columns={experimentResultColumns}
-                          data={filteredBatchRunRows}
-                          tableClassName="cbw-parameter-result-table"
-                          initialPageSize={8}
-                          pageSizeOptions={[8, 16, 32]}
-                          initialSorting={[{ id: 'total_return', desc: true }]}
-                        />
-                      </Card>
-                      {selectedBatchDetail ? (
-                        <Card size="small" title="评分标准">
-                          <Row gutter={[12, 12]}>
-                            {Object.values(selectedBatchDetail.scoring_rules).map((rule) => (
-                              <Col xs={24} xl={8} key={rule.label}>
-                                <Alert
-                                  type="info"
-                                  showIcon
-                                  message={rule.label}
-                                  description={(
-                                    <Space direction="vertical" size={4}>
-                                      <Text>{rule.summary}</Text>
-                                      {rule.thresholds.map((threshold) => (
-                                        <Text key={`${rule.label}-${threshold}`} type="secondary">- {threshold}</Text>
-                                      ))}
-                                    </Space>
-                                  )}
-                                />
-                              </Col>
-                            ))}
-                          </Row>
-                        </Card>
-                      ) : null}
+                      <Collapse
+                        items={[
+                          {
+                            key: 'run-results',
+                            label: `高级明细：完整 Run 表（${filteredBatchRunRows.length}）`,
+                            children: (
+                              <DataTable
+                                columns={experimentResultColumns}
+                                data={filteredBatchRunRows}
+                                tableClassName="cbw-parameter-result-table"
+                                initialPageSize={8}
+                                pageSizeOptions={[8, 16, 32]}
+                                initialSorting={[{ id: 'total_return', desc: true }]}
+                              />
+                            ),
+                          },
+                          ...(selectedBatchDetail ? [{
+                            key: 'scoring-rules',
+                            label: '评分标准',
+                            children: (
+                              <Row gutter={[12, 12]}>
+                                {Object.values(selectedBatchDetail.scoring_rules).map((rule) => (
+                                  <Col xs={24} xl={8} key={rule.label}>
+                                    <Alert
+                                      type="info"
+                                      showIcon
+                                      message={rule.label}
+                                      description={(
+                                        <Space direction="vertical" size={4}>
+                                          <Text>{rule.summary}</Text>
+                                          {rule.thresholds.map((threshold) => (
+                                            <Text key={`${rule.label}-${threshold}`} type="secondary">- {threshold}</Text>
+                                          ))}
+                                        </Space>
+                                      )}
+                                    />
+                                  </Col>
+                                ))}
+                              </Row>
+                            ),
+                          }] : []),
+                        ]}
+                      />
                     </>
                   )}
                 </Space>
@@ -4567,9 +8568,72 @@ function ParametersView({
                         </>
                       )}
                       <Card size="small" title="实验 Run 结果">
-                        <Paragraph type="secondary">
-                          当前显示 {filteredExperimentRunRows.length} 条已落盘 run。优先按样本外收益、样本外超额排序，再回头看总收益和胜率。
-                        </Paragraph>
+                        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                          <Paragraph type="secondary" style={{ marginBottom: 0 }}>
+                            当前显示 {filteredExperimentRunRows.length} / {selectedExperimentRows.length} 条已落盘 run。筛选支持“大于等于”阈值，最大回撤是“小于等于”阈值。
+                          </Paragraph>
+                          <Space wrap>
+                            <InputNumber
+                              min={0}
+                              step={1}
+                              value={experimentMinResearchScoreFilter}
+                              placeholder="评分 ≥"
+                              style={{ width: 112 }}
+                              onChange={(value) => setExperimentMinResearchScoreFilter(value === null ? null : Number(value))}
+                            />
+                            <InputNumber
+                              step={10}
+                              value={experimentMinOosReturnFilter}
+                              placeholder="OOS% ≥"
+                              style={{ width: 116 }}
+                              onChange={(value) => setExperimentMinOosReturnFilter(value === null ? null : Number(value))}
+                            />
+                            <InputNumber
+                              step={10}
+                              value={experimentMinTotalReturnFilter}
+                              placeholder="收益% ≥"
+                              style={{ width: 116 }}
+                              onChange={(value) => setExperimentMinTotalReturnFilter(value === null ? null : Number(value))}
+                            />
+                            <InputNumber
+                              min={0}
+                              step={0.05}
+                              value={experimentMinProfitFactorFilter}
+                              placeholder="PF ≥"
+                              style={{ width: 100 }}
+                              onChange={(value) => setExperimentMinProfitFactorFilter(value === null ? null : Number(value))}
+                            />
+                            <InputNumber
+                              min={0}
+                              step={5}
+                              value={experimentMaxDrawdownFilter}
+                              placeholder="回撤% ≤"
+                              style={{ width: 116 }}
+                              onChange={(value) => setExperimentMaxDrawdownFilter(value === null ? null : Number(value))}
+                            />
+                            <InputNumber
+                              min={0}
+                              step={10}
+                              value={experimentMinTradeCountFilter}
+                              placeholder="交易数 ≥"
+                              style={{ width: 116 }}
+                              onChange={(value) => setExperimentMinTradeCountFilter(value === null ? null : Number(value))}
+                            />
+                            <Button
+                              size="small"
+                              onClick={() => {
+                                setExperimentMinResearchScoreFilter(null);
+                                setExperimentMinOosReturnFilter(null);
+                                setExperimentMinTotalReturnFilter(null);
+                                setExperimentMinProfitFactorFilter(null);
+                                setExperimentMaxDrawdownFilter(null);
+                                setExperimentMinTradeCountFilter(null);
+                              }}
+                            >
+                              清空筛选
+                            </Button>
+                          </Space>
+                        </Space>
                         <DataTable
                           columns={experimentResultColumns}
                           data={filteredExperimentRunRows}
@@ -4744,7 +8808,269 @@ function ParametersView({
             )}
           </Space>
         </Card>
+      ) : null}
     </Space>
+    <Modal
+      title={filterResults ? `过滤结果 · ${filterResults.base_group.symbol} · ${filterResults.base_group.timeframe.toUpperCase()}` : '过滤结果'}
+      open={Boolean(filterResultsCandidateId)}
+      width={1280}
+      footer={null}
+      onCancel={() => {
+        setFilterResultsCandidateId(null);
+        setFilterResults(null);
+      }}
+    >
+      <Spin spinning={filterResultsLoading}>
+        {filterResults ? (
+          <Space direction="vertical" size={14} style={{ width: '100%' }}>
+            <Descriptions size="small" column={{ xs: 1, md: 3 }}>
+              <Descriptions.Item label="原始参数">{filterResults.base_group.parameter_summary}</Descriptions.Item>
+              <Descriptions.Item label="原始 Run / 快照">{filterResults.base_group.run_count} / {filterResults.base_group.snapshot_count}</Descriptions.Item>
+              <Descriptions.Item label="过滤 Run">{filterResults.filter_runs.length}</Descriptions.Item>
+              <Descriptions.Item label="原始平均 OOS">{formatPct(filterResults.base_group.avg_oos_total_return)}</Descriptions.Item>
+              <Descriptions.Item label="原始平均回撤">{formatPct(filterResults.base_group.avg_max_drawdown)}</Descriptions.Item>
+              <Descriptions.Item label="原始平均 PF">{formatNumber(filterResults.base_group.avg_profit_factor, 2)}</Descriptions.Item>
+            </Descriptions>
+            {filterResults.filter_groups.length ? (
+              <>
+                <Card size="small" title="过滤器汇总">
+                  <DataTable
+                    columns={filterResultGroupColumns}
+                    data={filterResults.filter_groups}
+                    tableClassName="cbw-parameter-group-table"
+                    initialPageSize={8}
+                    pageSizeOptions={[8, 16, 32]}
+                    initialSorting={[{ id: 'avg_oos_delta', desc: true }]}
+                  />
+                </Card>
+                <Card size="small" title="过滤后 Run">
+                  <DataTable
+                    columns={filterResultRunColumns}
+                    data={filterResults.filter_runs}
+                    tableClassName="cbw-parameter-result-table"
+                    initialPageSize={8}
+                    pageSizeOptions={[8, 16, 32]}
+                    initialSorting={[{ id: 'oos_total_return', desc: true }]}
+                  />
+                </Card>
+              </>
+            ) : (
+              <Alert
+                type="info"
+                showIcon
+                message="还没有匹配到过滤后 Run"
+                description="先在研究池点击单指标或叠加提交过滤器实验；实验完成后再打开这里查看。"
+              />
+            )}
+          </Space>
+        ) : filterResultsLoading ? null : (
+          <Alert type="info" showIcon message="未能加载过滤结果" />
+        )}
+      </Spin>
+    </Modal>
+    <Modal
+      title={tradeAttribution ? `交易归因 · ${tradeAttribution.candidate.symbol} · ${tradeAttribution.candidate.timeframe.toUpperCase()}` : '交易归因'}
+      open={Boolean(tradeAttributionCandidateId)}
+      width={1280}
+      footer={null}
+      onCancel={() => {
+        setTradeAttributionCandidateId(null);
+        setTradeAttribution(null);
+      }}
+    >
+      <Spin spinning={tradeAttributionLoading}>
+        {tradeAttribution ? (
+          <Space direction="vertical" size={14} style={{ width: '100%' }}>
+            <Descriptions size="small" column={{ xs: 1, md: 3 }}>
+              <Descriptions.Item label="参数">{tradeAttribution.candidate.parameter_summary}</Descriptions.Item>
+              <Descriptions.Item label="Run / 交易">{tradeAttribution.summary.run_count} / {tradeAttribution.summary.trade_count}</Descriptions.Item>
+              <Descriptions.Item label="OOS 交易">{tradeAttribution.summary.oos_trade_count}</Descriptions.Item>
+              <Descriptions.Item label="胜率">{formatPct(tradeAttribution.summary.win_rate)}</Descriptions.Item>
+              <Descriptions.Item label="PF">{formatNumber(tradeAttribution.summary.profit_factor, 2)}</Descriptions.Item>
+              <Descriptions.Item label="特征覆盖">{formatPct(tradeAttribution.summary.feature_meta_coverage)}</Descriptions.Item>
+            </Descriptions>
+            <Alert
+              type={tradeAttribution.summary.anti_overfit_passed ? 'success' : 'warning'}
+              showIcon
+              message={tradeAttribution.summary.anti_overfit_passed ? '防拟合检查通过，可进入假设复验' : '防拟合检查未完全通过，只能看现象，不能定规则'}
+              description={(
+                <Space size={[6, 6]} wrap>
+                  {tradeAttribution.anti_overfit_checks.map((check) => (
+                    <Tag key={check.key} color={check.passed ? 'green' : 'orange'}>
+                      {check.label} {formatNumber(check.actual, check.key === 'feature_meta_coverage' ? 2 : 0)} / {formatNumber(check.required, check.key === 'feature_meta_coverage' ? 2 : 0)}
+                    </Tag>
+                  ))}
+                </Space>
+              )}
+            />
+            {tradeAttribution.hypotheses.length ? (
+              <Card size="small" title="候选归因假设">
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  {tradeAttribution.hypotheses.map((hypothesis) => (
+                    <Alert
+                      key={hypothesis.hypothesis_id}
+                      type={hypothesis.status === 'candidate' ? 'info' : 'warning'}
+                      showIcon
+                      message={hypothesis.description}
+                      description={`${hypothesis.evidence}。${hypothesis.risk_note}`}
+                    />
+                  ))}
+                </Space>
+              </Card>
+            ) : (
+              <Alert type="info" showIcon message="暂时没有生成可复验的归因假设" />
+            )}
+            <Card size="small" title="归因分桶">
+              <DataTable
+                columns={tradeAttributionBucketColumns}
+                data={tradeAttribution.buckets}
+                tableClassName="cbw-parameter-group-table"
+                initialPageSize={10}
+                pageSizeOptions={[10, 20, 40]}
+                initialSorting={[{ id: 'loss_contribution', desc: true }]}
+              />
+            </Card>
+            <Card size="small" title="大亏交易">
+              {tradeAttribution.drawdown_trades.length ? (
+                <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                  {tradeAttribution.drawdown_trades.slice(0, 12).map((trade) => (
+                    <Flex key={String(trade.trade_id)} justify="space-between" align="center" wrap="wrap" gap={8}>
+                      <Space size={[6, 4]} wrap>
+                        <Text strong>{shortRunId(String(trade.run_id))}</Text>
+                        <Tag>{String(trade.segment).toUpperCase()}</Tag>
+                        <Tag>{String(trade.side)}</Tag>
+                        <Text type="secondary">{formatDateTime(String(trade.entry_time))}</Text>
+                        <Text>{String(trade.exit_reason)}</Text>
+                      </Space>
+                      <Space size={10}>
+                        <Text type="danger">{formatNumber(Number(trade.net_pnl), 2)}</Text>
+                        <Text type="secondary">{formatPct(Number(trade.return_pct))}</Text>
+                        <Button size="small" onClick={() => onOpenRun(String(trade.run_id))}>打开 Run</Button>
+                      </Space>
+                    </Flex>
+                  ))}
+                </Space>
+              ) : (
+                <Alert type="info" showIcon message="没有亏损交易" />
+              )}
+            </Card>
+          </Space>
+        ) : tradeAttributionLoading ? null : (
+          <Alert type="info" showIcon message="未能加载交易归因" />
+        )}
+      </Spin>
+    </Modal>
+    <Modal
+      title={riskCompareSourceGroup ? `风险 / 杠杆对比 · ${riskCompareSourceGroup.symbol} · ${riskCompareSourceGroup.timeframe.toUpperCase()}` : '风险 / 杠杆对比'}
+      open={Boolean(riskCompareGroupKey)}
+      width={1180}
+      footer={null}
+      onCancel={() => setRiskCompareGroupKey(null)}
+    >
+      {riskCompareSourceGroup ? (
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Descriptions size="small" column={{ xs: 1, md: 2 }}>
+            <Descriptions.Item label="固定入场结构">{riskCompareEntryText}</Descriptions.Item>
+            <Descriptions.Item label="比较对象">只比较 risk / cash / 杠杆变化</Descriptions.Item>
+          </Descriptions>
+          <Alert
+            type="info"
+            showIcon
+            message="怎么看"
+            description="优先看 OOS/DD、最差回撤和 PF。收益更高但回撤同步放大的组合，不一定比低风险组合更好。"
+          />
+          {riskCompareGroups.length ? (
+            <DataTable
+              columns={riskCompareColumns}
+              data={riskCompareGroups}
+              tableClassName="cbw-parameter-group-table"
+              initialPageSize={12}
+              pageSizeOptions={[12, 24, 48]}
+              initialSorting={[{ id: 'oos_drawdown_ratio', desc: true }]}
+            />
+          ) : (
+            <Alert type="info" showIcon message="没有找到同入场结构下的其他风险/杠杆组合" />
+          )}
+        </Space>
+      ) : null}
+    </Modal>
+    <Modal
+      title="Run 对比"
+      open={runCompareOpen}
+      width={1180}
+      footer={(
+        <Space>
+          <Button onClick={clearRunCompare}>清空选择</Button>
+          <Button type="primary" onClick={clearRunCompare}>关闭</Button>
+        </Space>
+      )}
+      onCancel={clearRunCompare}
+    >
+      {runCompareModel ? (
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Alert
+            type="info"
+            showIcon
+            message={runCompareModel.summary}
+            description={`相同项 ${runCompareModel.sameCount} 个，不同项 ${runCompareModel.diffCount} 个。绿色表示该指标相对更优，灰色表示相同或不排序。`}
+          />
+          <Row gutter={[12, 12]}>
+            {[runCompareModel.left, runCompareModel.right].map((row, index) => (
+              <Col xs={24} md={12} key={row.run_id}>
+                <div className="cbw-run-compare-summary">
+                  <Space direction="vertical" size={2}>
+                    <Text type="secondary">Run {index === 0 ? 'A' : 'B'}</Text>
+                    <Text strong>{shortRunId(row.run_id)}</Text>
+                    <Text type="secondary">{row.symbol} · {row.timeframe.toUpperCase()} · {compactStrategyName(row.strategy_name)}</Text>
+                    <Text>{row.parameter_summary}</Text>
+                  </Space>
+                  <Button size="small" onClick={() => onOpenRun(row.run_id)}>打开分析</Button>
+                </div>
+              </Col>
+            ))}
+          </Row>
+          {runCompareModel.sections.map((section) => (
+            <div key={section.key} className="cbw-run-compare-section">
+              <Text strong>{section.title}</Text>
+              <div className="cbw-run-compare-table-wrap">
+                <table className="cbw-run-compare-table">
+                  <thead>
+                    <tr>
+                      <th>项目</th>
+                      <th>Run A</th>
+                      <th>Run B</th>
+                      <th>判断</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {section.rows.map((item) => (
+                      <tr key={item.key} className={item.same ? 'is-same' : 'is-different'}>
+                        <td>{item.label}</td>
+                        <td className={item.leftBetter ? 'is-better' : item.rightBetter ? 'is-worse' : undefined}>{item.leftText}</td>
+                        <td className={item.rightBetter ? 'is-better' : item.leftBetter ? 'is-worse' : undefined}>{item.rightText}</td>
+                        <td>
+                          {item.same ? (
+                            <Tag>相同</Tag>
+                          ) : item.leftBetter ? (
+                            <Tag color="green">A 更优</Tag>
+                          ) : item.rightBetter ? (
+                            <Tag color="green">B 更优</Tag>
+                          ) : (
+                            <Tag color="blue">不同</Tag>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ))}
+        </Space>
+      ) : (
+        <Alert type="info" showIcon message="请选择两条 Run 后再打开对比" />
+      )}
+    </Modal>
     <Modal
       title={decisionTarget ? `研究决策 · ${decisionTarget.title}` : '研究决策'}
       open={Boolean(decisionTarget)}
@@ -4787,6 +9113,131 @@ function ParametersView({
           <Input.TextArea rows={4} />
         </Form.Item>
       </Form>
+    </Modal>
+    <Modal
+      title={selectedParameterGroupDetail ? `参数组详情 · ${selectedParameterGroupDetail.group.parameter_summary}` : '参数组详情'}
+      open={Boolean(selectedParameterGroupKey)}
+      width={1280}
+      footer={null}
+      onCancel={() => {
+        setSelectedParameterGroupKey(null);
+        setSelectedParameterGroupDetail(null);
+      }}
+    >
+      <Spin spinning={parameterGroupDetailLoading}>
+        {selectedParameterGroupDetail ? (
+          <Space direction="vertical" size={14} style={{ width: '100%' }}>
+            <Descriptions size="small" column={{ xs: 1, md: 3 }}>
+              <Descriptions.Item label="研究对象">
+                {selectedParameterGroupDetail.group.strategy_name} · {selectedParameterGroupDetail.group.symbol} · {selectedParameterGroupDetail.group.timeframe.toUpperCase()}
+              </Descriptions.Item>
+              <Descriptions.Item label="分类">
+                <Tag color={parameterGroupClassificationColor(selectedParameterGroupDetail.group.classification)}>
+                  {parameterGroupClassificationText(selectedParameterGroupDetail.group.classification)}
+                </Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="研究分">{formatNumber(selectedParameterGroupDetail.group.research_score, 1)}</Descriptions.Item>
+              <Descriptions.Item label="Run / 快照">{selectedParameterGroupDetail.group.run_count} / {selectedParameterGroupDetail.group.snapshot_count}</Descriptions.Item>
+              <Descriptions.Item label="平均 OOS">{formatPct(selectedParameterGroupDetail.group.avg_oos_total_return)}</Descriptions.Item>
+              <Descriptions.Item label="平均 Gap">{formatPct(selectedParameterGroupDetail.group.avg_gap)}</Descriptions.Item>
+              <Descriptions.Item label="平均回撤">{formatPct(selectedParameterGroupDetail.group.avg_max_drawdown)}</Descriptions.Item>
+              <Descriptions.Item label="最差回撤">{formatPct(selectedParameterGroupDetail.group.worst_max_drawdown)}</Descriptions.Item>
+              <Descriptions.Item label="平均 PF">{formatNumber(selectedParameterGroupDetail.group.avg_profit_factor, 2)}</Descriptions.Item>
+            </Descriptions>
+            <Card size="small" title="跨批次 Run">
+              {selectedParameterGroupDetail.runs.length ? (
+                <DataTable
+                  columns={parameterGroupRunColumns}
+                  data={selectedParameterGroupDetail.runs}
+                  tableClassName="cbw-parameter-result-table"
+                  initialPageSize={8}
+                  pageSizeOptions={[8, 16, 32]}
+                  initialSorting={[{ id: 'oos_total_return', desc: true }]}
+                />
+              ) : (
+                <Alert type="info" showIcon message="该参数组没有可展示的 run" />
+              )}
+            </Card>
+            <Card size="small" title="趋势周期邻域">
+              <Paragraph type="secondary">
+                邻域只固定同一研究对象、同一 tol/sl/rr/仓位/杠杆等参数，比较趋势快慢周期附近组合，判断参数是否只在一个点上偶然有效。
+              </Paragraph>
+              {selectedParameterGroupDetail.neighbors.length ? (
+                <DataTable
+                  columns={researchParameterGroupColumns}
+                  data={selectedParameterGroupDetail.neighbors}
+                  tableClassName="cbw-parameter-group-table"
+                  initialPageSize={8}
+                  pageSizeOptions={[8, 16, 32]}
+                  initialSorting={[{ id: 'research_score', desc: true }]}
+                />
+              ) : (
+                <Alert type="info" showIcon message="当前参数组没有匹配到趋势周期邻域" />
+              )}
+            </Card>
+          </Space>
+        ) : parameterGroupDetailLoading ? null : (
+          <Alert type="info" showIcon message="未能加载参数组详情" />
+        )}
+      </Spin>
+    </Modal>
+    <Modal
+      title={neighborhoodSourceRun ? `趋势周期邻域 · ${shortRunId(neighborhoodSourceRun.run_id)}` : '趋势周期邻域'}
+      open={Boolean(neighborhoodSourceRun)}
+      width={1120}
+      footer={null}
+      onCancel={() => setNeighborhoodSourceRunId(null)}
+    >
+      {neighborhoodSourceRun ? (
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Descriptions size="small" column={{ xs: 1, md: 3 }}>
+            <Descriptions.Item label="数据">{neighborhoodSourceRun.symbol} · {neighborhoodSourceRun.timeframe.toUpperCase()}</Descriptions.Item>
+            <Descriptions.Item label="当前周期">tf{neighborhoodSourceRun.trend_fast_period} / ts{neighborhoodSourceRun.trend_slow_period}</Descriptions.Item>
+            <Descriptions.Item label="固定参数">
+              tol {formatNumber(neighborhoodSourceRun.atr_entry_tolerance, 2)}
+              {' '}· sl {formatNumber(neighborhoodSourceRun.atr_stop_mult, 2)}
+              {' '}· rr {formatNumber(neighborhoodSourceRun.risk_reward_ratio, 2)}
+              {' '}· l{formatNumber(neighborhoodSourceRun.leverage, 2)}
+            </Descriptions.Item>
+          </Descriptions>
+          <Paragraph type="secondary" style={{ marginBottom: 0 }}>
+            从全部实验结果中匹配同一快照、同一 tol/sl/rr/杠杆，只比较当前趋势快慢周期前后相邻组合。
+          </Paragraph>
+          <Alert
+            showIcon
+            type={trendNeighborhoodStats.verdict === 'stable' ? 'success' : trendNeighborhoodStats.verdict === 'watch' ? 'warning' : 'info'}
+            message={(
+              <Space size={8} wrap>
+                <Text strong>{trendNeighborhoodStats.verdictText}</Text>
+                <Tag color={trendNeighborhoodStats.verdict === 'stable' ? 'green' : trendNeighborhoodStats.verdict === 'watch' ? 'orange' : 'default'}>
+                  稳定分 {trendNeighborhoodStats.score === null ? '--' : formatNumber(trendNeighborhoodStats.score, 1)}
+                </Tag>
+              </Space>
+            )}
+            description={trendNeighborhoodStats.reason}
+          />
+          <Row gutter={[12, 12]}>
+            <Col xs={12} md={4}><Statistic title="邻居数" value={trendNeighborhoodStats.sampleCount} /></Col>
+            <Col xs={12} md={4}><Statistic title="OOS 正比例" value={formatPct(trendNeighborhoodStats.positiveOosRatio)} /></Col>
+            <Col xs={12} md={4}><Statistic title="平均 OOS" value={formatPct(trendNeighborhoodStats.avgOosReturn)} /></Col>
+            <Col xs={12} md={4}><Statistic title="平均 Gap" value={formatPct(trendNeighborhoodStats.avgGap)} /></Col>
+            <Col xs={12} md={4}><Statistic title="最差回撤" value={formatPct(trendNeighborhoodStats.worstDrawdown)} /></Col>
+            <Col xs={12} md={4}><Statistic title="最少交易" value={trendNeighborhoodStats.minTradeCount ?? '--'} /></Col>
+          </Row>
+          {trendNeighborhoodMatches.length ? (
+            <DataTable
+              columns={trendNeighborhoodColumns}
+              data={trendNeighborhoodMatches}
+              tableClassName="cbw-parameter-result-table"
+              initialPageSize={12}
+              pageSizeOptions={[12, 24, 48]}
+              initialSorting={[{ id: 'total_return', desc: true }]}
+            />
+          ) : (
+            <Alert type="info" showIcon message="没有匹配到已完成的邻域结果" />
+          )}
+        </Space>
+      ) : null}
     </Modal>
     </>
   );

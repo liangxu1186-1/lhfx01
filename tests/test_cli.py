@@ -476,6 +476,46 @@ def test_build_execution_constraints_supports_percent_of_cash_defaults() -> None
     assert constraints.cash_allocation_pct_by_policy == {"percent_of_cash": 50.0}
 
 
+def test_build_execution_constraints_supports_risk_pct_of_equity() -> None:
+    constraints = cli._build_execution_constraints(
+        argparse.Namespace(
+            qty_policy_ref="risk_pct_of_equity",
+            qty=None,
+            cash_allocation_pct=None,
+            risk_pct_per_trade=0.01,
+            initial_cash=1000.0,
+            leverage=2.0,
+            fee_rate=0.0,
+            slippage_bps=0.0,
+            min_notional=0.0,
+        )
+    )
+
+    assert constraints.qty_by_policy == {}
+    assert constraints.cash_allocation_pct_by_policy == {}
+    assert constraints.risk_pct_per_trade_by_policy == {"risk_pct_of_equity": 0.01}
+
+
+def test_build_execution_constraints_supports_risk_pct_of_cash_allocation() -> None:
+    constraints = cli._build_execution_constraints(
+        argparse.Namespace(
+            qty_policy_ref="risk_pct_of_cash_allocation",
+            qty=None,
+            cash_allocation_pct=50.0,
+            risk_pct_per_trade=0.01,
+            initial_cash=1000.0,
+            leverage=2.0,
+            fee_rate=0.0,
+            slippage_bps=0.0,
+            min_notional=0.0,
+        )
+    )
+
+    assert constraints.qty_by_policy == {}
+    assert constraints.cash_allocation_pct_by_policy == {"risk_pct_of_cash_allocation": 50.0}
+    assert constraints.risk_pct_per_trade_by_policy == {"risk_pct_of_cash_allocation": 0.01}
+
+
 def _snapshot() -> DatasetSnapshot:
     return DatasetSnapshot(
         dataset_snapshot_id="snapshot-001",

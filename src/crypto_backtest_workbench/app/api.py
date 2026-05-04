@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import contextlib
 import threading
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
@@ -12,16 +13,22 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from crypto_backtest_workbench.app.batch_scoring import build_batch_recommendations
+from crypto_backtest_workbench.app.readmodels.parameters import ParameterLabRow, build_parameter_lab_rows
 from crypto_backtest_workbench.app.readmodels import (
+    build_parameter_research_workspace,
     build_workspace_datasets,
     build_workspace_overview,
     build_workspace_overview_equity,
     build_workspace_parameter_lab,
+    build_research_workflow,
+    build_stable_pool_trade_attribution,
     build_workspace_run_detail,
     build_workspace_run_index,
     build_workspace_snapshot,
     build_workspace_source,
     json_ready,
+    load_parameter_group_detail,
+    load_research_candidate_trade_attribution,
 )
 from crypto_backtest_workbench.app.workflows import (
     ParameterExperimentBatchRequest,
@@ -45,6 +52,7 @@ from crypto_backtest_workbench.domain.models import (
 )
 from crypto_backtest_workbench.engine.execution import ExecutionConstraints
 from crypto_backtest_workbench.jobs import LocalTaskRunner
+from crypto_backtest_workbench.jobs.task_models import TaskRecord
 from crypto_backtest_workbench.storage.repositories import (
     FileDatasetRepository,
     FileExperimentBatchRepository,
@@ -57,7 +65,10 @@ from crypto_backtest_workbench.storage.repositories import (
 
 DEFAULT_QTY_POLICY_REF = "percent_of_cash"
 DEFAULT_CASH_ALLOCATION_PCT = 100.0
+RISK_PCT_OF_EQUITY_POLICY_REF = "risk_pct_of_equity"
+RISK_PCT_OF_CASH_ALLOCATION_POLICY_REF = "risk_pct_of_cash_allocation"
 RESEARCH_NOTE_DECISION_STATUSES = frozenset({"candidate", "observing", "approved", "rejected", "archived"})
+CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError)
 
 
 class WorkspaceApiServer(ThreadingHTTPServer):
@@ -79,6 +90,8 @@ class WorkspaceApiServer(ThreadingHTTPServer):
         self.cors_origin = cors_origin
         self.frontend_dist_dir = frontend_dist_dir
         self.background_threads: dict[str, threading.Thread] = {}
+        self.readmodel_cache: dict[str, tuple[tuple[int, int], object]] = {}
+        self.readmodel_cache_lock = threading.Lock()
         super().__init__(server_address, WorkspaceApiHandler)
 
     def server_bind(self) -> None:
@@ -218,7 +231,94 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     HTTPStatus.OK,
                     self._build_workspace_payload(
-                        parameter_lab=build_workspace_parameter_lab(data_dir=self.server.data_dir),
+                        parameter_lab=self._build_cached_parameter_lab(),
+                    ),
+                )
+                return
+            if path == "/api/parameter-research":
+                research_workspace = self._build_research_workspace()
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        research_subjects=research_workspace["subjects"],
+                        parameter_groups=self._filter_parameter_groups(
+                            research_workspace["parameter_groups"],
+                            query,
+                        ),
+                    ),
+                )
+                return
+            if path == "/api/research-workflow":
+                research_workflow = build_research_workflow(
+                    FileRunRepository(self.server.data_dir),
+                    FileResearchNoteRepository(self.server.data_dir),
+                    data_dir=self.server.data_dir,
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        research_workflow=research_workflow.as_dict(),
+                    ),
+                )
+                return
+            if path.startswith("/api/research-candidates/") and path.endswith("/filter-results"):
+                candidate_id = unquote(path.removeprefix("/api/research-candidates/").removesuffix("/filter-results"))
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        filter_results=self._build_research_candidate_filter_results(candidate_id),
+                    ),
+                )
+                return
+            if path.startswith("/api/research-candidates/") and path.endswith("/trade-attribution"):
+                candidate_id = unquote(path.removeprefix("/api/research-candidates/").removesuffix("/trade-attribution"))
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        trade_attribution=load_research_candidate_trade_attribution(
+                            FileRunRepository(self.server.data_dir),
+                            candidate_id=candidate_id,
+                        ).as_dict(),
+                    ),
+                )
+                return
+            if path == "/api/stable-pool/trade-attribution":
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        stable_pool_trade_attribution=build_stable_pool_trade_attribution(
+                            FileRunRepository(self.server.data_dir),
+                            FileResearchNoteRepository(self.server.data_dir),
+                        ),
+                    ),
+                )
+                return
+            if path == "/api/research-subjects":
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        research_subjects=self._build_research_workspace()["subjects"],
+                    ),
+                )
+                return
+            if path == "/api/parameter-groups":
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        parameter_groups=self._filter_parameter_groups(
+                            self._build_research_workspace()["parameter_groups"],
+                            query,
+                        ),
+                    ),
+                )
+                return
+            if path.startswith("/api/parameter-groups/"):
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        parameter_group=self._build_parameter_group_detail(
+                            unquote(path.removeprefix("/api/parameter-groups/"))
+                        ),
                     ),
                 )
                 return
@@ -232,6 +332,8 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                 self._serve_frontend_asset(path)
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": {"message": f"Unknown endpoint: {path}"}})
+        except CLIENT_DISCONNECT_ERRORS:
+            return
         except Exception as exc:  # pragma: no cover - defensive fallback
             self._send_error_json(exc)
 
@@ -246,6 +348,10 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                 status, body = self._handle_run_ema(payload)
                 self._send_json(status, body)
                 return
+            if path == "/api/runs":
+                status, body = self._handle_run(payload)
+                self._send_json(status, body)
+                return
             if path == "/api/parameter-experiments":
                 status, body = self._handle_parameter_experiment(payload)
                 self._send_json(status, body)
@@ -258,7 +364,27 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                 status, body = self._handle_create_research_note(payload)
                 self._send_json(status, body)
                 return
+            if path == "/api/research-pool":
+                status, body = self._handle_add_to_research_pool(payload)
+                self._send_json(status, body)
+                return
+            if path == "/api/stable-pool":
+                status, body = self._handle_add_to_stable_pool(payload)
+                self._send_json(status, body)
+                return
+            if path.startswith("/api/research-candidates/") and path.endswith("/risk-matrix"):
+                candidate_id = unquote(path.removeprefix("/api/research-candidates/").removesuffix("/risk-matrix"))
+                status, body = self._handle_run_research_candidate_risk_matrix(candidate_id, payload)
+                self._send_json(status, body)
+                return
+            if path.startswith("/api/research-candidates/") and path.endswith("/filter-experiments"):
+                candidate_id = unquote(path.removeprefix("/api/research-candidates/").removesuffix("/filter-experiments"))
+                status, body = self._handle_run_research_candidate_filter_experiment(candidate_id, payload)
+                self._send_json(status, body)
+                return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": {"message": f"Unknown endpoint: {path}"}})
+        except CLIENT_DISCONNECT_ERRORS:
+            return
         except Exception as exc:
             self._send_error_json(exc)
 
@@ -281,7 +407,13 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                 experiment_id = unquote(path.removeprefix("/api/parameter-experiments/"))
                 self._send_json(HTTPStatus.OK, self._handle_delete_parameter_experiment(experiment_id))
                 return
+            if path.startswith("/api/research-notes/"):
+                note_id = unquote(path.removeprefix("/api/research-notes/"))
+                self._send_json(HTTPStatus.OK, self._handle_delete_research_note(note_id))
+                return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": {"message": f"Unknown endpoint: {path}"}})
+        except CLIENT_DISCONNECT_ERRORS:
+            return
         except Exception as exc:
             self._send_error_json(exc)
 
@@ -314,21 +446,23 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
         }
 
     def _handle_run_ema(self, payload: dict[str, object]) -> tuple[HTTPStatus, dict[str, object]]:
+        mapped = dict(payload)
+        mapped["strategy_name"] = "ema_crossover"
+        return self._handle_run(mapped)
+
+    def _handle_run(self, payload: dict[str, object]) -> tuple[HTTPStatus, dict[str, object]]:
         snapshot = _load_snapshot(self.server.data_dir, _require_str(payload, "snapshot_id"))
         validation_split = _build_validation_split(
             payload=payload,
             snapshot=snapshot,
         )
         qty_policy_ref, constraints = _build_execution_constraints(payload)
+        strategy_name = str(payload.get("strategy_name", "ema_crossover"))
 
         request = RunBacktestWorkflowRequest(
             run_id=_require_str(payload, "run_id"),
             snapshot=snapshot,
-            strategy_params={
-                "fast_period": int(payload.get("fast_period", 2)),
-                "slow_period": int(payload.get("slow_period", 3)),
-                "qty_policy_ref": qty_policy_ref,
-            },
+            strategy_params=_build_strategy_params_from_payload(payload, strategy_name=strategy_name, qty_policy_ref=qty_policy_ref),
             constraints=constraints,
             validation_split=validation_split,
             enable_buy_and_hold_benchmark=str(payload.get("benchmark", "buy_and_hold")) == "buy_and_hold",
@@ -391,7 +525,22 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
 
     def _build_task_detail(self, task_id: str) -> dict[str, object]:
         task_repository = FileTaskRepository(self.server.data_dir)
-        return json_ready(task_repository.load_task(task_id))
+        try:
+            return json_ready(task_repository.load_task(task_id))
+        except (FileNotFoundError, json.JSONDecodeError):
+            now = datetime.now(UTC)
+            return json_ready(
+                TaskRecord(
+                    task_id=task_id,
+                    task_kind="background",
+                    status="pending",
+                    created_at=now,
+                    updated_at=now,
+                    failure_code=None,
+                    failure_message=None,
+                    failure_stage=None,
+                )
+            )
 
     def _build_parameter_experiment_index(self) -> list[dict[str, object]]:
         experiment_repository = FileParameterExperimentRepository(self.server.data_dir)
@@ -472,9 +621,15 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             )
 
         run_ids = set(str(run_id) for run_id in execution.get("run_ids", []))
-        summaries = build_workspace_run_index(data_dir=self.server.data_dir)
-        run_rows = [row for row in summaries if row["run_id"] in run_ids]
-        parameter_groups, recommendations, scoring_rules = build_batch_recommendations(run_rows)
+        run_repository = FileRunRepository(self.server.data_dir)
+        run_rows = [
+            row.as_dict()
+            for row in build_parameter_lab_rows(run_repository, run_ids=sorted(run_ids))
+        ]
+        parameter_groups, recommendations, scoring_rules = build_batch_recommendations(
+            run_rows,
+            strategy_name=batch.strategy_name,
+        )
         return {
             "batch": json_ready(batch),
             "execution": execution,
@@ -484,6 +639,80 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             "recommendations": recommendations,
             "scoring_rules": scoring_rules,
         }
+
+    def _build_research_workspace(self) -> dict[str, object]:
+        cached = self._cached_readmodel("parameter_research")
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        run_repository = FileRunRepository(self.server.data_dir)
+        workspace = build_parameter_research_workspace(
+            run_repository,
+            data_dir=self.server.data_dir,
+        ).as_dict()
+        self._store_cached_readmodel("parameter_research", workspace)
+        return workspace
+
+    def _build_cached_parameter_lab(self) -> dict[str, object]:
+        cached = self._cached_readmodel("parameter_lab")
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        parameter_lab = build_workspace_parameter_lab(data_dir=self.server.data_dir)
+        self._store_cached_readmodel("parameter_lab", parameter_lab)
+        return parameter_lab
+
+    def _build_parameter_group_detail(self, group_key: str) -> dict[str, object]:
+        run_repository = FileRunRepository(self.server.data_dir)
+        return load_parameter_group_detail(
+            run_repository,
+            group_key=group_key,
+            data_dir=self.server.data_dir,
+        ).as_dict()
+
+    def _cached_readmodel(self, key: str) -> object | None:
+        signature = _readmodel_signature(self.server.data_dir)
+        with self.server.readmodel_cache_lock:
+            cached = self.server.readmodel_cache.get(key)
+            if cached and cached[0] == signature:
+                return cached[1]
+        return None
+
+    def _store_cached_readmodel(self, key: str, value: object) -> None:
+        signature = _readmodel_signature(self.server.data_dir)
+        with self.server.readmodel_cache_lock:
+            self.server.readmodel_cache[key] = (signature, value)
+
+    def _filter_parameter_groups(
+        self,
+        parameter_groups: list[dict[str, object]],
+        query: dict[str, list[str]],
+    ) -> list[dict[str, object]]:
+        filters = {
+            "strategy_name": _first_query_value(query, "strategy_name"),
+            "symbol": _first_query_value(query, "symbol"),
+            "timeframe": _first_query_value(query, "timeframe"),
+            "validation_split_id": _first_query_value(query, "validation_split_id"),
+            "qty_policy_ref": _first_query_value(query, "qty_policy_ref"),
+            "leverage": _first_query_value(query, "leverage"),
+            "subject_key": _first_query_value(query, "subject_key"),
+        }
+        filtered: list[dict[str, object]] = []
+        for group in parameter_groups:
+            if filters["subject_key"] and group.get("subject_key") != filters["subject_key"]:
+                continue
+            if filters["strategy_name"] and group.get("strategy_name") != filters["strategy_name"]:
+                continue
+            if filters["symbol"] and group.get("symbol") != filters["symbol"]:
+                continue
+            if filters["timeframe"] and group.get("timeframe") != filters["timeframe"]:
+                continue
+            if filters["validation_split_id"] and group.get("validation_split_id") != filters["validation_split_id"]:
+                continue
+            if filters["qty_policy_ref"] and group.get("qty_policy_ref") != filters["qty_policy_ref"]:
+                continue
+            if filters["leverage"] and str(group.get("leverage")) != filters["leverage"]:
+                continue
+            filtered.append(group)
+        return filtered
 
     def _build_research_note_index(self, query: dict[str, list[str]]) -> list[dict[str, object]]:
         repository = FileResearchNoteRepository(self.server.data_dir)
@@ -509,6 +738,7 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
         snapshot = _load_snapshot(self.server.data_dir, _require_str(payload, "snapshot_id"))
         experiment_id = _require_str(payload, "experiment_id")
         qty_policy_ref = _resolve_qty_policy_ref(payload)
+        strategy_name = str(payload.get("strategy_name", "ema_crossover"))
         experiment_repository = FileParameterExperimentRepository(self.server.data_dir)
         if experiment_id in experiment_repository.list_experiment_ids():
             raise FileExistsError(f"Parameter experiment already exists: {experiment_id}")
@@ -516,14 +746,30 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             experiment_id=experiment_id,
             snapshot=snapshot,
             search_type=SearchType(str(payload.get("search_type", SearchType.GRID.value))),
-            fast_periods=_require_int_tuple(payload, "fast_periods"),
-            slow_periods=_require_int_tuple(payload, "slow_periods"),
+            strategy_name=strategy_name,
+            strategy_version=str(payload.get("strategy_version", "v2" if strategy_name == "ema_pullback_atr_v2" else "v1")),
+            fast_periods=_optional_int_tuple(payload, "fast_periods"),
+            slow_periods=_optional_int_tuple(payload, "slow_periods"),
+            trend_fast_periods=_optional_int_tuple(payload, "trend_fast_periods"),
+            trend_slow_periods=_optional_int_tuple(payload, "trend_slow_periods"),
+            atr_entry_tolerances=_optional_float_tuple(payload, "atr_entry_tolerances"),
+            atr_stop_mults=_optional_float_tuple(payload, "atr_stop_mults"),
+            risk_reward_ratios=_optional_float_tuple(payload, "risk_reward_ratios"),
+            entry_ema_period=int(payload.get("entry_ema_period", 21)),
+            atr_period=int(payload.get("atr_period", 14)),
+            min_atr_pct_of_price=float(payload.get("min_atr_pct_of_price", 0.002)),
+            min_stop_pct=float(payload.get("min_stop_pct", 0.003)),
             qty_policy_ref=qty_policy_ref,
             qty=_optional_number(payload.get("qty")),
             cash_allocation_pct=_optional_number(
                 payload.get("cash_allocation_pct"),
-                default=DEFAULT_CASH_ALLOCATION_PCT if qty_policy_ref == DEFAULT_QTY_POLICY_REF else None,
+                default=(
+                    DEFAULT_CASH_ALLOCATION_PCT
+                    if qty_policy_ref in {DEFAULT_QTY_POLICY_REF, RISK_PCT_OF_CASH_ALLOCATION_POLICY_REF}
+                    else None
+                ),
             ),
+            risk_pct_per_trade=_optional_number(payload.get("risk_pct_per_trade")),
             initial_cash=float(payload.get("initial_cash", 10_000.0)),
             leverage_candidates=_require_float_tuple(payload, "leverage_candidates", fallback_field_name="leverage"),
             fee_rate=float(payload.get("fee_rate", 0.0)),
@@ -579,18 +825,37 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             raise FileExistsError(f"Parameter experiment batch already exists: {batch_id}")
         snapshots = tuple(_load_snapshot(self.server.data_dir, snapshot_id) for snapshot_id in snapshot_ids)
         qty_policy_ref = _resolve_qty_policy_ref(payload)
+        strategy_name = str(payload.get("strategy_name", "ema_crossover"))
         request = ParameterExperimentBatchRequest(
             batch_id=batch_id,
             snapshots=snapshots,
             search_type=SearchType(str(payload.get("search_type", SearchType.GRID.value))),
-            fast_periods=_require_int_tuple(payload, "fast_periods"),
-            slow_periods=_require_int_tuple(payload, "slow_periods"),
+            strategy_name=strategy_name,
+            strategy_version=str(payload.get("strategy_version", "v2" if strategy_name == "ema_pullback_atr_v2" else "v1")),
+            fast_periods=_optional_int_tuple(payload, "fast_periods"),
+            slow_periods=_optional_int_tuple(payload, "slow_periods"),
+            trend_fast_periods=_optional_int_tuple(payload, "trend_fast_periods"),
+            trend_slow_periods=_optional_int_tuple(payload, "trend_slow_periods"),
+            atr_entry_tolerances=_optional_float_tuple(payload, "atr_entry_tolerances"),
+            atr_stop_mults=_optional_float_tuple(payload, "atr_stop_mults"),
+            risk_reward_ratios=_optional_float_tuple(payload, "risk_reward_ratios"),
+            entry_ema_period=int(payload.get("entry_ema_period", 21)),
+            atr_period=int(payload.get("atr_period", 14)),
+            min_atr_pct_of_price=float(payload.get("min_atr_pct_of_price", 0.002)),
+            min_stop_pct=float(payload.get("min_stop_pct", 0.003)),
             qty_policy_ref=qty_policy_ref,
             qty=_optional_number(payload.get("qty")),
             cash_allocation_pct=_optional_number(
                 payload.get("cash_allocation_pct"),
-                default=DEFAULT_CASH_ALLOCATION_PCT if qty_policy_ref == DEFAULT_QTY_POLICY_REF else None,
+                default=(
+                    DEFAULT_CASH_ALLOCATION_PCT
+                    if qty_policy_ref in {DEFAULT_QTY_POLICY_REF, RISK_PCT_OF_CASH_ALLOCATION_POLICY_REF}
+                    else None
+                ),
             ),
+            risk_pct_per_trade=_optional_number(payload.get("risk_pct_per_trade")),
+            cash_allocation_pct_candidates=_optional_float_tuple(payload, "cash_allocation_pct_candidates"),
+            risk_pct_per_trade_candidates=_optional_float_tuple(payload, "risk_pct_per_trade_candidates"),
             initial_cash=float(payload.get("initial_cash", 10_000.0)),
             leverage_candidates=_require_float_tuple(payload, "leverage_candidates", fallback_field_name="leverage"),
             fee_rate=float(payload.get("fee_rate", 0.0)),
@@ -640,6 +905,211 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                 "planned_run_count": planned_run_count,
             },
         )
+
+    def _submit_parameter_experiment_batch_request(self, request: ParameterExperimentBatchRequest) -> tuple[HTTPStatus, dict[str, object]]:
+        batch_repository = FileExperimentBatchRepository(self.server.data_dir)
+        if request.batch_id in batch_repository.list_batch_ids():
+            raise FileExistsError(f"Parameter experiment batch already exists: {request.batch_id}")
+        task, batch, child_requests, planned_run_count = build_parameter_experiment_batch(request)
+        task_repository = FileTaskRepository(self.server.data_dir)
+        task_repository.save_task(task)
+        batch_repository.save_batch(batch)
+        batch_repository.save_execution_index(
+            request.batch_id,
+            {
+                "batch_id": request.batch_id,
+                "task_id": task.task_id,
+                "status": task.status.value,
+                "dataset_snapshot_ids": list(batch.dataset_snapshot_ids),
+                "experiment_ids": list(batch.experiment_ids),
+                "run_ids": [],
+                "child_task_ids": [],
+                "failed_experiment_ids": [],
+                "planned_experiment_count": len(child_requests),
+                "planned_run_count": planned_run_count,
+                "updated_at": task.updated_at.isoformat(),
+            },
+        )
+        worker = threading.Thread(
+            target=self._run_parameter_experiment_batch_in_background,
+            args=(request,),
+            daemon=True,
+            name=f"parameter-experiment-batch:{request.batch_id}",
+        )
+        self.server.background_threads[task.task_id] = worker
+        worker.start()
+        return (
+            HTTPStatus.ACCEPTED,
+            {
+                "task_id": task.task_id,
+                "task_status": task.status.value,
+                "batch_id": request.batch_id,
+                "search_type": request.search_type.value,
+                "planned_experiment_count": len(child_requests),
+                "planned_run_count": planned_run_count,
+            },
+        )
+
+    def _handle_run_research_candidate_risk_matrix(self, candidate_id: str, payload: dict[str, object]) -> tuple[HTTPStatus, dict[str, object]]:
+        candidate_id = candidate_id.strip()
+        if not candidate_id:
+            raise ValueError("candidate_id must not be empty")
+        run_repository = FileRunRepository(self.server.data_dir)
+        group_detail = load_parameter_group_detail(run_repository, group_key=candidate_id, data_dir=self.server.data_dir)
+        group = group_detail.group
+        if group.strategy_name != "ema_pullback_atr_v2":
+            raise ValueError("Risk matrix currently supports EMA Pullback ATR v2 candidates")
+        snapshots = tuple(_load_snapshot(self.server.data_dir, run.dataset_snapshot_id) for run in group_detail.runs)
+        if not snapshots:
+            raise ValueError("Candidate has no evidence runs to derive snapshots")
+        representative_run = group_detail.runs[0]
+        representative_rows = build_parameter_lab_rows(run_repository, run_ids=[representative_run.run_id])
+        if not representative_rows:
+            raise ValueError("Representative run parameters are not available")
+        representative_parameter_row = representative_rows[0]
+        qty_policy_ref = str(group.qty_policy_ref or RISK_PCT_OF_EQUITY_POLICY_REF)
+        risk_candidates = _optional_float_tuple(payload, "risk_pct_per_trade_candidates") or (0.01, 0.03, 0.05, 0.10)
+        cash_candidates = _optional_float_tuple(payload, "cash_allocation_pct_candidates")
+        if qty_policy_ref == DEFAULT_QTY_POLICY_REF:
+            cash_candidates = cash_candidates or (30.0, 50.0, 95.0)
+            risk_candidates = ()
+        if qty_policy_ref == RISK_PCT_OF_CASH_ALLOCATION_POLICY_REF and not cash_candidates:
+            cash_candidates = (30.0, 50.0, 95.0)
+        leverage_candidates = _optional_float_tuple(payload, "leverage_candidates") or (1.0, 3.0, 5.0, 10.0)
+        batch_id = str(payload.get("batch_id") or f"risk-matrix-{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}")
+        request = ParameterExperimentBatchRequest(
+            batch_id=batch_id,
+            snapshots=snapshots,
+            search_type=SearchType.GRID,
+            strategy_name=group.strategy_name,
+            strategy_version="v2",
+            trend_fast_periods=(int(group.trend_fast_period),),
+            trend_slow_periods=(int(group.trend_slow_period),),
+            atr_entry_tolerances=(float(group.atr_entry_tolerance or 0.0),),
+            atr_stop_mults=(float(group.atr_stop_mult or 1.5),),
+            risk_reward_ratios=(float(group.risk_reward_ratio or 1.5),),
+            entry_ema_period=int(group.entry_ema_period or 21),
+            atr_period=int(group.atr_period or 14),
+            min_atr_pct_of_price=float(payload.get("min_atr_pct_of_price", 0.002)),
+            min_stop_pct=float(payload.get("min_stop_pct", 0.003)),
+            qty_policy_ref=qty_policy_ref,
+            qty=None,
+            cash_allocation_pct=float(group.cash_allocation_pct) if group.cash_allocation_pct is not None and qty_policy_ref == DEFAULT_QTY_POLICY_REF else None,
+            cash_allocation_pct_candidates=cash_candidates,
+            risk_pct_per_trade=float(group.risk_pct_per_trade) if group.risk_pct_per_trade is not None and not risk_candidates else None,
+            risk_pct_per_trade_candidates=risk_candidates,
+            initial_cash=float(payload.get("initial_cash", 10_000.0)),
+            leverage_candidates=leverage_candidates,
+            fee_rate=float(representative_parameter_row.fee_rate or 0.0),
+            slippage_bps=float(representative_parameter_row.slippage_bps or 0.0),
+            min_notional=float(payload.get("min_notional", 0.0)),
+            benchmark_enabled=True,
+            validation_split_factory=_build_batch_validation_split_factory(
+                payload={
+                    "validation_split_mode": "auto_ratio",
+                    "oos_ratio": float(payload.get("oos_ratio", 0.3)),
+                    "warmup_bars": int(payload.get("warmup_bars", 0)),
+                },
+                batch_id=batch_id,
+            ),
+        )
+        return self._submit_parameter_experiment_batch_request(request)
+
+    def _handle_run_research_candidate_filter_experiment(self, candidate_id: str, payload: dict[str, object]) -> tuple[HTTPStatus, dict[str, object]]:
+        candidate_id = candidate_id.strip()
+        if not candidate_id:
+            raise ValueError("candidate_id must not be empty")
+        run_repository = FileRunRepository(self.server.data_dir)
+        group_detail = load_parameter_group_detail(run_repository, group_key=candidate_id, data_dir=self.server.data_dir)
+        group = group_detail.group
+        if group.strategy_name != "ema_pullback_atr_v2":
+            raise ValueError("Filter experiments currently support EMA Pullback ATR v2 candidates")
+        snapshots = tuple(_load_snapshot(self.server.data_dir, run.dataset_snapshot_id) for run in group_detail.runs)
+        if not snapshots:
+            raise ValueError("Candidate has no evidence runs to derive snapshots")
+        representative_run = group_detail.runs[0]
+        representative_rows = build_parameter_lab_rows(run_repository, run_ids=[representative_run.run_id])
+        if not representative_rows:
+            raise ValueError("Representative run parameters are not available")
+        representative_parameter_row = representative_rows[0]
+        qty_policy_ref = str(group.qty_policy_ref or RISK_PCT_OF_EQUITY_POLICY_REF)
+        signal_filter_sets = _build_signal_filter_sets(payload)
+        batch_id = str(payload.get("batch_id") or f"filter-experiment-{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}")
+        request = ParameterExperimentBatchRequest(
+            batch_id=batch_id,
+            snapshots=snapshots,
+            search_type=SearchType.GRID,
+            strategy_name=group.strategy_name,
+            strategy_version="v2",
+            trend_fast_periods=(int(group.trend_fast_period),),
+            trend_slow_periods=(int(group.trend_slow_period),),
+            atr_entry_tolerances=(float(group.atr_entry_tolerance or 0.0),),
+            atr_stop_mults=(float(group.atr_stop_mult or 1.5),),
+            risk_reward_ratios=(float(group.risk_reward_ratio or 1.5),),
+            entry_ema_period=int(group.entry_ema_period or 21),
+            atr_period=int(group.atr_period or 14),
+            min_atr_pct_of_price=float(payload.get("min_atr_pct_of_price", 0.002)),
+            min_stop_pct=float(payload.get("min_stop_pct", 0.003)),
+            qty_policy_ref=qty_policy_ref,
+            qty=None,
+            cash_allocation_pct=float(group.cash_allocation_pct) if group.cash_allocation_pct is not None else None,
+            risk_pct_per_trade=float(group.risk_pct_per_trade) if group.risk_pct_per_trade is not None else None,
+            initial_cash=float(payload.get("initial_cash", 10_000.0)),
+            leverage_candidates=(float(group.leverage or representative_parameter_row.leverage or 1.0),),
+            fee_rate=float(representative_parameter_row.fee_rate or 0.0),
+            slippage_bps=float(representative_parameter_row.slippage_bps or 0.0),
+            min_notional=float(payload.get("min_notional", 0.0)),
+            signal_filter_sets=signal_filter_sets,
+            benchmark_enabled=True,
+            validation_split_factory=_build_batch_validation_split_factory(
+                payload={
+                    "validation_split_mode": "auto_ratio",
+                    "oos_ratio": float(payload.get("oos_ratio", 0.3)),
+                    "warmup_bars": int(payload.get("warmup_bars", 0)),
+                },
+                batch_id=batch_id,
+            ),
+        )
+        status, body = self._submit_parameter_experiment_batch_request(request)
+        body["filter_set_count"] = len(signal_filter_sets)
+        body["filter_sets"] = list(signal_filter_sets)
+        return status, body
+
+    def _build_research_candidate_filter_results(self, candidate_id: str) -> dict[str, object]:
+        candidate_id = candidate_id.strip()
+        if not candidate_id:
+            raise ValueError("candidate_id must not be empty")
+        run_repository = FileRunRepository(self.server.data_dir)
+        group_detail = load_parameter_group_detail(run_repository, group_key=candidate_id, data_dir=self.server.data_dir)
+        base_group = group_detail.group
+        rows = build_parameter_lab_rows(run_repository)
+        filtered_rows = [
+            row
+            for row in rows
+            if row.signal_filter_summary and _matches_filter_result_signature(base_group, row)
+        ]
+        rows_by_filter: dict[str, list[ParameterLabRow]] = {}
+        for row in filtered_rows:
+            rows_by_filter.setdefault(str(row.signal_filter_summary), []).append(row)
+        filter_groups = [
+            _build_filter_result_group(filter_summary, filter_rows, base_group=base_group)
+            for filter_summary, filter_rows in rows_by_filter.items()
+        ]
+        filter_groups.sort(
+            key=lambda item: (
+                float(item.get("avg_oos_delta") or -10_000),
+                -float(item.get("avg_max_drawdown") or 10_000),
+                str(item.get("filter_summary") or ""),
+            ),
+            reverse=True,
+        )
+        return {
+            "candidate_id": candidate_id,
+            "base_group": base_group.as_dict(),
+            "base_runs": [run.as_dict() for run in group_detail.runs],
+            "filter_groups": filter_groups,
+            "filter_runs": [row.as_dict() for row in filtered_rows],
+        }
 
     def _run_parameter_experiment_in_background(self, request: ParameterExperimentTaskRequest) -> None:
         run_parameter_experiment_task_workflow(
@@ -700,6 +1170,68 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                 "note": json_ready(note),
             },
         )
+
+    def _handle_delete_research_note(self, note_id: str) -> dict[str, object]:
+        if not note_id:
+            raise ValueError("note_id must not be empty")
+        repository = FileResearchNoteRepository(self.server.data_dir)
+        note = repository.load_note(note_id)
+        repository.delete_note(note_id)
+        return {
+            "deleted_note_id": note_id,
+            "target_type": note.target_type,
+            "target_id": note.target_id,
+        }
+
+    def _handle_add_to_research_pool(self, payload: dict[str, object]) -> tuple[HTTPStatus, dict[str, object]]:
+        source_run_id = _require_str(payload, "source_run_id")
+        run_repository = FileRunRepository(self.server.data_dir)
+        _ = run_repository.load_run(source_run_id)
+        rows_by_run_id = {row.run_id: row for row in build_parameter_lab_rows(run_repository)}
+        source_row = rows_by_run_id.get(source_run_id)
+        if source_row is None:
+            raise FileNotFoundError(f"Run not found in parameter lab: {source_run_id}")
+        group_key = self._parameter_group_key_for_run(source_run_id)
+        note_payload = {
+            "target_type": "research_candidate",
+            "target_id": group_key,
+            "content": str(payload.get("note") or "加入研究池").strip() or "加入研究池",
+            "labels": ["research_pool"],
+            "decision_status": "candidate",
+            "linked_parameter_group": group_key,
+        }
+        status, body = self._handle_create_research_note(note_payload)
+        return status, {"research_candidate_id": group_key, "source_run_id": source_run_id, **body}
+
+    def _handle_add_to_stable_pool(self, payload: dict[str, object]) -> tuple[HTTPStatus, dict[str, object]]:
+        candidate_id = _require_str(payload, "research_candidate_id")
+        chosen_run_id = _optional_str(payload.get("chosen_run_id"))
+        _ = load_parameter_group_detail(
+            FileRunRepository(self.server.data_dir),
+            group_key=candidate_id,
+            data_dir=self.server.data_dir,
+        )
+        if chosen_run_id:
+            _ = FileRunRepository(self.server.data_dir).load_run(chosen_run_id)
+        note_payload = {
+            "target_type": "stable_candidate",
+            "target_id": candidate_id,
+            "content": str(payload.get("decision_reason") or "加入稳定池").strip() or "加入稳定池",
+            "labels": ["stable_pool"],
+            "decision_status": "approved",
+            "decision_reason": _optional_str(payload.get("decision_reason")),
+            "linked_parameter_group": candidate_id,
+        }
+        status, body = self._handle_create_research_note(note_payload)
+        return status, {"stable_candidate_id": candidate_id, "chosen_run_id": chosen_run_id, **body}
+
+    def _parameter_group_key_for_run(self, run_id: str) -> str:
+        run_repository = FileRunRepository(self.server.data_dir)
+        research_workspace = build_parameter_research_workspace(run_repository, data_dir=self.server.data_dir)
+        for group in research_workspace.parameter_groups:
+            if run_id in group.run_ids:
+                return group.group_key
+        raise FileNotFoundError(f"Parameter group not found for run: {run_id}")
 
     def _handle_delete_run(self, run_id: str) -> dict[str, object]:
         run_repository = FileRunRepository(self.server.data_dir)
@@ -788,6 +1320,8 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_error_json(self, exc: Exception) -> None:
+        if isinstance(exc, CLIENT_DISCONNECT_ERRORS):
+            return
         if isinstance(exc, FileNotFoundError):
             status = HTTPStatus.NOT_FOUND
         elif isinstance(exc, FileExistsError):
@@ -796,15 +1330,16 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             status = HTTPStatus.BAD_REQUEST
         else:
             status = HTTPStatus.INTERNAL_SERVER_ERROR
-        self._send_json(
-            status,
-            {
-                "error": {
-                    "type": exc.__class__.__name__,
-                    "message": str(exc),
-                }
-            },
-        )
+        with contextlib.suppress(*CLIENT_DISCONNECT_ERRORS):
+            self._send_json(
+                status,
+                {
+                    "error": {
+                        "type": exc.__class__.__name__,
+                        "message": str(exc),
+                    }
+                },
+            )
 
     def _build_workspace_payload(self, **sections: object) -> dict[str, object]:
         return {
@@ -1212,19 +1747,44 @@ def _build_execution_constraints(payload: dict[str, object]) -> tuple[str, Execu
     qty_policy_ref = _resolve_qty_policy_ref(payload)
     qty = _optional_number(payload.get("qty"))
     cash_allocation_pct = _optional_number(payload.get("cash_allocation_pct"))
+    risk_pct_per_trade = _optional_number(payload.get("risk_pct_per_trade"))
     qty_by_policy: dict[str, float] = {}
     cash_allocation_pct_by_policy: dict[str, float] = {}
+    risk_pct_per_trade_by_policy: dict[str, float] = {}
 
-    if cash_allocation_pct is not None:
-        if qty_policy_ref != DEFAULT_QTY_POLICY_REF:
-            raise ValueError("cash_allocation_pct only supports qty_policy_ref=percent_of_cash")
+    if qty_policy_ref == DEFAULT_QTY_POLICY_REF:
+        if risk_pct_per_trade is not None:
+            raise ValueError("risk_pct_per_trade only supports risk sizing qty_policy_ref")
+        if qty is not None:
+            raise ValueError("qty is not supported with qty_policy_ref=percent_of_cash")
+        if cash_allocation_pct is None:
+            cash_allocation_pct = DEFAULT_CASH_ALLOCATION_PCT
         cash_allocation_pct_by_policy[qty_policy_ref] = cash_allocation_pct
+    elif qty_policy_ref == RISK_PCT_OF_EQUITY_POLICY_REF:
+        if cash_allocation_pct is not None:
+            raise ValueError("cash_allocation_pct only supports qty_policy_ref=percent_of_cash")
+        if qty is not None:
+            raise ValueError("qty is not supported with qty_policy_ref=risk_pct_of_equity")
+        if risk_pct_per_trade is None:
+            raise KeyError("risk_pct_per_trade")
+        risk_pct_per_trade_by_policy[qty_policy_ref] = risk_pct_per_trade
+    elif qty_policy_ref == RISK_PCT_OF_CASH_ALLOCATION_POLICY_REF:
+        if qty is not None:
+            raise ValueError("qty is not supported with qty_policy_ref=risk_pct_of_cash_allocation")
+        if cash_allocation_pct is None:
+            cash_allocation_pct = DEFAULT_CASH_ALLOCATION_PCT
+        if risk_pct_per_trade is None:
+            raise KeyError("risk_pct_per_trade")
+        cash_allocation_pct_by_policy[qty_policy_ref] = cash_allocation_pct
+        risk_pct_per_trade_by_policy[qty_policy_ref] = risk_pct_per_trade
     elif qty is not None:
         qty_by_policy[qty_policy_ref] = qty
-    elif qty_policy_ref == DEFAULT_QTY_POLICY_REF:
-        cash_allocation_pct_by_policy[qty_policy_ref] = DEFAULT_CASH_ALLOCATION_PCT
     else:
-        raise KeyError("Either qty or cash_allocation_pct must be provided")
+        if cash_allocation_pct is not None:
+            raise ValueError("cash_allocation_pct only supports qty_policy_ref=percent_of_cash")
+        if risk_pct_per_trade is not None:
+            raise ValueError("risk_pct_per_trade only supports risk sizing qty_policy_ref")
+        raise KeyError("Either qty, cash_allocation_pct, or risk_pct_per_trade must be provided")
 
     return (
         qty_policy_ref,
@@ -1236,12 +1796,59 @@ def _build_execution_constraints(payload: dict[str, object]) -> tuple[str, Execu
             min_notional=float(payload.get("min_notional", 0.0)),
             qty_by_policy=qty_by_policy,
             cash_allocation_pct_by_policy=cash_allocation_pct_by_policy,
+            risk_pct_per_trade_by_policy=risk_pct_per_trade_by_policy,
         ),
     )
 
 
+def _build_strategy_params_from_payload(
+    payload: dict[str, object],
+    *,
+    strategy_name: str,
+    qty_policy_ref: str,
+) -> dict[str, object]:
+    if strategy_name == "ema_pullback_atr_v2":
+        strategy_params = {
+            "strategy_name": "ema_pullback_atr_v2",
+            "trend_fast_period": int(payload.get("trend_fast_period", 8)),
+            "trend_slow_period": int(payload.get("trend_slow_period", 34)),
+            "atr_entry_tolerance": float(payload.get("atr_entry_tolerance", 0.5)),
+            "atr_stop_mult": float(payload.get("atr_stop_mult", 1.5)),
+            "risk_reward_ratio": float(payload.get("risk_reward_ratio", 1.5)),
+            "entry_ema_period": int(payload.get("entry_ema_period", 21)),
+            "atr_period": int(payload.get("atr_period", 14)),
+            "min_atr_pct_of_price": float(payload.get("min_atr_pct_of_price", 0.002)),
+            "min_stop_pct": float(payload.get("min_stop_pct", 0.003)),
+            "qty_policy_ref": qty_policy_ref,
+        }
+        risk_pct_per_trade = _optional_number(payload.get("risk_pct_per_trade"))
+        if qty_policy_ref in {RISK_PCT_OF_EQUITY_POLICY_REF, RISK_PCT_OF_CASH_ALLOCATION_POLICY_REF} and risk_pct_per_trade is not None:
+            strategy_params["risk_pct_per_trade"] = risk_pct_per_trade
+        cash_allocation_pct = _optional_number(payload.get("cash_allocation_pct"))
+        if qty_policy_ref == RISK_PCT_OF_CASH_ALLOCATION_POLICY_REF and cash_allocation_pct is not None:
+            strategy_params["cash_allocation_pct"] = cash_allocation_pct
+        return strategy_params
+    if strategy_name != "ema_crossover":
+        raise ValueError(f"Unsupported strategy_name: {strategy_name}")
+    return {
+        "strategy_name": "ema_crossover",
+        "fast_period": int(payload.get("fast_period", 2)),
+        "slow_period": int(payload.get("slow_period", 3)),
+        "qty_policy_ref": qty_policy_ref,
+    }
+
+
 def _require_int_tuple(payload: dict[str, object], field_name: str) -> tuple[int, ...]:
     value = payload.get(field_name)
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{field_name} must be a non-empty array")
+    return tuple(int(item) for item in value)
+
+
+def _optional_int_tuple(payload: dict[str, object], field_name: str) -> tuple[int, ...]:
+    value = payload.get(field_name)
+    if value is None:
+        return ()
     if not isinstance(value, list) or not value:
         raise ValueError(f"{field_name} must be a non-empty array")
     return tuple(int(item) for item in value)
@@ -1252,6 +1859,15 @@ def _require_float_tuple(payload: dict[str, object], field_name: str, *, fallbac
     if value is None and fallback_field_name is not None:
         fallback = payload.get(fallback_field_name, 1.0)
         return (float(fallback),)
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{field_name} must be a non-empty array")
+    return tuple(float(item) for item in value)
+
+
+def _optional_float_tuple(payload: dict[str, object], field_name: str) -> tuple[float, ...]:
+    value = payload.get(field_name)
+    if value is None:
+        return ()
     if not isinstance(value, list) or not value:
         raise ValueError(f"{field_name} must be a non-empty array")
     return tuple(float(item) for item in value)
@@ -1314,8 +1930,202 @@ def _optional_float(value: object | None) -> float | None:
     return float(value)
 
 
+def _build_signal_filter_sets(payload: dict[str, object]) -> tuple[dict[str, object], ...]:
+    raw_sets = payload.get("signal_filter_sets")
+    if raw_sets is not None:
+        if not isinstance(raw_sets, list):
+            raise ValueError("signal_filter_sets must be an array")
+        return tuple(_normalize_signal_filter_set(item) for item in raw_sets)
+
+    mode = str(payload.get("mode", "single")).strip() or "single"
+    selected = payload.get("filter_types")
+    filter_types = (
+        [str(item) for item in selected]
+        if isinstance(selected, list) and selected
+        else ["higher_timeframe_trend", "atr_percentile", "adx"]
+    )
+    filter_sets = [_default_signal_filter_set(filter_type) for filter_type in filter_types]
+    if mode in {"stacked", "recommended"} and len(filter_sets) > 1:
+        stacked_filters = [signal_filter for filter_set in filter_sets for signal_filter in filter_set["filters"]]
+        filter_sets.append(
+            {
+                "filter_set_id": "stacked_core",
+                "label": "stacked-core",
+                "mode": "stacked",
+                "filters": stacked_filters,
+            }
+        )
+    return tuple(_normalize_signal_filter_set(item) for item in filter_sets)
+
+
+def _default_signal_filter_set(filter_type: str) -> dict[str, object]:
+    if filter_type == "higher_timeframe_trend":
+        return {
+            "filter_set_id": "htf-trend-ema50-200",
+            "label": "htf-trend",
+            "mode": "single",
+            "filters": [
+                {
+                    "filter_type": "higher_timeframe_trend",
+                    "enabled": True,
+                    "params": {"ema_fast": 50, "ema_slow": 200, "mode": "direction_aligned"},
+                }
+            ],
+        }
+    if filter_type == "atr_percentile":
+        return {
+            "filter_set_id": "atr-p20-80",
+            "label": "atr-p20-80",
+            "mode": "single",
+            "filters": [
+                {
+                    "filter_type": "atr_percentile",
+                    "enabled": True,
+                    "params": {"atr_period": 14, "lookback_bars": 200, "min_percentile": 20, "max_percentile": 80},
+                }
+            ],
+        }
+    if filter_type == "adx":
+        return {
+            "filter_set_id": "adx-20",
+            "label": "adx-20",
+            "mode": "single",
+            "filters": [
+                {
+                    "filter_type": "adx",
+                    "enabled": True,
+                    "params": {"adx_period": 14, "min_adx": 20},
+                }
+            ],
+        }
+    raise ValueError(f"Unsupported filter_type: {filter_type}")
+
+
+def _normalize_signal_filter_set(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("signal_filter_sets entries must be objects")
+    filters = value.get("filters")
+    if not isinstance(filters, list) or not filters:
+        raise ValueError("signal_filter_set.filters must be a non-empty array")
+    return {
+        "filter_set_id": str(value.get("filter_set_id") or value.get("label") or "filter-set"),
+        "label": str(value.get("label") or value.get("filter_set_id") or "filter-set"),
+        "mode": str(value.get("mode") or "single"),
+        "filters": [_normalize_signal_filter(item) for item in filters],
+    }
+
+
+def _normalize_signal_filter(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("signal filter must be an object")
+    filter_type = str(value.get("filter_type") or "")
+    if filter_type not in {"higher_timeframe_trend", "atr_percentile", "adx"}:
+        raise ValueError(f"Unsupported signal filter type: {filter_type}")
+    params = value.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        raise ValueError("signal filter params must be an object")
+    return {
+        "filter_type": filter_type,
+        "enabled": bool(value.get("enabled", True)),
+        "params": params,
+    }
+
+
+def _matches_filter_result_signature(base_group: object, row: ParameterLabRow) -> bool:
+    fields = (
+        "strategy_name",
+        "symbol",
+        "timeframe",
+        "fast_period",
+        "slow_period",
+        "trend_fast_period",
+        "trend_slow_period",
+        "entry_ema_period",
+        "atr_period",
+        "atr_entry_tolerance",
+        "atr_stop_mult",
+        "risk_reward_ratio",
+        "qty_policy_ref",
+        "cash_allocation_pct",
+        "risk_pct_per_trade",
+        "leverage",
+    )
+    return all(getattr(base_group, field) == getattr(row, field) for field in fields)
+
+
+def _build_filter_result_group(filter_summary: str, rows: list[ParameterLabRow], *, base_group: object) -> dict[str, object]:
+    run_count = len(rows)
+    oos_values = [float(row.oos_total_return) for row in rows if row.oos_total_return is not None]
+    total_values = [float(row.total_return) for row in rows]
+    drawdowns = [float(row.max_drawdown) for row in rows]
+    profit_factors = [float(row.profit_factor) for row in rows if row.profit_factor is not None]
+    trade_counts = [int(row.trade_count) for row in rows]
+    oos_trade_counts = [int(row.oos_trade_count) for row in rows if row.oos_trade_count is not None]
+    avg_oos = sum(oos_values) / len(oos_values) if oos_values else None
+    avg_total = sum(total_values) / run_count if run_count else None
+    avg_drawdown = sum(drawdowns) / run_count if run_count else None
+    worst_drawdown = max(drawdowns) if drawdowns else None
+    avg_profit_factor = sum(profit_factors) / len(profit_factors) if profit_factors else None
+    min_trade_count = min(trade_counts) if trade_counts else None
+    min_oos_trade_count = min(oos_trade_counts) if oos_trade_counts else None
+    base_avg_oos = getattr(base_group, "avg_oos_total_return", None)
+    base_avg_drawdown = getattr(base_group, "avg_max_drawdown", None)
+    base_avg_profit_factor = getattr(base_group, "avg_profit_factor", None)
+    base_min_trade_count = getattr(base_group, "min_trade_count", None)
+    return {
+        "filter_summary": filter_summary,
+        "run_count": run_count,
+        "snapshot_count": len({row.dataset_snapshot_id for row in rows}),
+        "avg_total_return": avg_total,
+        "avg_oos_total_return": avg_oos,
+        "avg_oos_delta": (avg_oos - float(base_avg_oos)) if avg_oos is not None and base_avg_oos is not None else None,
+        "avg_max_drawdown": avg_drawdown,
+        "avg_drawdown_delta": (avg_drawdown - float(base_avg_drawdown)) if avg_drawdown is not None and base_avg_drawdown is not None else None,
+        "worst_max_drawdown": worst_drawdown,
+        "avg_profit_factor": avg_profit_factor,
+        "avg_profit_factor_delta": (
+            avg_profit_factor - float(base_avg_profit_factor)
+            if avg_profit_factor is not None and base_avg_profit_factor is not None
+            else None
+        ),
+        "min_trade_count": min_trade_count,
+        "min_oos_trade_count": min_oos_trade_count,
+        "trade_retention": (
+            (float(min_trade_count) / float(base_min_trade_count))
+            if min_trade_count is not None and base_min_trade_count
+            else None
+        ),
+        "run_ids": [row.run_id for row in sorted(rows, key=lambda item: item.created_at, reverse=True)],
+    }
+
+
 def _build_research_note_id() -> str:
     return f"note-{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}"
+
+
+def _readmodel_signature(data_dir: Path) -> tuple[int, int]:
+    paths = [
+        data_dir / "runs",
+        data_dir / "experiments",
+        data_dir / "experiment_batches",
+    ]
+    file_count = 0
+    latest_mtime_ns = 0
+    for root in paths:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            file_count += 1
+            latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
+    return file_count, latest_mtime_ns
 
 
 def _validate_research_note_target(data_dir: Path, *, target_type: str, target_id: str) -> None:
@@ -1328,13 +2138,26 @@ def _validate_research_note_target(data_dir: Path, *, target_type: str, target_i
     if target_type == "parameter_experiment_batch":
         _ = FileExperimentBatchRepository(data_dir).load_batch(target_id)
         return
-    if target_type == "parameter_group":
+    if target_type in {"parameter_group", "research_candidate", "stable_candidate"}:
+        if "|" in target_id:
+            _ = load_parameter_group_detail(
+                FileRunRepository(data_dir),
+                group_key=target_id,
+                data_dir=data_dir,
+            )
+            return
         batch_id = target_id.split(":", 1)[0].strip()
-        if not batch_id:
-            raise ValueError("parameter_group target_id must start with batch_id")
-        _ = FileExperimentBatchRepository(data_dir).load_batch(batch_id)
+        try:
+            _ = FileExperimentBatchRepository(data_dir).load_batch(batch_id)
+            return
+        except FileNotFoundError:
+            _ = load_parameter_group_detail(
+                FileRunRepository(data_dir),
+                group_key=target_id,
+                data_dir=data_dir,
+            )
         return
-    raise ValueError("target_type must be one of run, parameter_experiment, parameter_experiment_batch, parameter_group")
+    raise ValueError("target_type must be one of run, parameter_experiment, parameter_experiment_batch, parameter_group, research_candidate, stable_candidate")
 
 
 def _delete_run_if_exists(run_repository: FileRunRepository, run_id: str) -> None:

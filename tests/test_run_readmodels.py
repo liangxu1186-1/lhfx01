@@ -9,6 +9,8 @@ from crypto_backtest_workbench.app.readmodels import (
     build_trade_explorer_rows,
     build_trade_rows,
     build_warning_rows,
+    build_parameter_research_workspace,
+    load_research_candidate_trade_attribution,
     TradeFilter,
     filter_trade_rows,
     filter_run_summary_views,
@@ -16,6 +18,7 @@ from crypto_backtest_workbench.app.readmodels import (
     list_run_summary_views,
     load_run_detail_view,
 )
+from crypto_backtest_workbench.app.readmodels.runs import _parameter_summary
 from crypto_backtest_workbench.domain.models import (
     CanonicalCandle,
     MarketType,
@@ -150,6 +153,23 @@ def test_run_readmodels_filter_trade_rows(tmp_path) -> None:
     assert filtered[0]["side"] == "long"
 
 
+def test_trade_attribution_builds_candidate_buckets_and_checks(tmp_path) -> None:
+    repository = FileRunRepository(tmp_path)
+    repository.save_single_run_result(_build_single_run_result(run_id="run-001"))
+    repository.save_single_run_result(_build_single_run_result(run_id="run-002"))
+    workspace = build_parameter_research_workspace(repository)
+    candidate_id = workspace.parameter_groups[0].group_key
+
+    attribution = load_research_candidate_trade_attribution(repository, candidate_id=candidate_id).as_dict()
+
+    assert attribution["candidate_id"] == candidate_id
+    assert attribution["summary"]["run_count"] == 2
+    assert attribution["summary"]["trade_count"] == 2
+    assert attribution["summary"]["feature_meta_coverage"] == 1.0
+    assert any(bucket["dimension"] == "side" for bucket in attribution["buckets"])
+    assert any(check["key"] == "total_trade_sample" for check in attribution["anti_overfit_checks"])
+
+
 def _build_single_run_result(*, run_id: str):
     candles = _build_candles([100.0, 102.0, 105.0, 103.0, 104.0])
     signals = [
@@ -162,6 +182,25 @@ def _build_single_run_result(*, run_id: str):
             side=Side.LONG,
             qty_policy_ref="fixed_1",
             reason_code="open-long",
+            meta_json={
+                "feature_values": {
+                    "trend_fast_ema": 101.0,
+                    "trend_slow_ema": 99.0,
+                    "entry_ema": 100.0,
+                    "atr": 2.0,
+                    "low": 99.0,
+                    "close": 100.0,
+                    "previous_high": 99.5,
+                },
+                "risk_spec": {
+                    "stop_loss_mode": "atr_multiple",
+                    "stop_loss_value": 1.5,
+                    "take_profit_mode": "rr",
+                    "take_profit_value": 2.0,
+                    "atr_value": 2.0,
+                    "min_stop_pct": 0.003,
+                },
+            },
         ),
         SignalIntent(
             signal_id=f"{run_id}-signal-close",
@@ -256,3 +295,25 @@ def _build_candles(close_prices: list[float]) -> list[CanonicalCandle]:
             )
         )
     return candles
+
+
+def test_run_summary_parameter_summary_includes_risk_sizing() -> None:
+    summary = _parameter_summary(
+        "ema_pullback_atr_v2",
+        {
+            "trend_fast_period": 8,
+            "trend_slow_period": 34,
+            "entry_ema_period": 21,
+            "atr_period": 14,
+            "atr_entry_tolerance": 0.5,
+            "atr_stop_mult": 1.5,
+            "risk_reward_ratio": 2.0,
+            "qty_policy_ref": "risk_pct_of_equity",
+        },
+        {
+            "leverage": 2.0,
+            "risk_pct_per_trade_by_policy": {"risk_pct_of_equity": 0.01},
+        },
+    )
+
+    assert summary == "tf8 ts34 ema21 atr14 tol0.5 sl1.5 rr2 risk1% l2"

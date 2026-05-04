@@ -74,18 +74,24 @@ def build_batch_scoring_rules() -> dict[str, dict[str, object]]:
 
 def build_batch_recommendations(
     run_rows: list[dict[str, object]],
+    *,
+    strategy_name: str | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, list[dict[str, object]]], dict[str, dict[str, object]]]:
-    grouped: dict[tuple[int | None, int | None, float | None], dict[str, object]] = {}
+    if strategy_name is not None:
+        run_rows = [row for row in run_rows if row.get("strategy_name") == strategy_name]
+    grouped: dict[tuple[object, ...], dict[str, object]] = {}
     for row in run_rows:
-        fast_period = _as_optional_int(row.get("fast_period"))
-        slow_period = _as_optional_int(row.get("slow_period"))
+        row_strategy_name = str(row.get("strategy_name") or "ema_crossover")
         leverage = _as_optional_float(row.get("leverage"))
-        key = (fast_period, slow_period, leverage)
+        key = _parameter_group_key(row)
+        params = _parameter_group_params(row)
         group = grouped.setdefault(
             key,
             {
-                "fast_period": fast_period,
-                "slow_period": slow_period,
+                **params,
+                "strategy_name": row_strategy_name,
+                "parameter_summary": _parameter_summary(row),
+                "signal_filter_summary": row.get("signal_filter_summary"),
                 "leverage": leverage,
                 "run_count": 0,
                 "positive_run_count": 0,
@@ -144,12 +150,21 @@ def build_batch_recommendations(
         if isinstance(run_ids, list):
             run_ids.append(str(row.get("run_id", "")))
 
-    fast_values = sorted({key[0] for key in grouped if key[0] is not None})
-    slow_values = sorted({key[1] for key in grouped if key[1] is not None})
-    leverage_values = sorted({key[2] for key in grouped if key[2] is not None})
+    fast_values = sorted({group["fast_period"] for group in grouped.values() if group.get("fast_period") is not None})
+    slow_values = sorted({group["slow_period"] for group in grouped.values() if group.get("slow_period") is not None})
+    leverage_values = sorted({group["leverage"] for group in grouped.values() if group.get("leverage") is not None})
     fast_index = {value: index for index, value in enumerate(fast_values)}
     slow_index = {value: index for index, value in enumerate(slow_values)}
     leverage_index = {value: index for index, value in enumerate(leverage_values)}
+    key_by_comparable = {
+        (
+            group.get("strategy_name"),
+            group.get("fast_period"),
+            group.get("slow_period"),
+            group.get("leverage"),
+        ): key
+        for key, group in grouped.items()
+    }
 
     def averaged_metric(group: dict[str, object], field_name: str) -> float:
         return float(group[field_name]) / int(group["run_count"])
@@ -174,7 +189,10 @@ def build_batch_recommendations(
         )
 
     for key, group in grouped.items():
-        fast_period, slow_period, leverage = key
+        fast_period = group.get("fast_period")
+        slow_period = group.get("slow_period")
+        leverage = group.get("leverage")
+        group_strategy_name = group.get("strategy_name")
         neighbors: list[dict[str, object]] = []
         if fast_period is not None and slow_period is not None:
             current_fast_index = fast_index.get(fast_period)
@@ -183,14 +201,16 @@ def build_batch_recommendations(
                 for offset in (-1, 1):
                     next_index = current_fast_index + offset
                     if 0 <= next_index < len(fast_values):
-                        neighbor = grouped.get((fast_values[next_index], slow_period, leverage))
+                        neighbor_key = key_by_comparable.get((group_strategy_name, fast_values[next_index], slow_period, leverage))
+                        neighbor = grouped.get(neighbor_key) if neighbor_key is not None else None
                         if neighbor is not None:
                             neighbors.append(neighbor)
             if current_slow_index is not None:
                 for offset in (-1, 1):
                     next_index = current_slow_index + offset
                     if 0 <= next_index < len(slow_values):
-                        neighbor = grouped.get((fast_period, slow_values[next_index], leverage))
+                        neighbor_key = key_by_comparable.get((group_strategy_name, fast_period, slow_values[next_index], leverage))
+                        neighbor = grouped.get(neighbor_key) if neighbor_key is not None else None
                         if neighbor is not None:
                             neighbors.append(neighbor)
         if leverage is not None:
@@ -199,7 +219,8 @@ def build_batch_recommendations(
                 for offset in (-1, 1):
                     next_index = current_leverage_index + offset
                     if 0 <= next_index < len(leverage_values):
-                        neighbor = grouped.get((fast_period, slow_period, leverage_values[next_index]))
+                        neighbor_key = key_by_comparable.get((group_strategy_name, fast_period, slow_period, leverage_values[next_index]))
+                        neighbor = grouped.get(neighbor_key) if neighbor_key is not None else None
                         if neighbor is not None:
                             neighbors.append(neighbor)
         stable_neighbor_count = sum(1 for neighbor in neighbors if is_stable_group(neighbor))
@@ -260,8 +281,18 @@ def build_batch_recommendations(
         )
         parameter_groups.append(
             {
+                "strategy_name": group["strategy_name"],
+                "parameter_summary": group["parameter_summary"],
+                "signal_filter_summary": group.get("signal_filter_summary"),
                 "fast_period": group["fast_period"],
                 "slow_period": group["slow_period"],
+                "trend_fast_period": group.get("trend_fast_period"),
+                "trend_slow_period": group.get("trend_slow_period"),
+                "entry_ema_period": group.get("entry_ema_period"),
+                "atr_period": group.get("atr_period"),
+                "atr_entry_tolerance": group.get("atr_entry_tolerance"),
+                "atr_stop_mult": group.get("atr_stop_mult"),
+                "risk_reward_ratio": group.get("risk_reward_ratio"),
                 "leverage": group["leverage"],
                 "run_count": run_count,
                 "snapshot_count": len(group["snapshot_ids"]),
@@ -323,9 +354,9 @@ def build_batch_recommendations(
         and int(group["stable_neighbor_count"]) >= int(robust_rule["min_stable_neighbor_count"])
         and float(group["neighbor_stability_score"] or 0.0) >= float(robust_rule["min_neighbor_stability"])
     ]
-    robust_keys = {(item["fast_period"], item["slow_period"], item["leverage"]) for item in robust_candidates}
+    robust_keys = {_recommendation_key(item) for item in robust_candidates}
     excluded_keys = {
-        (group["fast_period"], group["slow_period"], group["leverage"])
+        _recommendation_key(group)
         for group in parameter_groups
         if (
             float(group["avg_total_return"]) <= 0
@@ -355,8 +386,8 @@ def build_batch_recommendations(
         and int(group["oos_available_count"]) > 0
         and float(group["avg_oos_total_return"]) > 0
         and int(group["min_oos_trade_count"] or 0) >= int(BATCH_RECOMMENDATION_RULES["high_return_candidate"]["min_oos_trade_count"])
-        and (group["fast_period"], group["slow_period"], group["leverage"]) not in robust_keys
-        and (group["fast_period"], group["slow_period"], group["leverage"]) not in excluded_keys
+        and _recommendation_key(group) not in robust_keys
+        and _recommendation_key(group) not in excluded_keys
     ]
     excluded_combinations = [
         {
@@ -403,8 +434,8 @@ def build_batch_recommendations(
         if float(group["best_total_return"]) > 0
         and float(group["avg_total_return"]) > 0
         and int(group["oos_available_count"]) == 0
-        and (group["fast_period"], group["slow_period"], group["leverage"]) not in robust_keys
-        and (group["fast_period"], group["slow_period"], group["leverage"]) not in excluded_keys
+        and _recommendation_key(group) not in robust_keys
+        and _recommendation_key(group) not in excluded_keys
     ]
 
     parameter_groups.sort(
@@ -462,3 +493,76 @@ def _as_optional_float(value: object | None) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _parameter_group_key(row: dict[str, object]) -> tuple[object, ...]:
+    strategy_name = str(row.get("strategy_name") or "ema_crossover")
+    leverage = _as_optional_float(row.get("leverage"))
+    if strategy_name == "ema_pullback_atr_v2":
+        return (
+            strategy_name,
+            _as_optional_int(row.get("trend_fast_period")),
+            _as_optional_int(row.get("trend_slow_period")),
+            _as_optional_int(row.get("entry_ema_period")),
+            _as_optional_int(row.get("atr_period")),
+            _as_optional_float(row.get("atr_entry_tolerance")),
+            _as_optional_float(row.get("atr_stop_mult")),
+            _as_optional_float(row.get("risk_reward_ratio")),
+            row.get("signal_filter_summary"),
+            leverage,
+        )
+    return (
+        strategy_name,
+        _as_optional_int(row.get("fast_period")),
+        _as_optional_int(row.get("slow_period")),
+        leverage,
+    )
+
+
+def _parameter_group_params(row: dict[str, object]) -> dict[str, object]:
+    strategy_name = str(row.get("strategy_name") or "ema_crossover")
+    if strategy_name == "ema_pullback_atr_v2":
+        return {
+            "fast_period": _as_optional_int(row.get("trend_fast_period")),
+            "slow_period": _as_optional_int(row.get("trend_slow_period")),
+            "trend_fast_period": _as_optional_int(row.get("trend_fast_period")),
+            "trend_slow_period": _as_optional_int(row.get("trend_slow_period")),
+            "entry_ema_period": _as_optional_int(row.get("entry_ema_period")),
+            "atr_period": _as_optional_int(row.get("atr_period")),
+            "atr_entry_tolerance": _as_optional_float(row.get("atr_entry_tolerance")),
+            "atr_stop_mult": _as_optional_float(row.get("atr_stop_mult")),
+            "risk_reward_ratio": _as_optional_float(row.get("risk_reward_ratio")),
+            "signal_filter_summary": row.get("signal_filter_summary"),
+        }
+    return {
+        "fast_period": _as_optional_int(row.get("fast_period")),
+        "slow_period": _as_optional_int(row.get("slow_period")),
+    }
+
+
+def _parameter_summary(row: dict[str, object]) -> str:
+    summary = row.get("parameter_summary")
+    if isinstance(summary, str) and summary:
+        return summary
+    return ":".join(str(part) for part in _parameter_group_key(row)[1:] if part is not None)
+
+
+def _recommendation_key(group: dict[str, object]) -> tuple[object, ...]:
+    if group.get("strategy_name") == "ema_pullback_atr_v2":
+        return (
+            group.get("strategy_name"),
+            group.get("trend_fast_period"),
+            group.get("trend_slow_period"),
+            group.get("entry_ema_period"),
+            group.get("atr_period"),
+            group.get("atr_entry_tolerance"),
+            group.get("atr_stop_mult"),
+            group.get("risk_reward_ratio"),
+            group.get("leverage"),
+        )
+    return (
+        group.get("strategy_name"),
+        group.get("fast_period"),
+        group.get("slow_period"),
+        group.get("leverage"),
+    )

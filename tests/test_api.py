@@ -7,6 +7,7 @@ from threading import Thread
 import time
 from urllib import error
 from urllib import request
+from urllib.parse import quote
 
 from crypto_backtest_workbench.app import api
 from crypto_backtest_workbench.domain.models import CanonicalCandle, DatasetSnapshot, MarketType, PriceType
@@ -122,6 +123,152 @@ def test_workspace_api_run_ema_supports_percent_of_cash_sizing(tmp_path: Path) -
     assert constraints["qty_by_policy"] == {}
 
 
+def test_workspace_api_runs_accepts_v2_run(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-v2-001")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        run_response = _request_json(
+            server,
+            "/api/runs",
+            payload={
+                "snapshot_id": "snapshot-api-v2-001",
+                "run_id": "run-api-v2-001",
+                "strategy_name": "ema_pullback_atr_v2",
+                "trend_fast_period": 2,
+                "trend_slow_period": 5,
+                "atr_entry_tolerance": 1.0,
+                "atr_stop_mult": 1.5,
+                "risk_reward_ratio": 2.0,
+                "cash_allocation_pct": 50.0,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.0,
+                "slippage_bps": 0.0,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+            },
+        )
+        run_detail = _request_json(server, "/api/runs/run-api-v2-001")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert run_response["task_status"] == "success"
+    assert run_detail["run"]["strategy_name"] == "ema_pullback_atr_v2"
+    params = run_detail["run"]["manifest"]["resolved_config_json"]["strategy_params"]
+    assert params["entry_ema_period"] == 21
+    assert params["atr_period"] == 14
+    assert params["min_atr_pct_of_price"] == 0.002
+    assert params["min_stop_pct"] == 0.003
+
+
+def test_workspace_api_runs_accepts_v2_risk_pct_of_equity_run(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-v2-risk-001")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+      run_response = _request_json(
+          server,
+          "/api/runs",
+          payload={
+              "snapshot_id": "snapshot-api-v2-risk-001",
+              "run_id": "run-api-v2-risk-001",
+              "strategy_name": "ema_pullback_atr_v2",
+              "trend_fast_period": 2,
+              "trend_slow_period": 5,
+              "atr_entry_tolerance": 1.0,
+              "atr_stop_mult": 1.5,
+              "risk_reward_ratio": 2.0,
+              "qty_policy_ref": "risk_pct_of_equity",
+              "risk_pct_per_trade": 0.01,
+              "initial_cash": 10000.0,
+              "leverage": 1.0,
+              "fee_rate": 0.0,
+              "slippage_bps": 0.0,
+              "min_notional": 0.0,
+              "benchmark": "buy_and_hold",
+          },
+      )
+      run_detail = _request_json(server, "/api/runs/run-api-v2-risk-001")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert run_response["task_status"] == "success"
+    manifest = run_detail["run"]["manifest"]["resolved_config_json"]
+    assert manifest["strategy_params"]["risk_pct_per_trade"] == 0.01
+    assert manifest["execution_constraints"]["risk_pct_per_trade_by_policy"] == {"risk_pct_of_equity": 0.01}
+
+
+def test_workspace_api_runs_accepts_v2_risk_pct_of_cash_allocation_run(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-v2-allocated-risk-001")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+      run_response = _request_json(
+          server,
+          "/api/runs",
+          payload={
+              "snapshot_id": "snapshot-api-v2-allocated-risk-001",
+              "run_id": "run-api-v2-allocated-risk-001",
+              "strategy_name": "ema_pullback_atr_v2",
+              "trend_fast_period": 2,
+              "trend_slow_period": 5,
+              "atr_entry_tolerance": 1.0,
+              "atr_stop_mult": 1.5,
+              "risk_reward_ratio": 2.0,
+              "qty_policy_ref": "risk_pct_of_cash_allocation",
+              "cash_allocation_pct": 50.0,
+              "risk_pct_per_trade": 0.01,
+              "initial_cash": 10000.0,
+              "leverage": 1.0,
+              "fee_rate": 0.0,
+              "slippage_bps": 0.0,
+              "min_notional": 0.0,
+              "benchmark": "buy_and_hold",
+          },
+      )
+      run_detail = _request_json(server, "/api/runs/run-api-v2-allocated-risk-001")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert run_response["task_status"] == "success"
+    manifest = run_detail["run"]["manifest"]["resolved_config_json"]
+    assert manifest["strategy_params"]["cash_allocation_pct"] == 50.0
+    assert manifest["strategy_params"]["risk_pct_per_trade"] == 0.01
+    assert manifest["execution_constraints"]["cash_allocation_pct_by_policy"] == {"risk_pct_of_cash_allocation": 50.0}
+    assert manifest["execution_constraints"]["risk_pct_per_trade_by_policy"] == {"risk_pct_of_cash_allocation": 0.01}
+
+
 def test_workspace_api_split_read_endpoints_return_expected_sections(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-003")
@@ -161,6 +308,18 @@ def test_workspace_api_split_read_endpoints_return_expected_sections(tmp_path: P
         run_detail_response = _request_json(server, "/api/runs/run-api-003")
         task_detail_response = _request_json(server, "/api/tasks/single-run:run-api-003")
         parameters_response = _request_json(server, "/api/parameters")
+        parameter_research_response = _request_json(server, "/api/parameter-research")
+        research_subjects_response = _request_json(server, "/api/research-subjects")
+        parameter_groups_response = _request_json(server, "/api/parameter-groups?symbol=BTC/USDT:USDT&timeframe=1h")
+        group_key = parameter_groups_response["parameter_groups"][0]["group_key"]
+        parameter_group_detail_response = _request_json(
+            server,
+            f"/api/parameter-groups/{quote(group_key, safe='')}",
+        )
+        trade_attribution_response = _request_json(
+            server,
+            f"/api/research-candidates/{quote(group_key, safe='')}/trade-attribution",
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -176,6 +335,201 @@ def test_workspace_api_split_read_endpoints_return_expected_sections(tmp_path: P
     assert run_detail_response["run"]["run_id"] == "run-api-003"
     assert task_detail_response["task"]["task_id"] == "single-run:run-api-003"
     assert parameters_response["parameter_lab"]["rows"][0]["run_id"] == "run-api-003"
+    assert parameter_research_response["research_subjects"][0]["run_count"] == 1
+    assert parameter_research_response["parameter_groups"][0]["representative_run_id"] == "run-api-003"
+    assert research_subjects_response["research_subjects"][0]["run_count"] == 1
+    assert parameter_groups_response["parameter_groups"][0]["representative_run_id"] == "run-api-003"
+    assert parameter_group_detail_response["parameter_group"]["runs"][0]["run_id"] == "run-api-003"
+    assert trade_attribution_response["trade_attribution"]["candidate_id"] == group_key
+    assert "anti_overfit_checks" in trade_attribution_response["trade_attribution"]
+
+
+def test_workspace_api_research_workflow_promotes_candidates_across_pools(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-workflow-001")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        _request_json(
+            server,
+            "/api/run-ema",
+            payload={
+                "snapshot_id": "snapshot-api-workflow-001",
+                "run_id": "run-api-workflow-001",
+                "fast_period": 2,
+                "slow_period": 3,
+                "qty_policy_ref": "fixed_1",
+                "qty": 0.01,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.0,
+                "slippage_bps": 0.0,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+            },
+        )
+        initial_workflow = _request_json(server, "/api/research-workflow")
+        research_response = _request_json(
+            server,
+            "/api/research-pool",
+            payload={"source_run_id": "run-api-workflow-001", "note": "进入研究池"},
+            method="POST",
+        )
+        research_workflow = _request_json(server, "/api/research-workflow")
+        candidate_id = research_response["research_candidate_id"]
+        stable_response = _request_json(
+            server,
+            "/api/stable-pool",
+            payload={
+                "research_candidate_id": candidate_id,
+                "chosen_run_id": "run-api-workflow-001",
+                "decision_reason": "邻域和风险矩阵通过",
+            },
+            method="POST",
+        )
+        stable_workflow = _request_json(server, "/api/research-workflow")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert initial_workflow["research_workflow"]["screening_pool"]["runs"][0]["run_id"] == "run-api-workflow-001"
+    assert initial_workflow["research_workflow"]["research_pool"]["candidates"] == []
+    assert research_response["source_run_id"] == "run-api-workflow-001"
+    assert research_workflow["research_workflow"]["research_pool"]["candidates"][0]["candidate_id"] == candidate_id
+    assert research_workflow["research_workflow"]["research_pool"]["candidates"][0]["source_run_ids"] == ["run-api-workflow-001"]
+    assert stable_response["stable_candidate_id"] == candidate_id
+    assert stable_workflow["research_workflow"]["stable_pool"]["candidates"][0]["stable_candidate_id"] == candidate_id
+    assert stable_workflow["research_workflow"]["stable_pool"]["candidates"][0]["evidence_run_ids"] == ["run-api-workflow-001"]
+
+
+def test_workspace_api_research_candidate_risk_matrix_uses_full_representative_run_params(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-risk-matrix-001")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        run_response = _request_json(
+            server,
+            "/api/runs",
+            payload={
+                "snapshot_id": "snapshot-api-risk-matrix-001",
+                "run_id": "run-api-risk-matrix-001",
+                "strategy_name": "ema_pullback_atr_v2",
+                "trend_fast_period": 2,
+                "trend_slow_period": 5,
+                "atr_entry_tolerance": 1.0,
+                "atr_stop_mult": 1.5,
+                "risk_reward_ratio": 2.0,
+                "qty_policy_ref": "risk_pct_of_equity",
+                "risk_pct_per_trade": 0.01,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.001,
+                "slippage_bps": 0.5,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+            },
+        )
+        research_response = _request_json(
+            server,
+            "/api/research-pool",
+            payload={"source_run_id": "run-api-risk-matrix-001", "note": "进入研究池"},
+            method="POST",
+        )
+        risk_matrix_response = _request_json(
+            server,
+            f"/api/research-candidates/{quote(research_response['research_candidate_id'], safe='')}/risk-matrix",
+            payload={
+                "batch_id": "risk-matrix-api-001",
+                "risk_pct_per_trade_candidates": [0.01],
+                "leverage_candidates": [1.0],
+            },
+            method="POST",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert run_response["task_status"] == "success"
+    assert risk_matrix_response["task_status"] == "pending"
+    assert risk_matrix_response["batch_id"] == "risk-matrix-api-001"
+
+
+def test_workspace_api_research_candidate_filter_experiment_submits_fixed_parameter_batch(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-filter-001")
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        _request_json(
+            server,
+            "/api/runs",
+            payload={
+                "snapshot_id": "snapshot-api-filter-001",
+                "run_id": "run-api-filter-001",
+                "strategy_name": "ema_pullback_atr_v2",
+                "trend_fast_period": 2,
+                "trend_slow_period": 5,
+                "atr_entry_tolerance": 1.0,
+                "atr_stop_mult": 1.5,
+                "risk_reward_ratio": 2.0,
+                "qty_policy_ref": "risk_pct_of_equity",
+                "risk_pct_per_trade": 0.01,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.001,
+                "slippage_bps": 0.5,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+            },
+        )
+        research_response = _request_json(
+            server,
+            "/api/research-pool",
+            payload={"source_run_id": "run-api-filter-001", "note": "进入研究池"},
+            method="POST",
+        )
+        filter_response = _request_json(
+            server,
+            f"/api/research-candidates/{quote(research_response['research_candidate_id'], safe='')}/filter-experiments",
+            payload={
+                "batch_id": "filter-experiment-api-001",
+                "filter_types": ["adx"],
+            },
+            method="POST",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert filter_response["task_status"] == "pending"
+    assert filter_response["batch_id"] == "filter-experiment-api-001"
+    assert filter_response["filter_set_count"] == 1
+    assert filter_response["planned_run_count"] == 1
 
 
 def test_workspace_api_research_notes_can_be_created_and_read_from_run_detail(tmp_path: Path) -> None:

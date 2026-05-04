@@ -246,6 +246,53 @@ def test_build_batch_scoring_rules_hide_internal_threshold_fields() -> None:
     assert "平均样本外收益 > 0" in rules["high_return_candidate"]["thresholds"]
 
 
+def test_build_batch_recommendations_groups_v1_and_v2_separately() -> None:
+    run_rows = [
+        *_rows_for_group(
+            fast_period=8,
+            slow_period=34,
+            leverage=1.0,
+            snapshot_ids=("snapshot-a",),
+            total_returns=(0.1,),
+            excess_returns=(0.05,),
+            oos_total_returns=(0.03,),
+            oos_excess_returns=(0.02,),
+            max_drawdowns=(0.1,),
+            trade_counts=(4,),
+        ),
+        {
+            **_rows_for_group(
+                fast_period=8,
+                slow_period=34,
+                leverage=1.0,
+                snapshot_ids=("snapshot-b",),
+                total_returns=(0.2,),
+                excess_returns=(0.08,),
+                oos_total_returns=(0.04,),
+                oos_excess_returns=(0.03,),
+                max_drawdowns=(0.12,),
+                trade_counts=(5,),
+            )[0],
+            "strategy_name": "ema_pullback_atr_v2",
+            "trend_fast_period": 8,
+            "trend_slow_period": 34,
+            "entry_ema_period": 21,
+            "atr_period": 14,
+            "atr_entry_tolerance": 0.5,
+            "atr_stop_mult": 1.5,
+            "risk_reward_ratio": 2.0,
+        },
+    ]
+
+    parameter_groups, _, _ = build_batch_recommendations(run_rows)
+
+    assert len(parameter_groups) == 2
+    assert {group["strategy_name"] for group in parameter_groups} == {"ema_crossover", "ema_pullback_atr_v2"}
+    v2_group = next(group for group in parameter_groups if group["strategy_name"] == "ema_pullback_atr_v2")
+    assert v2_group["trend_fast_period"] == 8
+    assert v2_group["atr_stop_mult"] == 1.5
+
+
 def _rows_for_group(
     *,
     fast_period: int,

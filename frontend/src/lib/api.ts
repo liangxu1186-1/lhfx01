@@ -7,10 +7,15 @@ import type {
   OverviewPayload,
   ParameterExperimentIndexPayload,
   ParametersPayload,
+  ParameterGroupDetailPayload,
+  ParameterResearchPayload,
+  ResearchCandidateFilterResultsPayload,
   ResearchNote,
   ResearchNotesPayload,
+  ResearchWorkflowPayload,
   RunDetailPayload,
   RunIndexPayload,
+  TradeAttributionPayload,
   WorkspaceData,
   MultiRunEquityRow,
 } from '../types';
@@ -27,7 +32,22 @@ function apiUrl(path: string): string {
 }
 
 async function parseResponse<T>(response: Response): Promise<T> {
-  const payload = (await response.json()) as T & { error?: { message?: string } };
+  const rawBody = await response.text();
+  if (!rawBody.trim()) {
+    throw new Error(
+      response.ok
+        ? 'API returned an empty response'
+        : `API returned an empty ${response.status} response. Check that the Python API server is running.`,
+    );
+  }
+  let payload: T & { error?: { message?: string } };
+  try {
+    payload = JSON.parse(rawBody) as T & { error?: { message?: string } };
+  } catch (parseError) {
+    throw new Error(
+      `API returned non-JSON response with status ${response.status}: ${parseError instanceof Error ? parseError.message : 'invalid JSON'}`,
+    );
+  }
   if (!response.ok) {
     const message = payload && typeof payload === 'object' && 'error' in payload
       ? payload.error?.message ?? `Request failed with status ${response.status}`
@@ -151,6 +171,39 @@ export async function loadParameters(): Promise<ParametersPayload> {
   }
 }
 
+export async function loadParameterResearch(): Promise<ParameterResearchPayload> {
+  const response = await fetchJson<{
+    generated_at: string;
+    source: WorkspaceData['source'];
+    research_subjects: ParameterResearchPayload['parameter_research']['subjects'];
+    parameter_groups: ParameterResearchPayload['parameter_research']['parameter_groups'];
+  }>('/api/parameter-research');
+  return {
+    generated_at: response.generated_at,
+    source: response.source,
+    parameter_research: {
+      subjects: response.research_subjects,
+      parameter_groups: response.parameter_groups,
+    },
+  };
+}
+
+export async function loadResearchWorkflow(): Promise<ResearchWorkflowPayload> {
+  return fetchJson<ResearchWorkflowPayload>('/api/research-workflow');
+}
+
+export async function loadParameterGroupDetail(groupKey: string): Promise<ParameterGroupDetailPayload> {
+  return fetchJson<ParameterGroupDetailPayload>(`/api/parameter-groups/${encodeURIComponent(groupKey)}`);
+}
+
+export async function loadResearchCandidateFilterResults(candidateId: string): Promise<ResearchCandidateFilterResultsPayload> {
+  return fetchJson<ResearchCandidateFilterResultsPayload>(`/api/research-candidates/${encodeURIComponent(candidateId)}/filter-results`);
+}
+
+export async function loadResearchCandidateTradeAttribution(candidateId: string): Promise<TradeAttributionPayload> {
+  return fetchJson<TradeAttributionPayload>(`/api/research-candidates/${encodeURIComponent(candidateId)}/trade-attribution`);
+}
+
 export async function loadParameterExperiments(): Promise<ParameterExperimentIndexPayload> {
   return fetchJson<ParameterExperimentIndexPayload>('/api/parameter-experiments');
 }
@@ -238,6 +291,15 @@ export async function postRunEma(payload: Record<string, unknown>): Promise<Reco
   return parseResponse<Record<string, unknown>>(response);
 }
 
+export async function postRun(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl('/api/runs'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<Record<string, unknown>>(response);
+}
+
 export async function postParameterExperiment(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   const response = await fetch(apiUrl('/api/parameter-experiments'), {
     method: 'POST',
@@ -258,6 +320,49 @@ export async function postParameterExperimentBatch(payload: Record<string, unkno
 
 export async function postResearchNote(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   const response = await fetch(apiUrl('/api/research-notes'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<Record<string, unknown>>(response);
+}
+
+export async function deleteResearchNote(noteId: string): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl(`/api/research-notes/${encodeURIComponent(noteId)}`), {
+    method: 'DELETE',
+  });
+  return parseResponse<Record<string, unknown>>(response);
+}
+
+export async function postResearchPool(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl('/api/research-pool'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<Record<string, unknown>>(response);
+}
+
+export async function postStablePool(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl('/api/stable-pool'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<Record<string, unknown>>(response);
+}
+
+export async function postResearchCandidateRiskMatrix(candidateId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl(`/api/research-candidates/${encodeURIComponent(candidateId)}/risk-matrix`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<Record<string, unknown>>(response);
+}
+
+export async function postResearchCandidateFilterExperiment(candidateId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl(`/api/research-candidates/${encodeURIComponent(candidateId)}/filter-experiments`), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),

@@ -35,8 +35,6 @@ class ParameterExperimentBatchRequest:
     batch_id: str
     snapshots: tuple[object, ...]
     search_type: SearchType
-    fast_periods: tuple[int, ...]
-    slow_periods: tuple[int, ...]
     qty_policy_ref: str
     qty: float | None
     initial_cash: float
@@ -44,7 +42,24 @@ class ParameterExperimentBatchRequest:
     fee_rate: float
     slippage_bps: float
     min_notional: float
+    strategy_name: str = "ema_crossover"
+    strategy_version: str = "v1"
+    fast_periods: tuple[int, ...] = ()
+    slow_periods: tuple[int, ...] = ()
+    trend_fast_periods: tuple[int, ...] = ()
+    trend_slow_periods: tuple[int, ...] = ()
+    atr_entry_tolerances: tuple[float, ...] = ()
+    atr_stop_mults: tuple[float, ...] = ()
+    risk_reward_ratios: tuple[float, ...] = ()
+    entry_ema_period: int = 21
+    atr_period: int = 14
+    min_atr_pct_of_price: float = 0.002
+    min_stop_pct: float = 0.003
     cash_allocation_pct: float | None = None
+    risk_pct_per_trade: float | None = None
+    cash_allocation_pct_candidates: tuple[float, ...] = ()
+    risk_pct_per_trade_candidates: tuple[float, ...] = ()
+    signal_filter_sets: tuple[dict[str, object], ...] = ()
     benchmark_enabled: bool = True
     max_samples: int | None = None
     seed: int | None = None
@@ -87,8 +102,19 @@ def build_parameter_experiment_batch(
             experiment_id=experiment_id,
             snapshot=snapshot,
             search_type=request.search_type,
+            strategy_name=request.strategy_name,
+            strategy_version=request.strategy_version,
             fast_periods=request.fast_periods,
             slow_periods=request.slow_periods,
+            trend_fast_periods=request.trend_fast_periods,
+            trend_slow_periods=request.trend_slow_periods,
+            atr_entry_tolerances=request.atr_entry_tolerances,
+            atr_stop_mults=request.atr_stop_mults,
+            risk_reward_ratios=request.risk_reward_ratios,
+            entry_ema_period=request.entry_ema_period,
+            atr_period=request.atr_period,
+            min_atr_pct_of_price=request.min_atr_pct_of_price,
+            min_stop_pct=request.min_stop_pct,
             qty_policy_ref=request.qty_policy_ref,
             qty=request.qty,
             initial_cash=request.initial_cash,
@@ -97,6 +123,10 @@ def build_parameter_experiment_batch(
             slippage_bps=request.slippage_bps,
             min_notional=request.min_notional,
             cash_allocation_pct=request.cash_allocation_pct,
+            risk_pct_per_trade=request.risk_pct_per_trade,
+            cash_allocation_pct_candidates=request.cash_allocation_pct_candidates,
+            risk_pct_per_trade_candidates=request.risk_pct_per_trade_candidates,
+            signal_filter_sets=request.signal_filter_sets,
             benchmark_enabled=request.benchmark_enabled,
             max_samples=request.max_samples,
             seed=request.seed,
@@ -114,20 +144,23 @@ def build_parameter_experiment_batch(
     )
     batch = ExperimentBatch(
         batch_id=request.batch_id,
-        strategy_name="ema_crossover",
+        strategy_name=request.strategy_name,
         dataset_snapshot_ids=tuple(snapshot_ids),
         validation_split_id=_batch_validation_split_id(request),
         metric_policy_id="metrics_daily_365_v1",
         benchmark_policy_version=DEFAULT_BENCHMARK_POLICY_VERSION,
         search_type=request.search_type,
         search_space_json={
-            "fast_periods": list(request.fast_periods),
-            "slow_periods": list(request.slow_periods),
+            "strategy_name": request.strategy_name,
+            "strategy_version": request.strategy_version,
             "leverage_candidates": list(request.leverage_candidates),
+            "cash_allocation_pct_candidates": list(request.cash_allocation_pct_candidates),
+            "risk_pct_per_trade_candidates": list(request.risk_pct_per_trade_candidates),
             "snapshot_count": len(request.snapshots),
             "combination_count_per_snapshot": planned_run_count // len(request.snapshots),
             "planned_run_count": planned_run_count,
             "max_samples": request.max_samples,
+            **_batch_search_space(request),
         },
         base_config_uri=DEFAULT_BASE_CONFIG_URI,
         seed_policy=SeedPolicy.FIXED if request.seed is not None else SeedPolicy.GLOBAL_RANDOM,
@@ -152,6 +185,45 @@ def _batch_validation_split_id(request: ParameterExperimentBatchRequest) -> str:
     if request.validation_split is not None:
         return str(getattr(request.validation_split, "validation_split_id", "validation:batch"))
     return "validation:none"
+
+
+def _batch_search_space(request: ParameterExperimentBatchRequest) -> dict[str, object]:
+    if request.strategy_name == "ema_pullback_atr_v2":
+        payload = {
+            "trend_fast_periods": list(request.trend_fast_periods),
+            "trend_slow_periods": list(request.trend_slow_periods),
+            "atr_entry_tolerances": list(request.atr_entry_tolerances),
+            "atr_stop_mults": list(request.atr_stop_mults),
+            "risk_reward_ratios": list(request.risk_reward_ratios),
+            "entry_ema_period": request.entry_ema_period,
+            "atr_period": request.atr_period,
+            "min_atr_pct_of_price": request.min_atr_pct_of_price,
+            "min_stop_pct": request.min_stop_pct,
+        }
+        if request.cash_allocation_pct is not None:
+            payload["cash_allocation_pct"] = request.cash_allocation_pct
+        if request.cash_allocation_pct_candidates:
+            payload["cash_allocation_pct_candidates"] = list(request.cash_allocation_pct_candidates)
+        if request.risk_pct_per_trade is not None:
+            payload["risk_pct_per_trade"] = request.risk_pct_per_trade
+        if request.risk_pct_per_trade_candidates:
+            payload["risk_pct_per_trade_candidates"] = list(request.risk_pct_per_trade_candidates)
+        if request.signal_filter_sets:
+            payload["signal_filter_sets"] = list(request.signal_filter_sets)
+        return payload
+    payload = {
+        "fast_periods": list(request.fast_periods),
+        "slow_periods": list(request.slow_periods),
+    }
+    if request.cash_allocation_pct is not None:
+        payload["cash_allocation_pct"] = request.cash_allocation_pct
+    if request.cash_allocation_pct_candidates:
+        payload["cash_allocation_pct_candidates"] = list(request.cash_allocation_pct_candidates)
+    if request.risk_pct_per_trade is not None:
+        payload["risk_pct_per_trade"] = request.risk_pct_per_trade
+    if request.risk_pct_per_trade_candidates:
+        payload["risk_pct_per_trade_candidates"] = list(request.risk_pct_per_trade_candidates)
+    return payload
 
 
 def run_parameter_experiment_batch_workflow(

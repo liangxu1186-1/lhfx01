@@ -7,6 +7,7 @@ import {
   getSortedRowModel,
   useReactTable,
   type ColumnDef,
+  type OnChangeFn,
   type PaginationState,
   type SortingState,
 } from '@tanstack/react-table';
@@ -19,6 +20,8 @@ interface DataTableProps<T extends object> {
   initialPageSize?: number;
   pageSizeOptions?: number[];
   initialSorting?: SortingState;
+  sorting?: SortingState;
+  onSortingChange?: OnChangeFn<SortingState>;
   tableClassName?: string;
   getRowId?: (row: T) => string;
   selectedRowIds?: string[];
@@ -31,6 +34,8 @@ export function DataTable<T extends object>({
   initialPageSize = 10,
   pageSizeOptions = [10, 20, 50],
   initialSorting = [],
+  sorting: controlledSorting,
+  onSortingChange,
   tableClassName,
   getRowId,
   selectedRowIds,
@@ -40,7 +45,9 @@ export function DataTable<T extends object>({
     pageIndex: 0,
     pageSize: initialPageSize,
   });
-  const [sorting, setSorting] = useState<SortingState>(initialSorting);
+  const [internalSorting, setInternalSorting] = useState<SortingState>(initialSorting);
+  const sorting = controlledSorting ?? internalSorting;
+  const setSorting = onSortingChange ?? setInternalSorting;
   const selectionEnabled = Boolean(getRowId && selectedRowIds && onSelectedRowIdsChange);
 
   const table = useReactTable({

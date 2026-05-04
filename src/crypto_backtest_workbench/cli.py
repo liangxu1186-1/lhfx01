@@ -20,6 +20,8 @@ from crypto_backtest_workbench.domain.models import (
 
 DEFAULT_QTY_POLICY_REF = "percent_of_cash"
 DEFAULT_CASH_ALLOCATION_PCT = 100.0
+RISK_PCT_OF_EQUITY_POLICY_REF = "risk_pct_of_equity"
+RISK_PCT_OF_CASH_ALLOCATION_POLICY_REF = "risk_pct_of_cash_allocation"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -70,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_ema.add_argument("--qty-policy-ref", default=DEFAULT_QTY_POLICY_REF)
     run_ema.add_argument("--qty", type=float)
     run_ema.add_argument("--cash-allocation-pct", type=float)
+    run_ema.add_argument("--risk-pct-per-trade", type=float)
     run_ema.add_argument("--initial-cash", type=float, default=10_000.0)
     run_ema.add_argument("--leverage", type=float, default=1.0)
     run_ema.add_argument("--fee-rate", type=float, default=0.0)
@@ -431,19 +434,44 @@ def _build_execution_constraints(args: argparse.Namespace):
     qty_policy_ref = getattr(args, "qty_policy_ref", DEFAULT_QTY_POLICY_REF)
     qty = getattr(args, "qty", None)
     cash_allocation_pct = getattr(args, "cash_allocation_pct", None)
+    risk_pct_per_trade = getattr(args, "risk_pct_per_trade", None)
     qty_by_policy: dict[str, float] = {}
     cash_allocation_pct_by_policy: dict[str, float] = {}
+    risk_pct_per_trade_by_policy: dict[str, float] = {}
 
-    if cash_allocation_pct is not None:
-        if qty_policy_ref != DEFAULT_QTY_POLICY_REF:
-            raise ValueError("cash_allocation_pct only supports --qty-policy-ref percent_of_cash")
+    if qty_policy_ref == DEFAULT_QTY_POLICY_REF:
+        if risk_pct_per_trade is not None:
+            raise ValueError("risk_pct_per_trade only supports risk sizing --qty-policy-ref")
+        if qty is not None:
+            raise ValueError("qty is not supported with --qty-policy-ref percent_of_cash")
+        if cash_allocation_pct is None:
+            cash_allocation_pct = DEFAULT_CASH_ALLOCATION_PCT
         cash_allocation_pct_by_policy[qty_policy_ref] = float(cash_allocation_pct)
+    elif qty_policy_ref == RISK_PCT_OF_EQUITY_POLICY_REF:
+        if cash_allocation_pct is not None:
+            raise ValueError("cash_allocation_pct only supports --qty-policy-ref percent_of_cash")
+        if qty is not None:
+            raise ValueError("qty is not supported with --qty-policy-ref risk_pct_of_equity")
+        if risk_pct_per_trade is None:
+            raise ValueError("--risk-pct-per-trade is required")
+        risk_pct_per_trade_by_policy[qty_policy_ref] = float(risk_pct_per_trade)
+    elif qty_policy_ref == RISK_PCT_OF_CASH_ALLOCATION_POLICY_REF:
+        if qty is not None:
+            raise ValueError("qty is not supported with --qty-policy-ref risk_pct_of_cash_allocation")
+        if cash_allocation_pct is None:
+            cash_allocation_pct = DEFAULT_CASH_ALLOCATION_PCT
+        if risk_pct_per_trade is None:
+            raise ValueError("--risk-pct-per-trade is required")
+        cash_allocation_pct_by_policy[qty_policy_ref] = float(cash_allocation_pct)
+        risk_pct_per_trade_by_policy[qty_policy_ref] = float(risk_pct_per_trade)
     elif qty is not None:
         qty_by_policy[qty_policy_ref] = float(qty)
-    elif qty_policy_ref == DEFAULT_QTY_POLICY_REF:
-        cash_allocation_pct_by_policy[qty_policy_ref] = DEFAULT_CASH_ALLOCATION_PCT
     else:
-        raise ValueError("Either --qty or --cash-allocation-pct is required")
+        if cash_allocation_pct is not None:
+            raise ValueError("cash_allocation_pct only supports --qty-policy-ref percent_of_cash")
+        if risk_pct_per_trade is not None:
+            raise ValueError("risk_pct_per_trade only supports risk sizing --qty-policy-ref")
+        raise ValueError("Either --qty, --cash-allocation-pct, or --risk-pct-per-trade is required")
 
     return ExecutionConstraints(
         initial_cash=args.initial_cash,
@@ -453,6 +481,7 @@ def _build_execution_constraints(args: argparse.Namespace):
         min_notional=args.min_notional,
         qty_by_policy=qty_by_policy,
         cash_allocation_pct_by_policy=cash_allocation_pct_by_policy,
+        risk_pct_per_trade_by_policy=risk_pct_per_trade_by_policy,
     )
 
 

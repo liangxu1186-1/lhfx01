@@ -108,6 +108,7 @@ class SingleRunOrchestrator:
             initial_equity=constraints.initial_cash,
             final_equity=execution.account.equity,
             trades=execution.trades,
+            equity_curve=execution.equity_curve,
         )
         benchmark_output = _compute_benchmark_output(
             request=request,
@@ -224,6 +225,7 @@ def _build_validation_summary(
         initial_equity=constraints.initial_cash,
         final_equity=oos_execution.account.equity,
         trades=oos_execution.trades,
+        equity_curve=oos_execution.equity_curve,
     )
     oos_benchmark = _compute_benchmark_output(
         request=request,

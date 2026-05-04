@@ -68,6 +68,49 @@ def test_parameter_experiment_batch_workflow_fans_out_into_multiple_experiments(
     assert batch.search_space_json["leverage_candidates"] == [1.0, 2.0]
 
 
+def test_parameter_experiment_batch_workflow_supports_v2_risk_pct_of_equity(tmp_path) -> None:
+    dataset_repository = FileDatasetRepository(tmp_path)
+    feature_repository = FileFeatureRepository(tmp_path)
+    run_repository = FileRunRepository(tmp_path)
+    task_repository = FileTaskRepository(tmp_path)
+    experiment_repository = FileParameterExperimentRepository(tmp_path)
+    batch_repository = FileExperimentBatchRepository(tmp_path)
+    snapshots = (_persist_snapshot(dataset_repository, snapshot_id="snapshot-batch-risk-001", timeframe="4h"),)
+
+    result = run_parameter_experiment_batch_workflow(
+        request=ParameterExperimentBatchRequest(
+            batch_id="batch-risk-001",
+            snapshots=snapshots,
+            search_type=SearchType.GRID,
+            strategy_name="ema_pullback_atr_v2",
+            strategy_version="v2",
+            trend_fast_periods=(8,),
+            trend_slow_periods=(34,),
+            atr_entry_tolerances=(0.5,),
+            atr_stop_mults=(1.5,),
+            risk_reward_ratios=(2.0,),
+            qty_policy_ref="risk_pct_of_equity",
+            qty=None,
+            risk_pct_per_trade=0.01,
+            initial_cash=1000.0,
+            leverage_candidates=(1.0,),
+            fee_rate=0.0,
+            slippage_bps=0.0,
+            min_notional=0.0,
+        ),
+        task_repository=task_repository,
+        batch_repository=batch_repository,
+        experiment_repository=experiment_repository,
+        dataset_repository=dataset_repository,
+        feature_repository=feature_repository,
+        run_repository=run_repository,
+    )
+
+    batch = batch_repository.load_batch("batch-risk-001")
+    assert result.task.status is TaskStatus.SUCCESS
+    assert batch.search_space_json["risk_pct_per_trade"] == 0.01
+
+
 def test_parameter_experiment_batch_workflow_rejects_duplicate_snapshots(tmp_path) -> None:
     dataset_repository = FileDatasetRepository(tmp_path)
     feature_repository = FileFeatureRepository(tmp_path)

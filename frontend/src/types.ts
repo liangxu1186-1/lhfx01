@@ -65,6 +65,36 @@ export interface ParametersPayload {
   parameter_lab: WorkspaceParameterLab;
 }
 
+export interface ParameterResearchPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  parameter_research: ParameterResearchWorkspace;
+}
+
+export interface ResearchWorkflowPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  research_workflow: ResearchWorkflow;
+}
+
+export interface ParameterGroupDetailPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  parameter_group: ParameterGroupDetail;
+}
+
+export interface ResearchCandidateFilterResultsPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  filter_results: ResearchCandidateFilterResults;
+}
+
+export interface TradeAttributionPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  trade_attribution: TradeAttributionView;
+}
+
 export interface ParameterExperimentIndexPayload {
   generated_at: string;
   source: WorkspaceSource;
@@ -121,6 +151,7 @@ export interface RunSummaryView {
   timeframe: string;
   fast_period: number | null;
   slow_period: number | null;
+  parameter_summary: string;
   leverage: number | null;
   status: string;
   created_at: string;
@@ -275,6 +306,9 @@ export interface TradeRow {
   holding_bars: number;
   entry_reason: string;
   exit_reason: string;
+  planned_stop_loss_price: number | null;
+  planned_take_profit_price: number | null;
+  entry_signal_meta_json?: Record<string, unknown>;
 }
 
 export interface WarningRow {
@@ -297,8 +331,18 @@ export interface ParameterLabRow {
   created_at: string;
   fast_period: number | null;
   slow_period: number | null;
+  trend_fast_period: number | null;
+  trend_slow_period: number | null;
+  entry_ema_period: number | null;
+  atr_period: number | null;
+  atr_entry_tolerance: number | null;
+  atr_stop_mult: number | null;
+  risk_reward_ratio: number | null;
+  parameter_summary: string;
+  signal_filter_summary: string | null;
   qty_policy_ref: string | null;
   cash_allocation_pct: number | null;
+  risk_pct_per_trade: number | null;
   leverage: number | null;
   fee_rate: number | null;
   slippage_bps: number | null;
@@ -317,6 +361,263 @@ export interface ParameterLabRow {
   win_rate: number;
   profit_factor: number | null;
   warning_count: number;
+}
+
+export interface ResearchSubjectView {
+  subject_key: string;
+  strategy_name: string;
+  symbol: string;
+  timeframe: string;
+  validation_split_id: string;
+  parameter_group_count: number;
+  run_count: number;
+  snapshot_count: number;
+  latest_run_at: string | null;
+}
+
+export interface ParameterGroupView {
+  group_key: string;
+  subject_key: string;
+  strategy_name: string;
+  symbol: string;
+  timeframe: string;
+  validation_split_id: string;
+  parameter_summary: string;
+  signal_filter_summary: string | null;
+  fast_period: number | null;
+  slow_period: number | null;
+  trend_fast_period: number | null;
+  trend_slow_period: number | null;
+  entry_ema_period: number | null;
+  atr_period: number | null;
+  atr_entry_tolerance: number | null;
+  atr_stop_mult: number | null;
+  risk_reward_ratio: number | null;
+  qty_policy_ref: string | null;
+  cash_allocation_pct: number | null;
+  risk_pct_per_trade: number | null;
+  leverage: number | null;
+  run_count: number;
+  snapshot_count: number;
+  avg_total_return: number;
+  avg_oos_total_return: number | null;
+  oos_positive_ratio: number | null;
+  avg_gap: number | null;
+  avg_max_drawdown: number;
+  worst_max_drawdown: number;
+  avg_profit_factor: number | null;
+  avg_win_rate: number;
+  min_trade_count: number;
+  min_oos_trade_count: number | null;
+  neighbor_count: number;
+  stable_neighbor_count: number;
+  neighbor_stability_score: number | null;
+  research_score: number;
+  classification: string;
+  representative_run_id: string | null;
+  run_ids: string[];
+}
+
+export interface ParameterGroupRunView {
+  group_key: string;
+  run_id: string;
+  batch_id: string | null;
+  experiment_id: string | null;
+  dataset_snapshot_id: string;
+  created_at: string;
+  total_return: number;
+  oos_total_return: number | null;
+  gap: number | null;
+  max_drawdown: number;
+  profit_factor: number | null;
+  trade_count: number;
+  oos_trade_count: number | null;
+  win_rate: number;
+  oos_win_rate: number | null;
+  final_equity: number;
+}
+
+export interface ParameterResearchWorkspace {
+  subjects: ResearchSubjectView[];
+  parameter_groups: ParameterGroupView[];
+}
+
+export interface ScreeningRunView {
+  run_id: string;
+  strategy_name: string;
+  dataset_snapshot_id: string;
+  symbol: string;
+  timeframe: string;
+  validation_split_id: string;
+  parameter_summary: string;
+  signal_filter_summary: string | null;
+  fast_period: number | null;
+  slow_period: number | null;
+  trend_fast_period: number | null;
+  trend_slow_period: number | null;
+  entry_ema_period: number | null;
+  atr_period: number | null;
+  atr_entry_tolerance: number | null;
+  atr_stop_mult: number | null;
+  risk_reward_ratio: number | null;
+  qty_policy_ref: string | null;
+  cash_allocation_pct: number | null;
+  risk_pct_per_trade: number | null;
+  leverage: number | null;
+  score: number;
+  auto_labels: string[];
+  manual_labels: string[];
+  pool_status: string;
+  neighborhood_status: string;
+  total_return: number;
+  is_excess_return: number | null;
+  oos_total_return: number | null;
+  oos_excess_return: number | null;
+  is_oos_gap: number | null;
+  max_drawdown: number;
+  profit_factor: number | null;
+  trade_count: number;
+  oos_trade_count: number | null;
+  created_at: string;
+}
+
+export interface ResearchCandidateView {
+  candidate_id: string;
+  source_run_ids: string[];
+  strategy_name: string;
+  symbol: string;
+  timeframe: string;
+  validation_split_id: string;
+  entry_structure: Record<string, unknown>;
+  risk_profile: Record<string, unknown>;
+  representative_run_id: string | null;
+  representative_run_score: number;
+  status: string;
+  latest_note: ResearchNote | null;
+  neighborhood_summary: Record<string, unknown>;
+  risk_matrix_summary: Record<string, unknown>;
+  recommendation: string;
+  updated_at: string | null;
+}
+
+export interface StableCandidateView {
+  stable_candidate_id: string;
+  strategy_name: string;
+  symbol: string;
+  timeframe: string;
+  validation_split_id: string;
+  entry_structure: Record<string, unknown>;
+  chosen_risk_profile: Record<string, unknown>;
+  evidence_run_ids: string[];
+  representative_run_id: string | null;
+  validation_summary: Record<string, unknown>;
+  neighborhood_summary: Record<string, unknown>;
+  risk_matrix_summary: Record<string, unknown>;
+  final_recommendation: string;
+  status: string;
+  latest_note: ResearchNote | null;
+}
+
+export interface ResearchWorkflow {
+  screening_pool: {
+    runs: ScreeningRunView[];
+  };
+  research_pool: {
+    candidates: ResearchCandidateView[];
+  };
+  stable_pool: {
+    candidates: StableCandidateView[];
+  };
+}
+
+export interface ParameterGroupDetail {
+  group: ParameterGroupView;
+  runs: ParameterGroupRunView[];
+  neighbors: ParameterGroupView[];
+}
+
+export interface FilterResultGroup {
+  filter_summary: string;
+  run_count: number;
+  snapshot_count: number;
+  avg_total_return: number | null;
+  avg_oos_total_return: number | null;
+  avg_oos_delta: number | null;
+  avg_max_drawdown: number | null;
+  avg_drawdown_delta: number | null;
+  worst_max_drawdown: number | null;
+  avg_profit_factor: number | null;
+  avg_profit_factor_delta: number | null;
+  min_trade_count: number | null;
+  min_oos_trade_count: number | null;
+  trade_retention: number | null;
+  run_ids: string[];
+}
+
+export interface ResearchCandidateFilterResults {
+  candidate_id: string;
+  base_group: ParameterGroupView;
+  base_runs: ParameterGroupRunView[];
+  filter_groups: FilterResultGroup[];
+  filter_runs: ParameterLabRow[];
+}
+
+export interface TradeAttributionBucket {
+  dimension: string;
+  bucket_key: string;
+  label: string;
+  trade_count: number;
+  oos_trade_count: number;
+  win_rate: number;
+  net_pnl: number;
+  avg_return_pct: number;
+  profit_factor: number | null;
+  loss_contribution: number;
+  big_loss_count: number;
+  sample_ok: boolean;
+}
+
+export interface TradeAttributionHypothesis {
+  hypothesis_id: string;
+  description: string;
+  evidence: string;
+  risk_note: string;
+  status: string;
+  source_dimension: string;
+  source_bucket: string;
+}
+
+export interface TradeAttributionView {
+  candidate_id: string;
+  candidate: {
+    strategy_name: string;
+    symbol: string;
+    timeframe: string;
+    parameter_summary: string;
+    signal_filter_summary: string | null;
+    run_ids: string[];
+  };
+  summary: {
+    run_count: number;
+    trade_count: number;
+    oos_trade_count: number;
+    win_rate: number;
+    net_pnl: number;
+    profit_factor: number | null;
+    feature_meta_coverage: number;
+    hypothesis_count: number;
+    anti_overfit_passed: boolean;
+  };
+  anti_overfit_checks: Array<{
+    key: string;
+    label: string;
+    passed: boolean;
+    actual: number;
+    required: number;
+  }>;
+  buckets: TradeAttributionBucket[];
+  drawdown_trades: Array<Record<string, unknown>>;
+  hypotheses: TradeAttributionHypothesis[];
 }
 
 export interface SensitivityRow {
@@ -385,8 +686,18 @@ export interface ParameterExperimentBatchSummary {
 }
 
 export interface ParameterGroupRecommendation {
+  strategy_name: string;
+  parameter_summary: string;
+  signal_filter_summary?: string | null;
   fast_period: number | null;
   slow_period: number | null;
+  trend_fast_period?: number | null;
+  trend_slow_period?: number | null;
+  entry_ema_period?: number | null;
+  atr_period?: number | null;
+  atr_entry_tolerance?: number | null;
+  atr_stop_mult?: number | null;
+  risk_reward_ratio?: number | null;
   leverage: number | null;
   run_count: number;
   snapshot_count: number;

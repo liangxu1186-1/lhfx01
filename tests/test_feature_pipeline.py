@@ -12,6 +12,7 @@ from crypto_backtest_workbench.domain.models import (
 from crypto_backtest_workbench.engine.features import (
     FeatureCacheRegistry,
     FeaturePipeline,
+    compute_atr,
     compute_ema,
     compute_rsi,
 )
@@ -35,6 +36,21 @@ def test_compute_rsi_matches_expected_wilder_progression() -> None:
     assert result[2:] == [50.0, 75.0, 37.5, 68.75]
 
 
+def test_compute_atr_uses_true_range_sma_seed_and_wilder_smoothing() -> None:
+    candles = [
+        _candle(open_price=10, high=12, low=9, close=11),
+        _candle(open_price=11, high=13, low=10, close=12),
+        _candle(open_price=12, high=15, low=11, close=14),
+        _candle(open_price=14, high=16, low=13, close=15),
+    ]
+
+    result = compute_atr(candles, window=3)
+
+    assert result[:2] == [None, None]
+    assert result[2] == pytest.approx(10.0 / 3.0)
+    assert result[3] == pytest.approx(29.0 / 9.0)
+
+
 def test_feature_pipeline_materializes_and_persists_feature_rows(tmp_path) -> None:
     repository = FileFeatureRepository(tmp_path)
     pipeline = FeaturePipeline(repository, cache_registry=FeatureCacheRegistry())
@@ -52,19 +68,41 @@ def test_feature_pipeline_materializes_and_persists_feature_rows(tmp_path) -> No
     )
 
     assert artifact.dataset_snapshot_id == "snapshot-001"
-    assert artifact.feature_version == "feature-pipeline-v1__ema-v1__rsi-v1"
+    assert artifact.feature_version == "feature-pipeline-v2__ema-v1__rsi-v1"
     assert artifact.warmup_bars == 3
     assert artifact.depends_on == ("dataset-raw",)
     assert artifact.storage_uri.endswith("feature_rows.csv")
 
     feature_names, rows = repository.load_feature_rows(artifact.feature_artifact_id)
-    assert feature_names == ("ema_close_3", "rsi_close_2")
+    assert feature_names == ("open", "high", "low", "close", "ema_close_3", "rsi_close_2")
     assert len(rows) == len(candles)
-    assert rows[0].values == {"ema_close_3": None, "rsi_close_2": None}
+    assert rows[0].values["ema_close_3"] is None
+    assert rows[0].values["rsi_close_2"] is None
+    assert rows[0].values["open"] == 1.0
     assert rows[2].values["ema_close_3"] == 4.0 / 3.0
     assert rows[3].values["rsi_close_2"] == 75.0
     assert rows[-1].values["ema_close_3"] == pytest.approx(5.0 / 3.0)
     assert rows[-1].values["rsi_close_2"] == 68.75
+
+
+def test_feature_pipeline_materializes_atr_column(tmp_path) -> None:
+    repository = FileFeatureRepository(tmp_path)
+    pipeline = FeaturePipeline(repository)
+    candles = [
+        _candle(open_price=10, high=12, low=9, close=11),
+        _candle(open_price=11, high=13, low=10, close=12),
+        _candle(open_price=12, high=15, low=11, close=14),
+    ]
+
+    artifact = pipeline.materialize(
+        dataset_snapshot_id="snapshot-atr",
+        candles=candles,
+        specs=[FeatureSpec(name="atr", params={"window": 3})],
+    )
+
+    feature_names, rows = repository.load_feature_rows(artifact.feature_artifact_id)
+    assert "atr_3" in feature_names
+    assert rows[2].values["atr_3"] == pytest.approx(10.0 / 3.0)
 
 
 def test_feature_pipeline_reuses_persisted_artifact_for_same_cache_key(tmp_path) -> None:
@@ -108,3 +146,18 @@ def build_candles(close_prices: list[float]) -> list[CanonicalCandle]:
             )
         )
     return candles
+
+
+def _candle(*, open_price: float, high: float, low: float, close: float) -> CanonicalCandle:
+    return CanonicalCandle(
+        timestamp=datetime(2024, 1, 1, tzinfo=UTC),
+        symbol="BTC/USDT:USDT",
+        exchange="binance",
+        market_type=MarketType.LINEAR_USDT_PERPETUAL,
+        timeframe="1h",
+        open=open_price,
+        high=high,
+        low=low,
+        close=close,
+        volume=100.0,
+    )

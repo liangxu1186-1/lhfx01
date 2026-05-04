@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 from uuid import uuid4
 
 from crypto_backtest_workbench.domain.models import (
@@ -21,6 +22,10 @@ from crypto_backtest_workbench.engine.analytics.metrics import EquityPoint
 from crypto_backtest_workbench.engine.portfolio.account import AccountSnapshot
 
 
+_MARGIN_CHECK_REL_TOLERANCE = 1e-9
+_MARGIN_CHECK_ABS_TOLERANCE = 1e-9
+
+
 @dataclass(slots=True)
 class ExecutionConstraints:
     initial_cash: float
@@ -30,6 +35,7 @@ class ExecutionConstraints:
     min_notional: float = 0.0
     qty_by_policy: dict[str, float] = field(default_factory=dict)
     cash_allocation_pct_by_policy: dict[str, float] = field(default_factory=dict)
+    risk_pct_per_trade_by_policy: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -59,6 +65,9 @@ def simulate_signals(
     for allocation_pct in constraints.cash_allocation_pct_by_policy.values():
         if allocation_pct <= 0 or allocation_pct > 100:
             raise ValueError("cash_allocation_pct must be in (0, 100]")
+    for risk_pct in constraints.risk_pct_per_trade_by_policy.values():
+        if risk_pct <= 0 or risk_pct >= 1:
+            raise ValueError("risk_pct_per_trade must be in (0, 1)")
 
     sorted_candles = sorted(candles, key=lambda candle: candle.timestamp)
     index_by_timestamp = {candle.timestamp: index for index, candle in enumerate(sorted_candles)}
@@ -105,6 +114,19 @@ def simulate_signals(
     position: _OpenPosition | None = None
 
     for index, candle in enumerate(sorted_candles):
+        if position is not None:
+            sltp_order, sltp_fill, closed_position = _maybe_close_for_planned_sltp(
+                candle=candle,
+                constraints=constraints,
+                account=account,
+                position=position,
+            )
+            if closed_position is not None:
+                orders.append(sltp_order)
+                fills.append(sltp_fill)
+                trades.append(closed_position.trade)
+                position = None
+
         for signal in scheduled_signals.get(index, ()):
             signal_orders, signal_fills, signal_trades, signal_warnings, position = _execute_signal(
                 signal=signal,
@@ -117,6 +139,18 @@ def simulate_signals(
             fills.extend(signal_fills)
             trades.extend(signal_trades)
             warnings.extend(signal_warnings)
+            if position is not None and position.trade.entry_time == candle.timestamp:
+                sltp_order, sltp_fill, closed_position = _maybe_close_for_planned_sltp(
+                    candle=candle,
+                    constraints=constraints,
+                    account=account,
+                    position=position,
+                )
+                if closed_position is not None:
+                    orders.append(sltp_order)
+                    fills.append(sltp_fill)
+                    trades.append(closed_position.trade)
+                    position = None
 
         unrealized_pnl = _unrealized_pnl(position, candle.close)
         account.unrealized_pnl = unrealized_pnl
@@ -262,7 +296,9 @@ def _open_position(
         qty=qty,
         fee=fee,
         entry_reason=signal.reason_code,
+        entry_signal_meta_json=dict(signal.meta_json),
     )
+    _apply_risk_spec_to_trade(trade=trade, signal=signal)
     fill = FillEvent(
         fill_id=_next_id("fill"),
         run_id=signal.run_id,
@@ -329,6 +365,146 @@ def _close_position(
     return order, fill
 
 
+def _maybe_close_for_planned_sltp(
+    *,
+    candle: CanonicalCandle,
+    constraints: ExecutionConstraints,
+    account: AccountSnapshot,
+    position: _OpenPosition,
+) -> tuple[OrderRequest, FillEvent, _OpenPosition] | tuple[None, None, None]:
+    trigger = _resolve_sltp_trigger(position.trade, candle)
+    if trigger is None:
+        return None, None, None
+    reason_code, fill_price = trigger
+    order, fill = _close_position_at_price(
+        run_id=position.trade.run_id,
+        signal_id=f"sltp:{position.trade.trade_id}:{candle.timestamp.isoformat()}",
+        reason_code=reason_code,
+        fill_price=fill_price,
+        request_price=candle.open,
+        request_time=candle.timestamp,
+        constraints=constraints,
+        account=account,
+        position=position,
+    )
+    return order, fill, position
+
+
+def _resolve_sltp_trigger(trade: TradeRecord, candle: CanonicalCandle) -> tuple[str, float] | None:
+    stop = trade.planned_stop_loss_price
+    take_profit = trade.planned_take_profit_price
+    if stop is None and take_profit is None:
+        return None
+
+    if trade.side is Side.LONG:
+        if stop is not None and candle.open <= stop:
+            return "stop_loss_gap_open", candle.open
+        if take_profit is not None and candle.open >= take_profit:
+            return "take_profit_gap_open", candle.open
+        if stop is not None and candle.low <= stop:
+            return "stop_loss_intrabar", stop
+        if take_profit is not None and candle.high >= take_profit:
+            return "take_profit_intrabar", take_profit
+        return None
+
+    if trade.side is Side.SHORT:
+        if stop is not None and candle.open >= stop:
+            return "stop_loss_gap_open", candle.open
+        if take_profit is not None and candle.open <= take_profit:
+            return "take_profit_gap_open", candle.open
+        if stop is not None and candle.high >= stop:
+            return "stop_loss_intrabar", stop
+        if take_profit is not None and candle.low <= take_profit:
+            return "take_profit_intrabar", take_profit
+        return None
+
+    return None
+
+
+def _close_position_at_price(
+    *,
+    run_id: str,
+    signal_id: str,
+    reason_code: str,
+    fill_price: float,
+    request_price: float,
+    request_time,
+    constraints: ExecutionConstraints,
+    account: AccountSnapshot,
+    position: _OpenPosition,
+) -> tuple[OrderRequest, FillEvent]:
+    trade = position.trade
+    fee = fill_price * trade.qty * constraints.fee_rate
+    gross_pnl = _realized_pnl(trade.side, trade.entry_price, fill_price, trade.qty)
+    net_pnl = gross_pnl - trade.fee - fee
+
+    account.used_margin -= position.reserved_margin
+    account.available_cash += position.reserved_margin + gross_pnl - fee
+    account.equity = account.available_cash + account.used_margin
+    account.unrealized_pnl = 0.0
+
+    trade.exit_time = request_time
+    trade.exit_price = fill_price
+    trade.gross_pnl = gross_pnl
+    trade.fee += fee
+    trade.net_pnl = net_pnl
+    trade.return_pct = gross_pnl / (trade.entry_price * trade.qty) if trade.entry_price > 0 and trade.qty > 0 else 0.0
+    trade.exit_reason = reason_code
+
+    order = OrderRequest(
+        order_id=_next_id("order"),
+        run_id=run_id,
+        signal_id=signal_id,
+        symbol=trade.symbol,
+        side=trade.side,
+        order_type="market",
+        qty=trade.qty,
+        request_time=request_time,
+        request_price=request_price,
+        status="filled",
+    )
+    fill = FillEvent(
+        fill_id=_next_id("fill"),
+        run_id=run_id,
+        order_id=order.order_id,
+        trade_id=trade.trade_id,
+        fill_time=request_time,
+        fill_price=fill_price,
+        qty=trade.qty,
+        fee=fee,
+        slippage_cost=abs(fill_price - request_price) * trade.qty,
+    )
+    return order, fill
+
+
+def _apply_risk_spec_to_trade(*, trade: TradeRecord, signal: SignalIntent) -> None:
+    risk_spec = signal.meta_json.get("risk_spec")
+    if not isinstance(risk_spec, dict):
+        return
+    if risk_spec.get("stop_loss_mode") != "atr_multiple" or risk_spec.get("take_profit_mode") != "rr":
+        return
+    atr_value = _risk_spec_float(risk_spec.get("atr_value"), "atr_value")
+    stop_mult = _risk_spec_float(risk_spec.get("stop_loss_value"), "stop_loss_value")
+    reward_ratio = _risk_spec_float(risk_spec.get("take_profit_value"), "take_profit_value")
+    min_stop_pct = _risk_spec_float(risk_spec.get("min_stop_pct"), "min_stop_pct")
+    stop_distance = max(atr_value * stop_mult, trade.entry_price * min_stop_pct)
+    if trade.side is Side.LONG:
+        trade.planned_stop_loss_price = trade.entry_price - stop_distance
+        trade.planned_take_profit_price = trade.entry_price + (stop_distance * reward_ratio)
+    elif trade.side is Side.SHORT:
+        trade.planned_stop_loss_price = trade.entry_price + stop_distance
+        trade.planned_take_profit_price = trade.entry_price - (stop_distance * reward_ratio)
+
+
+def _risk_spec_float(value: object, field_name: Literal["atr_value", "stop_loss_value", "take_profit_value", "min_stop_pct"]) -> float:
+    if not isinstance(value, int | float):
+        raise ValueError(f"risk_spec requires numeric {field_name}")
+    numeric = float(value)
+    if numeric < 0:
+        raise ValueError(f"risk_spec {field_name} must be >= 0")
+    return numeric
+
+
 def _validate_open_order(
     *,
     qty: float,
@@ -343,7 +519,9 @@ def _validate_open_order(
         return RejectReasonCode.MIN_NOTIONAL
     required_margin = notional / constraints.leverage
     estimated_fee = notional * constraints.fee_rate
-    if not account.has_margin_for(required_margin + estimated_fee):
+    required_cash = required_margin + estimated_fee
+    tolerance = max(_MARGIN_CHECK_ABS_TOLERANCE, abs(required_cash) * _MARGIN_CHECK_REL_TOLERANCE)
+    if account.available_cash + tolerance < required_cash:
         return RejectReasonCode.INSUFFICIENT_MARGIN
     return None
 
@@ -356,6 +534,30 @@ def _resolve_order_qty(
     account: AccountSnapshot,
 ) -> float:
     cash_allocation_pct = constraints.cash_allocation_pct_by_policy.get(signal.qty_policy_ref)
+    risk_pct_per_trade = constraints.risk_pct_per_trade_by_policy.get(signal.qty_policy_ref)
+    if risk_pct_per_trade is not None:
+        stop_distance = _planned_stop_distance_from_signal(signal=signal, entry_price=price)
+        if stop_distance is None:
+            return 0.0
+        if cash_allocation_pct is not None:
+            return _qty_from_cash_allocation_risk(
+                price=price,
+                leverage=constraints.leverage,
+                fee_rate=constraints.fee_rate,
+                available_cash=account.available_cash,
+                cash_allocation_pct=cash_allocation_pct,
+                stop_distance=stop_distance,
+                risk_pct_per_trade=risk_pct_per_trade,
+            )
+        return _qty_from_risk_pct_of_equity(
+            price=price,
+            leverage=constraints.leverage,
+            fee_rate=constraints.fee_rate,
+            available_cash=account.available_cash,
+            account_equity=account.equity,
+            stop_distance=stop_distance,
+            risk_pct_per_trade=risk_pct_per_trade,
+        )
     if cash_allocation_pct is not None:
         return _qty_from_cash_allocation(
             price=price,
@@ -385,6 +587,77 @@ def _qty_from_cash_allocation(
         return 0.0
     notional = allocated_cash / notional_cost_per_unit
     return notional / price
+
+
+def _qty_from_risk_pct_of_equity(
+    *,
+    price: float,
+    leverage: float,
+    fee_rate: float,
+    available_cash: float,
+    account_equity: float,
+    stop_distance: float,
+    risk_pct_per_trade: float,
+) -> float:
+    if price <= 0 or stop_distance <= 0 or account_equity <= 0:
+        return 0.0
+    risk_cash = account_equity * risk_pct_per_trade
+    if risk_cash <= 0:
+        return 0.0
+    qty_from_risk = risk_cash / stop_distance
+    qty_from_margin = _qty_from_cash_allocation(
+        price=price,
+        leverage=leverage,
+        fee_rate=fee_rate,
+        available_cash=available_cash,
+        cash_allocation_pct=100.0,
+    )
+    if qty_from_margin <= 0:
+        return 0.0
+    return min(qty_from_risk, qty_from_margin)
+
+
+def _qty_from_cash_allocation_risk(
+    *,
+    price: float,
+    leverage: float,
+    fee_rate: float,
+    available_cash: float,
+    cash_allocation_pct: float,
+    stop_distance: float,
+    risk_pct_per_trade: float,
+) -> float:
+    if price <= 0 or stop_distance <= 0 or available_cash <= 0:
+        return 0.0
+    allocated_cash = available_cash * (cash_allocation_pct / 100)
+    if allocated_cash <= 0:
+        return 0.0
+    risk_cash = allocated_cash * risk_pct_per_trade
+    if risk_cash <= 0:
+        return 0.0
+    qty_from_risk = risk_cash / stop_distance
+    qty_from_allocation = _qty_from_cash_allocation(
+        price=price,
+        leverage=leverage,
+        fee_rate=fee_rate,
+        available_cash=available_cash,
+        cash_allocation_pct=cash_allocation_pct,
+    )
+    if qty_from_allocation <= 0:
+        return 0.0
+    return min(qty_from_risk, qty_from_allocation)
+
+
+def _planned_stop_distance_from_signal(*, signal: SignalIntent, entry_price: float) -> float | None:
+    risk_spec = signal.meta_json.get("risk_spec")
+    if not isinstance(risk_spec, dict):
+        return None
+    if risk_spec.get("stop_loss_mode") != "atr_multiple" or risk_spec.get("take_profit_mode") != "rr":
+        return None
+    atr_value = _risk_spec_float(risk_spec.get("atr_value"), "atr_value")
+    stop_mult = _risk_spec_float(risk_spec.get("stop_loss_value"), "stop_loss_value")
+    min_stop_pct = _risk_spec_float(risk_spec.get("min_stop_pct"), "min_stop_pct")
+    return max(atr_value * stop_mult, entry_price * min_stop_pct)
 
 
 def _apply_slippage(price: float, side: Side, *, is_entry: bool, slippage_bps: float) -> float:

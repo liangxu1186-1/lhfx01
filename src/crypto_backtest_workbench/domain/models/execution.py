@@ -86,6 +86,9 @@ class TradeRecord:
     holding_bars: int = 0
     entry_reason: str = ""
     exit_reason: str = ""
+    planned_stop_loss_price: float | None = None
+    planned_take_profit_price: float | None = None
+    entry_signal_meta_json: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -117,4 +120,3 @@ class StructuredWarning:
     message: str
     payload_json: dict[str, object] = field(default_factory=dict)
     created_at: datetime = field(default_factory=now_utc)
-

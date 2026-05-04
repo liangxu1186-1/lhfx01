@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from datetime import datetime
+from typing import Protocol
 
 from crypto_backtest_workbench.domain.models import TradeRecord
 
@@ -26,9 +27,25 @@ class RunMetrics:
     win_rate: float
     profit_factor: float
     expectancy: float
+    max_drawdown: float = 0.0
 
     def as_dict(self) -> dict[str, float | int]:
         return asdict(self)
+
+
+class _EquityLike(Protocol):
+    equity: float
+
+
+def compute_max_drawdown(equity_curve: list[_EquityLike] | tuple[_EquityLike, ...]) -> float:
+    peak_equity = 0.0
+    max_drawdown = 0.0
+    for point in equity_curve:
+        equity = float(point.equity)
+        peak_equity = max(peak_equity, equity)
+        if peak_equity > 0:
+            max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
+    return max_drawdown
 
 
 def compute_run_metrics(
@@ -36,18 +53,21 @@ def compute_run_metrics(
     initial_equity: float,
     final_equity: float,
     trades: list[TradeRecord],
+    equity_curve: list[_EquityLike] | tuple[_EquityLike, ...] | None = None,
 ) -> RunMetrics:
     closed_trades = [trade for trade in trades if trade.exit_time is not None]
     trade_count = len(closed_trades)
     total_return = 0.0
     if initial_equity > 0:
         total_return = (final_equity - initial_equity) / initial_equity
+    max_drawdown = compute_max_drawdown(equity_curve or [])
 
     if trade_count == 0:
         return RunMetrics(
             initial_equity=initial_equity,
             final_equity=final_equity,
             total_return=total_return,
+            max_drawdown=max_drawdown,
             trade_count=0,
             win_rate=0.0,
             profit_factor=0.0,
@@ -69,6 +89,7 @@ def compute_run_metrics(
         initial_equity=initial_equity,
         final_equity=final_equity,
         total_return=total_return,
+        max_drawdown=max_drawdown,
         trade_count=trade_count,
         win_rate=len(winners) / trade_count,
         profit_factor=profit_factor,

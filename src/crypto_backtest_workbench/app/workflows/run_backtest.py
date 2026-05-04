@@ -19,7 +19,7 @@ from crypto_backtest_workbench.domain.models import (
 )
 from crypto_backtest_workbench.engine.execution import ExecutionConstraints
 from crypto_backtest_workbench.engine.features import FeaturePipeline
-from crypto_backtest_workbench.engine.strategy import EMACrossoverStrategy, StrategyInput
+from crypto_backtest_workbench.engine.strategy import EMACrossoverStrategy, EMAPullbackATRStrategy, StrategyDefinition, StrategyInput
 from crypto_backtest_workbench.jobs import (
     SingleRunOrchestrator,
     SingleRunRequest,
@@ -44,6 +44,24 @@ _EMA_STRATEGY_ALLOWED_FIELDS = {
     "name",
     "version",
 }
+_V2_STRATEGY_ALLOWED_FIELDS = {
+    "trend_fast_period",
+    "trend_slow_period",
+    "atr_entry_tolerance",
+    "atr_stop_mult",
+    "risk_reward_ratio",
+    "entry_ema_period",
+    "atr_period",
+    "min_atr_pct_of_price",
+    "min_stop_pct",
+    "qty_policy_ref",
+    "cash_allocation_pct",
+    "risk_pct_per_trade",
+    "input_price_field",
+    "signal_filters",
+    "name",
+    "version",
+}
 
 
 @dataclass(slots=True)
@@ -65,7 +83,7 @@ class RunBacktestWorkflowRequest:
 @dataclass(slots=True)
 class RunBacktestWorkflowResult:
     candles: list[CanonicalCandle]
-    strategy: EMACrossoverStrategy
+    strategy: StrategyDefinition
     feature_artifact: FeatureArtifact
     signals: list[SignalIntent]
     single_run_result: SingleRunResult
@@ -83,7 +101,7 @@ def run_backtest_workflow(
 
     _validate_validation_split(snapshot=request.snapshot, validation_split=request.validation_split)
     candles = _load_candles(snapshot=request.snapshot, dataset_repository=dataset_repository)
-    strategy = _build_ema_strategy(request.strategy_params)
+    strategy = build_strategy(request.strategy_params)
 
     pipeline = feature_pipeline or FeaturePipeline(feature_repository)
     artifact = pipeline.materialize(
@@ -99,7 +117,7 @@ def run_backtest_workflow(
             timeframe=request.snapshot.timeframe,
             feature_artifact_id=artifact.feature_artifact_id,
             features_uri=artifact.storage_uri,
-            config={"qty_policy_ref": strategy.qty_policy_ref},
+            config={"qty_policy_ref": getattr(strategy, "qty_policy_ref", "fixed_notional_v1")},
         )
     )
 
@@ -142,18 +160,40 @@ def run_backtest_workflow(
     )
 
 
+def build_strategy(strategy_params: dict[str, object]) -> StrategyDefinition:
+    strategy_name = str(strategy_params.get("strategy_name") or strategy_params.get("name") or "ema_crossover")
+    if strategy_name == "ema_crossover":
+        return _build_ema_strategy(strategy_params)
+    if strategy_name == "ema_pullback_atr_v2":
+        return _build_v2_strategy(strategy_params)
+    raise ValueError(f"Unsupported strategy_name: {strategy_name}")
+
+
 def _build_ema_strategy(strategy_params: dict[str, object]) -> EMACrossoverStrategy:
     unknown_keys = sorted(set(strategy_params) - _EMA_STRATEGY_ALLOWED_FIELDS)
+    unknown_keys = [key for key in unknown_keys if key != "strategy_name"]
     if unknown_keys:
         joined = ", ".join(unknown_keys)
         raise ValueError(f"Unsupported EMA strategy params: {joined}")
-    return EMACrossoverStrategy(**strategy_params)
+    payload = {key: value for key, value in strategy_params.items() if key != "strategy_name"}
+    return EMACrossoverStrategy(**payload)
+
+
+def _build_v2_strategy(strategy_params: dict[str, object]) -> EMAPullbackATRStrategy:
+    unknown_keys = sorted(set(strategy_params) - _V2_STRATEGY_ALLOWED_FIELDS - {"strategy_name"})
+    if unknown_keys:
+        joined = ", ".join(unknown_keys)
+        raise ValueError(f"Unsupported EMA Pullback ATR v2 strategy params: {joined}")
+    payload = {key: value for key, value in strategy_params.items() if key != "strategy_name"}
+    payload["name"] = "ema_pullback_atr_v2"
+    payload["version"] = "v2"
+    return EMAPullbackATRStrategy(**payload)
 
 
 def _build_resolved_config(
     *,
     request: RunBacktestWorkflowRequest,
-    strategy: EMACrossoverStrategy,
+    strategy: StrategyDefinition,
     artifact: FeatureArtifact,
 ) -> dict[str, object]:
     return {
@@ -163,7 +203,7 @@ def _build_resolved_config(
         "timeframe": request.snapshot.timeframe,
         "strategy_name": strategy.name,
         "strategy_version": strategy.version,
-        "strategy_params": dict(sorted(request.strategy_params.items())),
+        "strategy_params": _strategy_params(strategy),
         "feature_artifact_id": artifact.feature_artifact_id,
         "feature_cache_key": artifact.feature_cache_key,
         "execution_constraints": {
@@ -174,10 +214,30 @@ def _build_resolved_config(
             "min_notional": request.constraints.min_notional,
             "qty_by_policy": dict(sorted(request.constraints.qty_by_policy.items())),
             "cash_allocation_pct_by_policy": dict(sorted(request.constraints.cash_allocation_pct_by_policy.items())),
+            "risk_pct_per_trade_by_policy": dict(sorted(request.constraints.risk_pct_per_trade_by_policy.items())),
         },
         "validation_split_id": _validation_split_id(request.validation_split),
         "benchmark": _benchmark_config_json(request.enable_buy_and_hold_benchmark),
         "seed": request.seed,
+    }
+
+
+def _strategy_params(strategy: StrategyDefinition) -> dict[str, object]:
+    if hasattr(strategy, "strategy_params"):
+        return dict(sorted(getattr(strategy, "strategy_params")().items()))
+    keys = (
+        "fast_period",
+        "slow_period",
+        "input_price_field",
+        "qty_policy_ref",
+        "feature_version",
+        "name",
+        "version",
+    )
+    return {
+        key: getattr(strategy, key)
+        for key in keys
+        if hasattr(strategy, key)
     }
 
 

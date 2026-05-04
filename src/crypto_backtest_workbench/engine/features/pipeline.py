@@ -8,15 +8,17 @@ from typing import Iterable, Sequence
 
 from crypto_backtest_workbench.domain.models import CanonicalCandle, FeatureArtifact, FeatureSpec
 from crypto_backtest_workbench.engine.features.cache import FeatureCacheRegistry
-from crypto_backtest_workbench.engine.features.indicators import compute_ema, compute_rsi
+from crypto_backtest_workbench.engine.features.indicators import compute_adx, compute_atr, compute_ema, compute_rsi
 from crypto_backtest_workbench.engine.features.records import FeatureRow
 from crypto_backtest_workbench.storage.repositories.features import FeatureRepository
 
 
-PIPELINE_VERSION = "feature-pipeline-v1"
+PIPELINE_VERSION = "feature-pipeline-v2"
 FEATURE_IMPLEMENTATION_VERSIONS: dict[str, str] = {
     "ema": "ema-v1",
     "rsi": "rsi-v1",
+    "atr": "atr-v1",
+    "adx": "adx-v1",
 }
 
 
@@ -73,7 +75,7 @@ class FeaturePipeline:
         )
 
         rows = self._build_rows(candles=candles, specs=specs)
-        column_names = tuple(_feature_column_name(spec) for spec in specs)
+        column_names = ("open", "high", "low", "close", *tuple(_feature_column_name(spec) for spec in specs))
         self.repository.save_artifact(artifact)
         self.repository.save_feature_rows(
             feature_artifact_id=artifact.feature_artifact_id,
@@ -118,16 +120,19 @@ class FeaturePipeline:
     ) -> list[FeatureRow]:
         prices_by_field = self._extract_prices_by_field(candles, specs)
         computed_features = {
-            _feature_column_name(spec): _compute_feature_series(spec, prices_by_field[spec.input_price_field])
+            _feature_column_name(spec): _compute_feature_series(spec, prices_by_field[spec.input_price_field], candles)
             for spec in specs
         }
 
         rows: list[FeatureRow] = []
         for index, candle in enumerate(candles):
             values = {
-                column_name: series[index]
-                for column_name, series in computed_features.items()
+                "open": candle.open,
+                "high": candle.high,
+                "low": candle.low,
+                "close": candle.close,
             }
+            values.update({column_name: series[index] for column_name, series in computed_features.items()})
             rows.append(
                 FeatureRow(
                     timestamp=candle.timestamp,
@@ -149,18 +154,28 @@ class FeaturePipeline:
         return extracted
 
 
-def _compute_feature_series(spec: FeatureSpec, prices: Sequence[float]) -> list[float | None]:
+def _compute_feature_series(
+    spec: FeatureSpec,
+    prices: Sequence[float],
+    candles: Sequence[CanonicalCandle],
+) -> list[float | None]:
     if spec.name == "ema":
         window = _require_positive_int(spec, "window")
         return compute_ema(prices, window)
     if spec.name == "rsi":
         window = _require_positive_int(spec, "window")
         return compute_rsi(prices, window)
+    if spec.name == "atr":
+        window = _require_positive_int(spec, "window")
+        return compute_atr(candles, window)
+    if spec.name == "adx":
+        window = _require_positive_int(spec, "window")
+        return compute_adx(candles, window)
     raise ValueError(f"Unsupported feature spec: {spec.name}")
 
 
 def _effective_warmup(spec: FeatureSpec) -> int:
-    if spec.name in {"ema", "rsi"}:
+    if spec.name in {"ema", "rsi", "atr", "adx"}:
         window = _require_positive_int(spec, "window")
         intrinsic = max(window, spec.warmup_bars)
         return intrinsic
@@ -171,6 +186,9 @@ def _feature_column_name(spec: FeatureSpec) -> str:
     if spec.name in {"ema", "rsi"}:
         window = _require_positive_int(spec, "window")
         return f"{spec.name}_{spec.input_price_field}_{window}"
+    if spec.name in {"atr", "adx"}:
+        window = _require_positive_int(spec, "window")
+        return f"{spec.name}_{window}"
     raise ValueError(f"Unsupported feature spec: {spec.name}")
 
 

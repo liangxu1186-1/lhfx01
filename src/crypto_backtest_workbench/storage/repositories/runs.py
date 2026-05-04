@@ -61,8 +61,14 @@ class RunRepository(Protocol):
     def load_benchmark(self, run_id: str) -> BuyAndHoldBenchmarkOutput | None:
         """Load persisted benchmark output if present."""
 
+    def load_benchmark_result(self, run_id: str) -> BenchmarkResult | None:
+        """Load persisted benchmark result without equity or daily-return series."""
+
     def load_validation_summary(self, run_id: str) -> dict[str, object] | None:
         """Load persisted validation summary if present."""
+
+    def load_max_drawdown(self, run_id: str) -> float:
+        """Load max drawdown without hydrating full execution artifacts."""
 
     def count_execution_items(self, run_id: str) -> dict[str, int]:
         """Load lightweight execution counts without hydrating full execution payloads."""
@@ -236,6 +242,9 @@ class FileRunRepository:
                     "holding_bars",
                     "entry_reason",
                     "exit_reason",
+                    "planned_stop_loss_price",
+                    "planned_take_profit_price",
+                    "entry_signal_meta_json",
                 ],
             )
             writer.writeheader()
@@ -258,6 +267,9 @@ class FileRunRepository:
                         "holding_bars": trade.holding_bars,
                         "entry_reason": trade.entry_reason,
                         "exit_reason": trade.exit_reason,
+                        "planned_stop_loss_price": _csv_optional_float(trade.planned_stop_loss_price),
+                        "planned_take_profit_price": _csv_optional_float(trade.planned_take_profit_price),
+                        "entry_signal_meta_json": json.dumps(_json_ready(trade.entry_signal_meta_json), sort_keys=True),
                     }
                 )
 
@@ -330,7 +342,36 @@ class FileRunRepository:
 
     def load_metrics(self, run_id: str) -> RunMetrics:
         payload = self._read_json(self._run_dir(run_id) / "metrics.json")
+        if not isinstance(payload, dict):
+            raise ValueError("metrics.json must contain an object")
         return RunMetrics(**payload)
+
+    def load_max_drawdown(self, run_id: str) -> float:
+        metrics_path = self._run_dir(run_id) / "metrics.json"
+        if metrics_path.exists():
+            payload = self._read_json(metrics_path)
+            if isinstance(payload, dict) and payload.get("max_drawdown") is not None:
+                return float(payload["max_drawdown"])
+
+        path = self._execution_dir(run_id) / "equity_curve.csv"
+        if not path.exists():
+            return 0.0
+        max_drawdown = 0.0
+        peak_equity = 0.0
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            if header is None or "equity" not in header:
+                return 0.0
+            equity_index = header.index("equity")
+            for row in reader:
+                if len(row) <= equity_index:
+                    continue
+                equity = float(row[equity_index])
+                peak_equity = max(peak_equity, equity)
+                if peak_equity > 0:
+                    max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
+        return max_drawdown
 
     def save_benchmark(self, *, run_id: str, output: BuyAndHoldBenchmarkOutput) -> dict[str, Path]:
         directory = self._benchmark_dir(run_id)
@@ -387,6 +428,15 @@ class FileRunRepository:
             equity_points=tuple(equity_points),
             daily_returns=tuple(daily_returns),
         )
+
+    def load_benchmark_result(self, run_id: str) -> BenchmarkResult | None:
+        result_path = self._benchmark_dir(run_id) / "result.json"
+        if not result_path.exists():
+            return None
+        payload = self._read_json(result_path)
+        if not isinstance(payload, dict):
+            raise ValueError("benchmark result.json must contain an object")
+        return BenchmarkResult(**payload)
 
     def save_validation_summary(self, *, run_id: str, summary: dict[str, object] | None) -> Path | None:
         if summary is None:
@@ -491,6 +541,9 @@ class FileRunRepository:
                 holding_bars=int(row["holding_bars"]),
                 entry_reason=row["entry_reason"],
                 exit_reason=row["exit_reason"],
+                planned_stop_loss_price=_load_float_or_none(row.get("planned_stop_loss_price")),
+                planned_take_profit_price=_load_float_or_none(row.get("planned_take_profit_price")),
+                entry_signal_meta_json=_load_json_object(row.get("entry_signal_meta_json")),
             )
             for row in rows
         ]
@@ -592,8 +645,8 @@ def _load_optional_enum(enum_cls: type[EnumT], value: str) -> EnumT | None:
     return enum_cls(value)
 
 
-def _load_float_or_none(value: str) -> float | None:
-    if value == "":
+def _load_float_or_none(value: str | None) -> float | None:
+    if value in {None, ""}:
         return None
     return float(value)
 
@@ -602,6 +655,15 @@ def _load_datetime_or_none(value: str) -> datetime | None:
     if value == "":
         return None
     return _parse_iso_datetime(value)
+
+
+def _load_json_object(value: str | None) -> dict[str, object]:
+    if not value:
+        return {}
+    payload = json.loads(value)
+    if not isinstance(payload, dict):
+        return {}
+    return payload
 
 
 def _csv_optional_float(value: float | None) -> str:

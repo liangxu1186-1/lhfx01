@@ -94,11 +94,12 @@ def run_backtest_task_workflow(
 ) -> RunBacktestTaskWorkflowResult:
     """Submit and execute a single-run backtest through LocalTaskRunner."""
 
+    strategy_name = str(request.strategy_params.get("strategy_name") or request.strategy_params.get("name") or "ema_crossover")
     payload = SingleRunTaskPayload(
         run_id=request.run_id,
         dataset_snapshot_id=request.snapshot.dataset_snapshot_id,
         feature_artifact_id="pending",
-        strategy_name=str(request.strategy_params.get("name", "ema_crossover")),
+        strategy_name=strategy_name,
         validation_split_id=(
             request.validation_split.validation_split_id
             if request.validation_split is not None

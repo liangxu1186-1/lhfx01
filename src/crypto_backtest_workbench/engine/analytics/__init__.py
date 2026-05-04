@@ -9,6 +9,7 @@ from crypto_backtest_workbench.engine.analytics.benchmark import (
 from crypto_backtest_workbench.engine.analytics.metrics import (
     EquityPoint,
     RunMetrics,
+    compute_max_drawdown,
     compute_run_metrics,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "EquityPoint",
     "RunMetrics",
     "compute_buy_and_hold_benchmark",
+    "compute_max_drawdown",
     "compute_run_metrics",
 ]

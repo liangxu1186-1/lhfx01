@@ -27,6 +27,7 @@ class RunSummaryView:
     timeframe: str
     fast_period: int | None
     slow_period: int | None
+    parameter_summary: str
     leverage: float | None
     status: str
     created_at: datetime
@@ -91,18 +92,18 @@ class TradeFilter:
     reason_query: str | None = None
 
 
-def list_run_summary_views(run_repository: RunRepository) -> list[RunSummaryView]:
+def list_run_summary_views(run_repository: RunRepository, *, run_ids: list[str] | None = None) -> list[RunSummaryView]:
     summaries: list[RunSummaryView] = []
-    for run_id in run_repository.list_run_ids():
+    for run_id in run_ids or run_repository.list_run_ids():
         manifest = run_repository.load_manifest(run_id)
         run = run_repository.load_run(run_id)
         metrics = run_repository.load_metrics(run_id)
-        benchmark = run_repository.load_benchmark(run_id)
+        benchmark = run_repository.load_benchmark_result(run_id)
         validation_summary = run_repository.load_validation_summary(run_id)
         execution_counts = run_repository.count_execution_items(run_id)
         strategy_params = manifest.resolved_config_json.get("strategy_params") or {}
         execution_constraints = manifest.resolved_config_json.get("execution_constraints") or {}
-        benchmark_return = benchmark.result.return_pct if benchmark is not None else None
+        benchmark_return = benchmark.return_pct if benchmark is not None else None
         excess_return = None
         if benchmark_return is not None:
             excess_return = metrics.total_return - benchmark_return
@@ -117,12 +118,13 @@ def list_run_summary_views(run_repository: RunRepository) -> list[RunSummaryView
                 timeframe=str(manifest.resolved_config_json.get("timeframe") or ""),
                 fast_period=_coerce_int(strategy_params.get("fast_period")),
                 slow_period=_coerce_int(strategy_params.get("slow_period")),
+                parameter_summary=_parameter_summary(run.strategy_name, strategy_params, execution_constraints),
                 leverage=_coerce_float(execution_constraints.get("leverage")),
                 status=run.status.value,
                 created_at=run.created_at,
                 validation_split_id=run.validation_split_id,
                 total_return=metrics.total_return,
-                max_drawdown=_max_drawdown(run_repository.load_execution(run_id).equity_curve),
+                max_drawdown=run_repository.load_max_drawdown(run_id),
                 final_equity=metrics.final_equity,
                 trade_count=metrics.trade_count,
                 win_rate=metrics.win_rate,
@@ -238,6 +240,44 @@ def build_run_comparison_views_from_summaries(summaries: list[RunSummaryView]) -
     ]
 
 
+def _parameter_summary(strategy_name: str, strategy_params: dict[str, object], execution_constraints: dict[str, object]) -> str:
+    leverage = _coerce_float(execution_constraints.get("leverage"))
+    leverage_label = f"l{leverage:g}" if leverage is not None else None
+    qty_policy_ref = str(strategy_params.get("qty_policy_ref") or "")
+    cash_allocation_pct = _coerce_policy_float(execution_constraints.get("cash_allocation_pct_by_policy"))
+    risk_pct_per_trade = _coerce_policy_float(execution_constraints.get("risk_pct_per_trade_by_policy"))
+    sizing_label = _sizing_summary(
+        qty_policy_ref=qty_policy_ref,
+        cash_allocation_pct=cash_allocation_pct,
+        risk_pct_per_trade=risk_pct_per_trade,
+    )
+    if strategy_name == "ema_pullback_atr_v2":
+        parts = [
+            f"tf{_coerce_int(strategy_params.get('trend_fast_period'))}",
+            f"ts{_coerce_int(strategy_params.get('trend_slow_period'))}",
+            f"ema{_coerce_int(strategy_params.get('entry_ema_period'))}",
+            f"atr{_coerce_int(strategy_params.get('atr_period'))}",
+            f"tol{_format_float(_coerce_float(strategy_params.get('atr_entry_tolerance')))}",
+            f"sl{_format_float(_coerce_float(strategy_params.get('atr_stop_mult')))}",
+            f"rr{_format_float(_coerce_float(strategy_params.get('risk_reward_ratio')))}",
+        ]
+        if sizing_label is not None:
+            parts.append(sizing_label)
+        if leverage_label is not None:
+            parts.append(leverage_label)
+        return " ".join(part for part in parts if part and "None" not in part)
+
+    parts = [
+        f"f{_coerce_int(strategy_params.get('fast_period'))}",
+        f"s{_coerce_int(strategy_params.get('slow_period'))}",
+    ]
+    if sizing_label is not None:
+        parts.append(sizing_label)
+    if leverage_label is not None:
+        parts.append(leverage_label)
+    return " ".join(part for part in parts if part and "None" not in part)
+
+
 def build_multi_run_equity_rows(details: list[RunDetailView]) -> list[dict[str, object]]:
     row_by_timestamp: dict[datetime, dict[str, object]] = {}
     for detail in details:
@@ -248,6 +288,31 @@ def build_multi_run_equity_rows(details: list[RunDetailView]) -> list[dict[str, 
             if row["benchmark_equity"] is not None:
                 merged[f"{detail.run.run_id}_benchmark"] = row["benchmark_equity"]
     return [row_by_timestamp[timestamp] for timestamp in sorted(row_by_timestamp)]
+
+
+def _sizing_summary(
+    *,
+    qty_policy_ref: str,
+    cash_allocation_pct: float | None,
+    risk_pct_per_trade: float | None,
+) -> str | None:
+    if qty_policy_ref == "percent_of_cash" and cash_allocation_pct is not None:
+        return f"cash{_format_float(cash_allocation_pct)}"
+    if qty_policy_ref == "risk_pct_of_equity" and risk_pct_per_trade is not None:
+        return f"risk{_format_float(risk_pct_per_trade * 100)}%"
+    if (
+        qty_policy_ref == "risk_pct_of_cash_allocation"
+        and cash_allocation_pct is not None
+        and risk_pct_per_trade is not None
+    ):
+        return f"cash{_format_float(cash_allocation_pct)} risk{_format_float(risk_pct_per_trade * 100)}%"
+    return None
+
+
+def _format_float(value: float | None) -> str:
+    if value is None:
+        return "na"
+    return f"{value:g}"
 
 
 def build_equity_chart_rows(detail: RunDetailView) -> list[dict[str, object]]:
@@ -275,6 +340,13 @@ def build_equity_chart_rows(detail: RunDetailView) -> list[dict[str, object]]:
     return rows
 
 
+def _coerce_policy_float(value: object) -> float | None:
+    if not isinstance(value, dict) or not value:
+        return None
+    first_value = next(iter(value.values()))
+    return _coerce_float(first_value)
+
+
 def build_trade_rows(detail: RunDetailView) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for trade in detail.execution.trades:
@@ -295,6 +367,9 @@ def build_trade_rows(detail: RunDetailView) -> list[dict[str, object]]:
                 "holding_bars": trade.holding_bars,
                 "entry_reason": trade.entry_reason,
                 "exit_reason": trade.exit_reason,
+                "planned_stop_loss_price": trade.planned_stop_loss_price,
+                "planned_take_profit_price": trade.planned_take_profit_price,
+                "entry_signal_meta_json": trade.entry_signal_meta_json,
             }
         )
     return rows

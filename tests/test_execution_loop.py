@@ -114,6 +114,297 @@ def test_simulate_signals_percent_of_cash_uses_dynamic_available_cash() -> None:
     assert round(result.account.equity, 6) == 1_960.0
 
 
+def test_simulate_signals_risk_pct_of_equity_sizes_qty_from_stop_distance() -> None:
+    candles = _sample_candles_for_risk_management()
+    signal = _signal(signal_id="sig-open", timestamp=candles[0].timestamp, action=SignalAction.OPEN, side=Side.LONG)
+    signal.qty_policy_ref = "risk_pct_of_equity"
+    signal.meta_json["risk_spec"] = _risk_spec(atr_value=2.0, stop_mult=1.5, rr=2.0, min_stop_pct=0.01)
+
+    result = simulate_signals(
+        candles=candles[:2],
+        signals=[signal],
+        constraints=ExecutionConstraints(
+            initial_cash=1_000.0,
+            leverage=1.0,
+            fee_rate=0.0,
+            risk_pct_per_trade_by_policy={"risk_pct_of_equity": 0.01},
+        ),
+    )
+
+    trade = result.trades[0]
+    assert round(trade.qty, 6) == round(10.0 / 3.0, 6)
+    assert trade.planned_stop_loss_price == 97.0
+    assert trade.planned_take_profit_price == 106.0
+
+
+def test_simulate_signals_risk_pct_of_equity_respects_margin_cap() -> None:
+    candles = _sample_candles_for_risk_management()
+    signal = _signal(signal_id="sig-open", timestamp=candles[0].timestamp, action=SignalAction.OPEN, side=Side.LONG)
+    signal.qty_policy_ref = "risk_pct_of_equity"
+    signal.meta_json["risk_spec"] = _risk_spec(atr_value=0.01, stop_mult=1.0, rr=2.0, min_stop_pct=0.0001)
+
+    result = simulate_signals(
+        candles=candles[:2],
+        signals=[signal],
+        constraints=ExecutionConstraints(
+            initial_cash=1_000.0,
+            leverage=1.0,
+            fee_rate=0.0,
+            risk_pct_per_trade_by_policy={"risk_pct_of_equity": 0.5},
+        ),
+    )
+
+    trade = result.trades[0]
+    assert round(trade.qty, 6) == 10.0
+
+
+def test_simulate_signals_risk_pct_of_cash_allocation_sizes_within_allocated_cash() -> None:
+    candles = _sample_candles_for_risk_management()
+    signal = _signal(signal_id="sig-open", timestamp=candles[0].timestamp, action=SignalAction.OPEN, side=Side.LONG)
+    signal.qty_policy_ref = "risk_pct_of_cash_allocation"
+    signal.meta_json["risk_spec"] = _risk_spec(atr_value=2.0, stop_mult=1.5, rr=2.0, min_stop_pct=0.01)
+
+    result = simulate_signals(
+        candles=candles[:2],
+        signals=[signal],
+        constraints=ExecutionConstraints(
+            initial_cash=1_000.0,
+            leverage=10.0,
+            fee_rate=0.0,
+            cash_allocation_pct_by_policy={"risk_pct_of_cash_allocation": 50.0},
+            risk_pct_per_trade_by_policy={"risk_pct_of_cash_allocation": 0.1},
+        ),
+    )
+
+    trade = result.trades[0]
+    assert round(trade.qty, 6) == round(50.0 / 3.0, 6)
+
+
+def test_simulate_signals_risk_pct_of_cash_allocation_respects_cash_cap() -> None:
+    candles = _sample_candles_for_risk_management()
+    signal = _signal(signal_id="sig-open", timestamp=candles[0].timestamp, action=SignalAction.OPEN, side=Side.LONG)
+    signal.qty_policy_ref = "risk_pct_of_cash_allocation"
+    signal.meta_json["risk_spec"] = _risk_spec(atr_value=0.01, stop_mult=1.0, rr=2.0, min_stop_pct=0.0001)
+
+    result = simulate_signals(
+        candles=candles[:2],
+        signals=[signal],
+        constraints=ExecutionConstraints(
+            initial_cash=1_000.0,
+            leverage=1.0,
+            fee_rate=0.0,
+            cash_allocation_pct_by_policy={"risk_pct_of_cash_allocation": 50.0},
+            risk_pct_per_trade_by_policy={"risk_pct_of_cash_allocation": 0.5},
+        ),
+    )
+
+    trade = result.trades[0]
+    assert round(trade.qty, 6) == 5.0
+
+
+def test_simulate_signals_risk_pct_of_equity_requires_risk_spec() -> None:
+    candles = _sample_candles_for_risk_management()
+    signal = _signal(signal_id="sig-open", timestamp=candles[0].timestamp, action=SignalAction.OPEN, side=Side.LONG)
+    signal.qty_policy_ref = "risk_pct_of_equity"
+
+    result = simulate_signals(
+        candles=candles[:2],
+        signals=[signal],
+        constraints=ExecutionConstraints(
+            initial_cash=1_000.0,
+            leverage=1.0,
+            fee_rate=0.0,
+            risk_pct_per_trade_by_policy={"risk_pct_of_equity": 0.01},
+        ),
+    )
+
+    assert len(result.orders) == 1
+    assert result.orders[0].status == "rejected"
+    assert result.orders[0].reject_reason_code is not None
+    assert result.trades == []
+
+
+def test_simulate_signals_without_risk_spec_keeps_v1_execution_behavior() -> None:
+    candles = _sample_candles_for_risk_management()
+    signals = [
+        _signal(signal_id="sig-open", timestamp=candles[0].timestamp, action=SignalAction.OPEN, side=Side.LONG),
+    ]
+
+    result = simulate_signals(
+        candles=candles,
+        signals=signals,
+        constraints=ExecutionConstraints(
+            initial_cash=1_000.0,
+            leverage=1.0,
+            fee_rate=0.0,
+            qty_by_policy={"fixed_1": 1.0},
+        ),
+    )
+
+    assert len(result.trades) == 1
+    assert result.trades[0].exit_time is None
+    assert result.trades[0].planned_stop_loss_price is None
+    assert result.trades[0].planned_take_profit_price is None
+
+
+def test_simulate_signals_risk_spec_uses_true_fill_price_for_planned_sltp() -> None:
+    candles = _sample_candles_for_risk_management()
+    signal = _signal(signal_id="sig-open", timestamp=candles[0].timestamp, action=SignalAction.OPEN, side=Side.LONG)
+    signal.meta_json["risk_spec"] = _risk_spec(atr_value=2.0, stop_mult=1.5, rr=2.0, min_stop_pct=0.01)
+
+    result = simulate_signals(
+        candles=candles[:2],
+        signals=[signal],
+        constraints=ExecutionConstraints(
+            initial_cash=1_000.0,
+            leverage=1.0,
+            fee_rate=0.0,
+            slippage_bps=100.0,
+            qty_by_policy={"fixed_1": 1.0},
+        ),
+    )
+
+    trade = result.trades[0]
+    assert trade.entry_price == 101.0
+    assert trade.planned_stop_loss_price == 98.0
+    assert trade.planned_take_profit_price == 107.0
+
+
+def test_simulate_signals_same_bar_new_short_position_checks_stop_loss_intrabar() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    candles = [
+        _risk_candle(start, 0, (100.0, 101.0, 99.0, 100.0)),
+        _risk_candle(start, 1, (100.0, 110.0, 99.0, 105.0)),
+        _risk_candle(start, 2, (120.0, 121.0, 119.0, 120.0)),
+    ]
+    signal = _signal(signal_id="sig-open", timestamp=candles[0].timestamp, action=SignalAction.OPEN, side=Side.SHORT)
+    signal.meta_json["risk_spec"] = _risk_spec(atr_value=3.0, stop_mult=1.0, rr=2.0, min_stop_pct=0.0)
+
+    result = simulate_signals(
+        candles=candles,
+        signals=[signal],
+        constraints=ExecutionConstraints(
+            initial_cash=1_000.0,
+            leverage=1.0,
+            fee_rate=0.0,
+            qty_by_policy={"fixed_1": 1.0},
+        ),
+    )
+
+    trade = result.trades[0]
+    assert trade.entry_time == candles[1].timestamp
+    assert trade.exit_time == candles[1].timestamp
+    assert trade.exit_reason == "stop_loss_intrabar"
+    assert trade.exit_price == 103.0
+
+
+def test_simulate_signals_same_bar_new_position_prefers_stop_when_stop_and_tp_trigger() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    candles = [
+        _risk_candle(start, 0, (100.0, 101.0, 99.0, 100.0)),
+        _risk_candle(start, 1, (100.0, 107.0, 96.0, 101.0)),
+    ]
+    signal = _signal(signal_id="sig-open", timestamp=candles[0].timestamp, action=SignalAction.OPEN, side=Side.LONG)
+    signal.meta_json["risk_spec"] = _risk_spec(atr_value=3.0, stop_mult=1.0, rr=2.0, min_stop_pct=0.0)
+
+    result = simulate_signals(
+        candles=candles,
+        signals=[signal],
+        constraints=ExecutionConstraints(
+            initial_cash=1_000.0,
+            leverage=1.0,
+            fee_rate=0.0,
+            qty_by_policy={"fixed_1": 1.0},
+        ),
+    )
+
+    trade = result.trades[0]
+    assert trade.exit_time == candles[1].timestamp
+    assert trade.exit_reason == "stop_loss_intrabar"
+    assert trade.exit_price == 97.0
+
+
+def test_simulate_signals_long_stop_loss_intrabar() -> None:
+    trade = _run_risk_case(side=Side.LONG, trigger_bar=(100.0, 104.0, 96.0, 101.0), rr=2.0)
+    assert trade.exit_reason == "stop_loss_intrabar"
+    assert trade.exit_price == 97.0
+
+
+def test_simulate_signals_short_stop_loss_intrabar() -> None:
+    trade = _run_risk_case(side=Side.SHORT, trigger_bar=(100.0, 104.0, 96.0, 101.0), rr=2.0)
+    assert trade.exit_reason == "stop_loss_intrabar"
+    assert trade.exit_price == 103.0
+
+
+def test_simulate_signals_long_take_profit_intrabar() -> None:
+    trade = _run_risk_case(side=Side.LONG, trigger_bar=(100.0, 107.0, 99.0, 106.0), rr=2.0)
+    assert trade.exit_reason == "take_profit_intrabar"
+    assert trade.exit_price == 106.0
+
+
+def test_simulate_signals_short_take_profit_intrabar() -> None:
+    trade = _run_risk_case(side=Side.SHORT, trigger_bar=(100.0, 101.0, 93.0, 94.0), rr=2.0)
+    assert trade.exit_reason == "take_profit_intrabar"
+    assert trade.exit_price == 94.0
+
+
+def test_simulate_signals_long_stop_loss_gap_open() -> None:
+    trade = _run_risk_case(side=Side.LONG, trigger_bar=(95.0, 100.0, 94.0, 99.0), rr=2.0)
+    assert trade.exit_reason == "stop_loss_gap_open"
+    assert trade.exit_price == 95.0
+
+
+def test_simulate_signals_short_stop_loss_gap_open() -> None:
+    trade = _run_risk_case(side=Side.SHORT, trigger_bar=(105.0, 106.0, 100.0, 101.0), rr=2.0)
+    assert trade.exit_reason == "stop_loss_gap_open"
+    assert trade.exit_price == 105.0
+
+
+def test_simulate_signals_long_take_profit_gap_open() -> None:
+    trade = _run_risk_case(side=Side.LONG, trigger_bar=(108.0, 109.0, 100.0, 101.0), rr=2.0)
+    assert trade.exit_reason == "take_profit_gap_open"
+    assert trade.exit_price == 108.0
+
+
+def test_simulate_signals_short_take_profit_gap_open() -> None:
+    trade = _run_risk_case(side=Side.SHORT, trigger_bar=(92.0, 100.0, 91.0, 99.0), rr=2.0)
+    assert trade.exit_reason == "take_profit_gap_open"
+    assert trade.exit_price == 92.0
+
+
+def test_simulate_signals_same_bar_stop_and_take_profit_prefers_stop() -> None:
+    trade = _run_risk_case(side=Side.LONG, trigger_bar=(100.0, 107.0, 96.0, 101.0), rr=2.0)
+    assert trade.exit_reason == "stop_loss_intrabar"
+    assert trade.exit_price == 97.0
+
+
+def test_simulate_signals_tolerates_margin_precision_at_full_cash_allocation() -> None:
+    candles = _sample_candles_for_margin_precision()
+    signals = [
+        _signal(signal_id="sig-open", timestamp=candles[0].timestamp, action=SignalAction.OPEN, side=Side.LONG),
+        _signal(signal_id="sig-close", timestamp=candles[1].timestamp, action=SignalAction.CLOSE, side=Side.LONG),
+    ]
+    for signal in signals:
+        signal.qty_policy_ref = "percent_of_cash"
+
+    result = simulate_signals(
+        candles=candles,
+        signals=signals,
+        constraints=ExecutionConstraints(
+            initial_cash=10_000.0,
+            leverage=3.0,
+            fee_rate=0.0,
+            cash_allocation_pct_by_policy={"percent_of_cash": 100.0},
+        ),
+    )
+
+    assert len(result.orders) == 2
+    assert all(order.status == "filled" for order in result.orders)
+    assert all(order.reject_reason_code is None for order in result.orders)
+    assert len(result.fills) == 2
+    assert len(result.trades) == 1
+
+
 def test_single_run_orchestrator_assembles_manifest_run_and_metrics() -> None:
     candles = _sample_candles()
     signals = [
@@ -225,6 +516,110 @@ def _sample_candles_for_dynamic_sizing() -> list[CanonicalCandle]:
             )
         )
     return candles
+
+
+def _sample_candles_for_margin_precision() -> list[CanonicalCandle]:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    prices = [
+        (45_000.0, 45_100.0, 44_900.0, 45_000.0),
+        (45_001.3, 45_100.0, 44_900.0, 45_001.3),
+        (45_010.0, 45_100.0, 44_900.0, 45_010.0),
+    ]
+    candles: list[CanonicalCandle] = []
+    for index, (open_price, high, low, close) in enumerate(prices):
+        candles.append(
+            CanonicalCandle(
+                timestamp=start + timedelta(hours=index),
+                symbol="BTC/USDT:USDT",
+                exchange="binance",
+                market_type=MarketType.LINEAR_USDT_PERPETUAL,
+                timeframe="1h",
+                open=open_price,
+                high=high,
+                low=low,
+                close=close,
+                volume=10.0,
+                price_type=PriceType.LAST,
+            )
+        )
+    return candles
+
+
+def _sample_candles_for_risk_management() -> list[CanonicalCandle]:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    prices = [
+        (100.0, 101.0, 99.0, 100.0),
+        (100.0, 101.0, 99.0, 100.0),
+        (100.0, 101.0, 99.0, 100.0),
+    ]
+    return [
+        CanonicalCandle(
+            timestamp=start + timedelta(hours=index),
+            symbol="BTC/USDT:USDT",
+            exchange="binance",
+            market_type=MarketType.LINEAR_USDT_PERPETUAL,
+            timeframe="1h",
+            open=open_price,
+            high=high,
+            low=low,
+            close=close,
+            volume=10.0,
+            price_type=PriceType.LAST,
+        )
+        for index, (open_price, high, low, close) in enumerate(prices)
+    ]
+
+
+def _run_risk_case(*, side: Side, trigger_bar: tuple[float, float, float, float], rr: float) -> object:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    candles = [
+        _risk_candle(start, 0, (100.0, 101.0, 99.0, 100.0)),
+        _risk_candle(start, 1, (100.0, 101.0, 99.0, 100.0)),
+        _risk_candle(start, 2, trigger_bar),
+    ]
+    signal = _signal(signal_id="sig-open", timestamp=candles[0].timestamp, action=SignalAction.OPEN, side=side)
+    signal.meta_json["risk_spec"] = _risk_spec(atr_value=3.0, stop_mult=1.0, rr=rr, min_stop_pct=0.0)
+
+    result = simulate_signals(
+        candles=candles,
+        signals=[signal],
+        constraints=ExecutionConstraints(
+            initial_cash=1_000.0,
+            leverage=1.0,
+            fee_rate=0.0,
+            qty_by_policy={"fixed_1": 1.0},
+        ),
+    )
+    assert len(result.trades) == 1
+    return result.trades[0]
+
+
+def _risk_candle(start: datetime, index: int, prices: tuple[float, float, float, float]) -> CanonicalCandle:
+    open_price, high, low, close = prices
+    return CanonicalCandle(
+        timestamp=start + timedelta(hours=index),
+        symbol="BTC/USDT:USDT",
+        exchange="binance",
+        market_type=MarketType.LINEAR_USDT_PERPETUAL,
+        timeframe="1h",
+        open=open_price,
+        high=high,
+        low=low,
+        close=close,
+        volume=10.0,
+        price_type=PriceType.LAST,
+    )
+
+
+def _risk_spec(*, atr_value: float, stop_mult: float, rr: float, min_stop_pct: float) -> dict[str, object]:
+    return {
+        "stop_loss_mode": "atr_multiple",
+        "stop_loss_value": stop_mult,
+        "take_profit_mode": "rr",
+        "take_profit_value": rr,
+        "atr_value": atr_value,
+        "min_stop_pct": min_stop_pct,
+    }
 
 
 def _signal(

@@ -114,6 +114,7 @@ def test_file_run_repository_round_trips_single_run_result(tmp_path) -> None:
     loaded_execution = repository.load_execution("run-001")
     loaded_metrics = repository.load_metrics("run-001")
     loaded_benchmark = repository.load_benchmark("run-001")
+    loaded_benchmark_result = repository.load_benchmark_result("run-001")
     loaded_validation_summary = repository.load_validation_summary("run-001")
 
     assert loaded_manifest == result.manifest
@@ -121,14 +122,17 @@ def test_file_run_repository_round_trips_single_run_result(tmp_path) -> None:
     assert loaded_execution == result.execution
     assert loaded_metrics == result.metrics
     assert loaded_benchmark == result.benchmark_output
+    assert loaded_benchmark_result == result.benchmark_output.result
     assert loaded_validation_summary == result.validation_summary
     assert loaded_execution.trades[0].trade_id == result.execution.trades[0].trade_id
+    assert repository.load_max_drawdown("run-001") == result.metrics.max_drawdown
 
 
 def test_file_run_repository_returns_none_when_benchmark_missing(tmp_path) -> None:
     repository = FileRunRepository(tmp_path)
 
     assert repository.load_benchmark("missing-run") is None
+    assert repository.load_benchmark_result("missing-run") is None
 
 
 def test_file_run_repository_lists_only_persisted_runs(tmp_path) -> None:
@@ -144,6 +148,28 @@ def test_file_run_repository_lists_only_persisted_runs(tmp_path) -> None:
     repository.save_single_run_result(second)
 
     assert repository.list_run_ids() == ["run-a", "run-b"]
+
+
+def test_file_run_repository_loads_legacy_trades_without_planned_sltp(tmp_path) -> None:
+    repository = FileRunRepository(tmp_path)
+    result = _build_single_run_result(run_id="run-legacy")
+    repository.save_single_run_result(result)
+    trades_path = tmp_path / "runs" / "run-legacy" / "execution" / "trades.csv"
+    rows = trades_path.read_text(encoding="utf-8").splitlines()
+    header = rows[0].split(",")
+    stop_index = header.index("planned_stop_loss_price")
+    tp_index = header.index("planned_take_profit_price")
+    keep_indexes = [index for index in range(len(header)) if index not in {stop_index, tp_index}]
+    legacy_rows = []
+    for row in rows:
+        parts = row.split(",")
+        legacy_rows.append(",".join(parts[index] for index in keep_indexes))
+    trades_path.write_text("\n".join(legacy_rows), encoding="utf-8")
+
+    loaded = repository.load_execution("run-legacy")
+
+    assert loaded.trades[0].planned_stop_loss_price is None
+    assert loaded.trades[0].planned_take_profit_price is None
 
 
 def _build_candles(close_prices: list[float]) -> list[CanonicalCandle]:

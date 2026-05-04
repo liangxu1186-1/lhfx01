@@ -22,8 +22,18 @@ class ParameterLabRow:
     created_at: datetime
     fast_period: int | None
     slow_period: int | None
+    trend_fast_period: int | None
+    trend_slow_period: int | None
+    entry_ema_period: int | None
+    atr_period: int | None
+    atr_entry_tolerance: float | None
+    atr_stop_mult: float | None
+    risk_reward_ratio: float | None
+    parameter_summary: str
+    signal_filter_summary: str | None
     qty_policy_ref: str | None
     cash_allocation_pct: float | None
+    risk_pct_per_trade: float | None
     leverage: float | None
     fee_rate: float | None
     slippage_bps: float | None
@@ -68,7 +78,7 @@ def build_parameter_lab_rows(
     candidate_run_ids = run_ids or run_repository.list_run_ids()
     summary_by_run_id = {
         summary.run_id: summary
-        for summary in list_run_summary_views(run_repository)
+        for summary in list_run_summary_views(run_repository, run_ids=candidate_run_ids)
     }
     for run_id in candidate_run_ids:
         summary = summary_by_run_id.get(run_id)
@@ -89,8 +99,18 @@ def build_parameter_lab_rows(
                 created_at=summary.created_at,
                 fast_period=_coerce_int(strategy_params.get("fast_period")),
                 slow_period=_coerce_int(strategy_params.get("slow_period")),
+                trend_fast_period=_coerce_int(strategy_params.get("trend_fast_period")),
+                trend_slow_period=_coerce_int(strategy_params.get("trend_slow_period")),
+                entry_ema_period=_coerce_int(strategy_params.get("entry_ema_period")),
+                atr_period=_coerce_int(strategy_params.get("atr_period")),
+                atr_entry_tolerance=_coerce_float(strategy_params.get("atr_entry_tolerance")),
+                atr_stop_mult=_coerce_float(strategy_params.get("atr_stop_mult")),
+                risk_reward_ratio=_coerce_float(strategy_params.get("risk_reward_ratio")),
+                parameter_summary=summary.parameter_summary,
+                signal_filter_summary=_signal_filter_summary(strategy_params.get("signal_filters")),
                 qty_policy_ref=_coerce_str(strategy_params.get("qty_policy_ref")),
                 cash_allocation_pct=_coerce_policy_float(execution_constraints.get("cash_allocation_pct_by_policy")),
+                risk_pct_per_trade=_coerce_policy_float(execution_constraints.get("risk_pct_per_trade_by_policy")),
                 leverage=_coerce_float(execution_constraints.get("leverage")),
                 fee_rate=_coerce_float(execution_constraints.get("fee_rate")),
                 slippage_bps=_coerce_float(execution_constraints.get("slippage_bps")),
@@ -197,6 +217,26 @@ def _coerce_str(value: object) -> str | None:
     return str(value)
 
 
+def _signal_filter_summary(value: object) -> str | None:
+    if not isinstance(value, list) or not value:
+        return None
+    labels: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        filter_type = str(item.get("filter_type") or "")
+        params = item.get("params") if isinstance(item.get("params"), dict) else {}
+        if filter_type == "higher_timeframe_trend":
+            labels.append(f"HTF ema{params.get('ema_fast', 50)}/{params.get('ema_slow', 200)}")
+        elif filter_type == "atr_percentile":
+            labels.append(f"ATR p{params.get('min_percentile', '--')}-{params.get('max_percentile', '--')}")
+        elif filter_type == "adx":
+            labels.append(f"ADX>={params.get('min_adx', '--')}")
+        elif filter_type:
+            labels.append(filter_type)
+    return " + ".join(labels) if labels else None
+
+
 def _coerce_policy_float(value: object) -> float | None:
     if not isinstance(value, dict) or not value:
         return None
@@ -204,7 +244,9 @@ def _coerce_policy_float(value: object) -> float | None:
     return _coerce_float(first_value)
 
 
-def _normalize_float(value: float) -> float | None:
+def _normalize_float(value: float | None) -> float | None:
+    if value is None:
+        return None
     if isnan(value):
         return None
     return value
