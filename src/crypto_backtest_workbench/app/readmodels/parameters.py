@@ -31,6 +31,7 @@ class ParameterLabRow:
     risk_reward_ratio: float | None
     parameter_summary: str
     signal_filter_summary: str | None
+    execution_protection_summary: str | None
     qty_policy_ref: str | None
     cash_allocation_pct: float | None
     risk_pct_per_trade: float | None
@@ -108,6 +109,7 @@ def build_parameter_lab_rows(
                 risk_reward_ratio=_coerce_float(strategy_params.get("risk_reward_ratio")),
                 parameter_summary=summary.parameter_summary,
                 signal_filter_summary=_signal_filter_summary(strategy_params.get("signal_filters")),
+                execution_protection_summary=_execution_protection_summary(execution_constraints),
                 qty_policy_ref=_coerce_str(strategy_params.get("qty_policy_ref")),
                 cash_allocation_pct=_coerce_policy_float(execution_constraints.get("cash_allocation_pct_by_policy")),
                 risk_pct_per_trade=_coerce_policy_float(execution_constraints.get("risk_pct_per_trade_by_policy")),
@@ -232,8 +234,32 @@ def _signal_filter_summary(value: object) -> str | None:
             labels.append(f"ATR p{params.get('min_percentile', '--')}-{params.get('max_percentile', '--')}")
         elif filter_type == "adx":
             labels.append(f"ADX>={params.get('min_adx', '--')}")
+        elif filter_type == "pre_entry_momentum":
+            labels.append(f"MOM{params.get('lookback_bars', 3)}>={params.get('min_momentum_pct', '--')}")
+        elif filter_type == "consecutive_move":
+            labels.append(f"连续>={params.get('min_consecutive', 1)}")
+        elif filter_type == "local_range_position":
+            labels.append(f"局部位>={params.get('min_position', '--')}")
         elif filter_type:
             labels.append(filter_type)
+    return " + ".join(labels) if labels else None
+
+
+def _execution_protection_summary(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    labels: list[str] = []
+    max_dd = _coerce_float(value.get("max_equity_drawdown_pct"))
+    if max_dd is not None:
+        labels.append(f"DD停开>={max_dd * 100:g}%")
+    stop_count = _coerce_int(value.get("cooldown_after_consecutive_stop_losses"))
+    cooldown_bars = _coerce_int(value.get("cooldown_bars"))
+    short_bars = _coerce_int(value.get("cooldown_only_short_holding_bars"))
+    if stop_count is not None and cooldown_bars is not None:
+        if short_bars is not None:
+            labels.append(f"{stop_count}短止冷却{cooldown_bars}K")
+        else:
+            labels.append(f"{stop_count}止冷却{cooldown_bars}K")
     return " + ".join(labels) if labels else None
 
 

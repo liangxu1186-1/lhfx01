@@ -128,6 +128,15 @@ body {
   font-size: 13px;
 }
 
+.cbw-data-table th[style*='sticky'] {
+  z-index: 4;
+}
+
+.cbw-data-table td[style*='sticky'] {
+  background: #ffffff;
+  box-shadow: 1px 0 0 #eaecf0;
+}
+
 .cbw-th-content {
   display: flex;
   align-items: center;

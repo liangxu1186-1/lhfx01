@@ -123,6 +123,8 @@ class EMAPullbackATRStrategy(StrategyDefinition):
                 specs.append(
                     FeatureSpec(name="adx", params={"window": adx_period}, input_price_field=self.input_price_field, warmup_bars=max(warmup_bars, adx_period * 2))
                 )
+            elif filter_type in {"pre_entry_momentum", "consecutive_move", "local_range_position", "entry_context_exclusion"}:
+                continue
             else:
                 raise ValueError(f"Unsupported signal filter type: {filter_type}")
         return tuple(_dedupe_feature_specs(specs))
@@ -179,7 +181,17 @@ class EMAPullbackATRStrategy(StrategyDefinition):
                 and abs(low - entry_ema) <= atr * self.atr_entry_tolerance
                 and close > previous_high
             ):
-                if not self._filters_allow_signal(rows=rows, index=index, side=Side.LONG):
+                feature_values = {
+                    "trend_fast_ema": trend_fast,
+                    "trend_slow_ema": trend_slow,
+                    "entry_ema": entry_ema,
+                    "atr": atr,
+                    "low": low,
+                    "close": close,
+                    "previous_high": previous_high,
+                }
+                feature_values.update(self._entry_context_features(rows=rows, index=index, side=Side.LONG, base_features=feature_values))
+                if not self._filters_allow_signal(rows=rows, index=index, side=Side.LONG, feature_values=feature_values):
                     continue
                 signals.append(
                     self._build_signal(
@@ -188,15 +200,7 @@ class EMAPullbackATRStrategy(StrategyDefinition):
                         timestamp=current.timestamp,
                         side=Side.LONG,
                         reason_code="ema_pullback_atr_long_breakout",
-                        feature_values={
-                            "trend_fast_ema": trend_fast,
-                            "trend_slow_ema": trend_slow,
-                            "entry_ema": entry_ema,
-                            "atr": atr,
-                            "low": low,
-                            "close": close,
-                            "previous_high": previous_high,
-                        },
+                        feature_values=feature_values,
                     )
                 )
             elif (
@@ -204,7 +208,17 @@ class EMAPullbackATRStrategy(StrategyDefinition):
                 and abs(high - entry_ema) <= atr * self.atr_entry_tolerance
                 and close < previous_low
             ):
-                if not self._filters_allow_signal(rows=rows, index=index, side=Side.SHORT):
+                feature_values = {
+                    "trend_fast_ema": trend_fast,
+                    "trend_slow_ema": trend_slow,
+                    "entry_ema": entry_ema,
+                    "atr": atr,
+                    "high": high,
+                    "close": close,
+                    "previous_low": previous_low,
+                }
+                feature_values.update(self._entry_context_features(rows=rows, index=index, side=Side.SHORT, base_features=feature_values))
+                if not self._filters_allow_signal(rows=rows, index=index, side=Side.SHORT, feature_values=feature_values):
                     continue
                 signals.append(
                     self._build_signal(
@@ -213,19 +227,112 @@ class EMAPullbackATRStrategy(StrategyDefinition):
                         timestamp=current.timestamp,
                         side=Side.SHORT,
                         reason_code="ema_pullback_atr_short_breakdown",
-                        feature_values={
-                            "trend_fast_ema": trend_fast,
-                            "trend_slow_ema": trend_slow,
-                            "entry_ema": entry_ema,
-                            "atr": atr,
-                            "high": high,
-                            "close": close,
-                            "previous_low": previous_low,
-                        },
+                        feature_values=feature_values,
                     )
                 )
 
         return signals
+
+    def _entry_context_features(self, *, rows, index: int, side: Side, base_features: dict[str, float]) -> dict[str, float]:
+        current = rows[index]
+        previous = rows[:index]
+        values = current.values
+        close_value = values.get("close")
+        if close_value is None:
+            return {}
+        close = float(close_value)
+        atr = base_features.get("atr")
+        trend_fast = base_features.get("trend_fast_ema")
+        trend_slow = base_features.get("trend_slow_ema")
+        entry_ema = base_features.get("entry_ema")
+        result: dict[str, float] = {}
+        if close > 0 and atr is not None:
+            result["atr_pct"] = atr / close
+        if close > 0 and trend_fast is not None and trend_slow is not None:
+            result["trend_gap_pct"] = abs(trend_fast - trend_slow) / close
+        if atr and atr > 0 and trend_fast is not None and trend_slow is not None:
+            result["trend_gap_atr"] = abs(trend_fast - trend_slow) / atr
+        if atr and atr > 0 and entry_ema is not None:
+            touch_value = values.get("low") if side is Side.LONG else values.get("high")
+            if touch_value is not None:
+                result["entry_distance_atr"] = abs(float(touch_value) - entry_ema) / atr
+            close_distance = close - entry_ema if side is Side.LONG else entry_ema - close
+            result["ema_reclaim_strength_atr"] = close_distance / atr
+            low_value = values.get("low")
+            high_value = values.get("high")
+            touched_ema = low_value is not None and float(low_value) <= entry_ema if side is Side.LONG else high_value is not None and float(high_value) >= entry_ema
+            closed_back = close >= entry_ema if side is Side.LONG else close <= entry_ema
+            result["ema_reclaim"] = 1.0 if touched_ema and closed_back else 0.0
+
+        def side_aligned_return(lookback: int) -> float | None:
+            if index < lookback:
+                return None
+            base_value = rows[index - lookback].values.get("close")
+            if base_value is None:
+                return None
+            base = float(base_value)
+            if base <= 0:
+                return None
+            raw = (close - base) / base
+            return raw if side is Side.LONG else -raw
+
+        for lookback in (3, 5):
+            value = side_aligned_return(lookback)
+            if value is not None:
+                result[f"pre_entry_momentum_{lookback}_pct"] = value
+
+        consecutive = 0
+        for right_index in range(index, 0, -1):
+            right = rows[right_index].values.get("close")
+            left = rows[right_index - 1].values.get("close")
+            if right is None or left is None:
+                break
+            moved_with_side = float(right) > float(left) if side is Side.LONG else float(right) < float(left)
+            if not moved_with_side:
+                break
+            consecutive += 1
+        result["pre_entry_consecutive_move"] = float(consecutive)
+
+        if atr and atr > 0 and index >= 3:
+            previous_fast = rows[index - 3].values.get(self.trend_fast_column)
+            if previous_fast is not None and trend_fast is not None:
+                raw_slope = (trend_fast - float(previous_fast)) / atr
+                result["ema_fast_slope_3_atr"] = raw_slope if side is Side.LONG else -raw_slope
+
+        prior_20 = previous[-20:]
+        if prior_20:
+            highs = [float(row.values["high"]) for row in prior_20 if row.values.get("high") is not None]
+            lows = [float(row.values["low"]) for row in prior_20 if row.values.get("low") is not None]
+            closes = [float(row.values["close"]) for row in prior_20 if row.values.get("close") is not None]
+            if highs and lows:
+                local_high = max(highs)
+                local_low = min(lows)
+                range_size = local_high - local_low
+                if range_size > 0:
+                    raw_position = (close - local_low) / range_size
+                    result["local_range_position_20"] = raw_position if side is Side.LONG else 1 - raw_position
+                    if atr and atr > 0:
+                        extreme = local_high if side is Side.LONG else local_low
+                        result["local_extreme_distance_atr"] = abs(close - extreme) / atr
+            if len(closes) >= 2:
+                net_move = abs(closes[-1] - closes[0])
+                gross_move = sum(abs(right - left) for left, right in zip(closes, closes[1:]))
+                if gross_move > 0:
+                    result["range_chop_score_20"] = max(0.0, min(1.0, 1.0 - net_move / gross_move))
+
+        if atr and atr > 0:
+            previous_high = base_features.get("previous_high")
+            previous_low = base_features.get("previous_low")
+            high_value = values.get("high")
+            low_value = values.get("low")
+            if side is Side.LONG and previous_high is not None and high_value is not None and float(high_value) > previous_high:
+                result["breakout_wick_atr"] = max(0.0, float(high_value) - max(close, previous_high)) / atr
+            elif side is Side.SHORT and previous_low is not None and low_value is not None and float(low_value) < previous_low:
+                result["breakout_wick_atr"] = max(0.0, min(close, previous_low) - float(low_value)) / atr
+            else:
+                result["breakout_wick_atr"] = 0.0
+
+        return result
 
     def _build_signal(
         self,
@@ -263,7 +370,7 @@ class EMAPullbackATRStrategy(StrategyDefinition):
             },
         )
 
-    def _filters_allow_signal(self, *, rows, index: int, side: Side) -> bool:
+    def _filters_allow_signal(self, *, rows, index: int, side: Side, feature_values: dict[str, float] | None = None) -> bool:
         if not self.signal_filters:
             return True
         for signal_filter in self.signal_filters:
@@ -280,6 +387,20 @@ class EMAPullbackATRStrategy(StrategyDefinition):
                     return False
             elif filter_type == "adx":
                 if not _adx_allows(rows[index].values, filter_params):
+                    return False
+            elif filter_type == "pre_entry_momentum":
+                if not _pre_entry_momentum_allows(rows=rows, index=index, filter_params=filter_params, side=side):
+                    return False
+            elif filter_type == "consecutive_move":
+                if not _consecutive_move_allows(rows=rows, index=index, filter_params=filter_params, side=side):
+                    return False
+            elif filter_type == "local_range_position":
+                if not _local_range_position_allows(rows=rows, index=index, filter_params=filter_params, side=side):
+                    return False
+            elif filter_type == "entry_context_exclusion":
+                if feature_values is None:
+                    return False
+                if not _entry_context_exclusion_allows(feature_values=feature_values, filter_params=filter_params, side=side):
                     return False
             else:
                 raise ValueError(f"Unsupported signal filter type: {filter_type}")
@@ -399,6 +520,102 @@ def _adx_allows(values: dict[str, object], filter_params: dict[str, object]) -> 
     if max_adx is not None and adx > max_adx:
         return False
     return True
+
+
+def _pre_entry_momentum_allows(*, rows, index: int, filter_params: dict[str, object], side: Side) -> bool:
+    lookback_bars = int(filter_params.get("lookback_bars", 3))
+    min_momentum_pct = _optional_float(filter_params.get("min_momentum_pct"))
+    max_momentum_pct = _optional_float(filter_params.get("max_momentum_pct"))
+    if lookback_bars <= 0:
+        raise ValueError("pre_entry_momentum lookback_bars must be positive")
+    if index < lookback_bars:
+        return False
+    current = rows[index].values.get("close")
+    previous = rows[index - lookback_bars].values.get("close")
+    if current is None or previous is None:
+        return False
+    previous_close = float(previous)
+    if previous_close <= 0:
+        return False
+    raw = (float(current) - previous_close) / previous_close
+    momentum_pct = raw if side is Side.LONG else -raw
+    if min_momentum_pct is not None and momentum_pct < min_momentum_pct:
+        return False
+    if max_momentum_pct is not None and momentum_pct > max_momentum_pct:
+        return False
+    return True
+
+
+def _consecutive_move_allows(*, rows, index: int, filter_params: dict[str, object], side: Side) -> bool:
+    min_consecutive = int(filter_params.get("min_consecutive", 1))
+    if min_consecutive <= 0:
+        return True
+    consecutive = 0
+    for right_index in range(index, 0, -1):
+        right = rows[right_index].values.get("close")
+        left = rows[right_index - 1].values.get("close")
+        if right is None or left is None:
+            break
+        moved_with_side = float(right) > float(left) if side is Side.LONG else float(right) < float(left)
+        if not moved_with_side:
+            break
+        consecutive += 1
+    return consecutive >= min_consecutive
+
+
+def _local_range_position_allows(*, rows, index: int, filter_params: dict[str, object], side: Side) -> bool:
+    lookback_bars = int(filter_params.get("lookback_bars", 20))
+    min_position = _optional_float(filter_params.get("min_position"))
+    max_position = _optional_float(filter_params.get("max_position"))
+    if lookback_bars <= 1:
+        raise ValueError("local_range_position lookback_bars must be greater than 1")
+    start = max(0, index - lookback_bars)
+    history = rows[start:index]
+    if len(history) < max(3, min(lookback_bars, 10)):
+        return False
+    highs = [float(row.values["high"]) for row in history if row.values.get("high") is not None]
+    lows = [float(row.values["low"]) for row in history if row.values.get("low") is not None]
+    close_value = rows[index].values.get("close")
+    if not highs or not lows or close_value is None:
+        return False
+    local_high = max(highs)
+    local_low = min(lows)
+    range_size = local_high - local_low
+    if range_size <= 0:
+        return False
+    raw_position = (float(close_value) - local_low) / range_size
+    position = raw_position if side is Side.LONG else 1 - raw_position
+    if min_position is not None and position < min_position:
+        return False
+    if max_position is not None and position > max_position:
+        return False
+    return True
+
+
+def _entry_context_exclusion_allows(*, feature_values: dict[str, float], filter_params: dict[str, object], side: Side) -> bool:
+    side_param = filter_params.get("side")
+    if side_param is not None and str(side_param) != side.value:
+        return True
+    conditions = filter_params.get("conditions")
+    if not isinstance(conditions, list) or not conditions:
+        raise ValueError("entry_context_exclusion conditions must be a non-empty list")
+    for condition in conditions:
+        if not isinstance(condition, dict):
+            raise ValueError("entry_context_exclusion condition must be an object")
+        field = str(condition.get("field") or "")
+        if not field:
+            raise ValueError("entry_context_exclusion condition.field must not be empty")
+        value = feature_values.get(field)
+        if value is None:
+            return True
+        numeric_value = float(value)
+        min_value = _optional_float(condition.get("min"))
+        max_value = _optional_float(condition.get("max"))
+        if min_value is not None and numeric_value < min_value:
+            return True
+        if max_value is not None and numeric_value >= max_value:
+            return True
+    return False
 
 
 def _optional_float(value: object) -> float | None:

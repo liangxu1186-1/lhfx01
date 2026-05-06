@@ -111,6 +111,52 @@ def test_parameter_experiment_batch_workflow_supports_v2_risk_pct_of_equity(tmp_
     assert batch.search_space_json["risk_pct_per_trade"] == 0.01
 
 
+def test_parameter_experiment_batch_workflow_expands_execution_protection_sets(tmp_path) -> None:
+    dataset_repository = FileDatasetRepository(tmp_path)
+    feature_repository = FileFeatureRepository(tmp_path)
+    run_repository = FileRunRepository(tmp_path)
+    task_repository = FileTaskRepository(tmp_path)
+    experiment_repository = FileParameterExperimentRepository(tmp_path)
+    batch_repository = FileExperimentBatchRepository(tmp_path)
+    snapshots = (_persist_snapshot(dataset_repository, snapshot_id="snapshot-batch-guard-001", timeframe="1h"),)
+
+    result = run_parameter_experiment_batch_workflow(
+        request=ParameterExperimentBatchRequest(
+            batch_id="batch-guard-001",
+            snapshots=snapshots,
+            search_type=SearchType.GRID,
+            fast_periods=(2,),
+            slow_periods=(5,),
+            qty_policy_ref="percent_of_cash",
+            qty=None,
+            cash_allocation_pct=100.0,
+            initial_cash=1000.0,
+            leverage_candidates=(1.0,),
+            fee_rate=0.0,
+            slippage_bps=0.0,
+            min_notional=0.0,
+            execution_protection_sets=(
+                {"protection_set_id": "none", "label": "none", "params": {}},
+                {"protection_set_id": "dd20", "label": "dd20", "params": {"max_equity_drawdown_pct": 0.2}},
+            ),
+        ),
+        task_repository=task_repository,
+        batch_repository=batch_repository,
+        experiment_repository=experiment_repository,
+        dataset_repository=dataset_repository,
+        feature_repository=feature_repository,
+        run_repository=run_repository,
+    )
+
+    assert result.task.status is TaskStatus.SUCCESS
+    assert len(result.run_ids) == 2
+    assert any("-guard-dd20" in run_id for run_id in result.run_ids)
+    guarded_manifest = run_repository.load_manifest(next(run_id for run_id in result.run_ids if "-guard-dd20" in run_id))
+    assert guarded_manifest.resolved_config_json["execution_constraints"]["max_equity_drawdown_pct"] == 0.2
+    batch = batch_repository.load_batch("batch-guard-001")
+    assert batch.search_space_json["execution_protection_sets"][1]["protection_set_id"] == "dd20"
+
+
 def test_parameter_experiment_batch_workflow_rejects_duplicate_snapshots(tmp_path) -> None:
     dataset_repository = FileDatasetRepository(tmp_path)
     feature_repository = FileFeatureRepository(tmp_path)

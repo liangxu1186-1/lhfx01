@@ -340,6 +340,7 @@ export interface ParameterLabRow {
   risk_reward_ratio: number | null;
   parameter_summary: string;
   signal_filter_summary: string | null;
+  execution_protection_summary: string | null;
   qty_policy_ref: string | null;
   cash_allocation_pct: number | null;
   risk_pct_per_trade: number | null;
@@ -574,6 +575,69 @@ export interface TradeAttributionBucket {
   profit_factor: number | null;
   loss_contribution: number;
   big_loss_count: number;
+  is_trade_count: number;
+  is_win_rate: number;
+  is_net_pnl: number;
+  is_avg_return_pct: number;
+  is_profit_factor: number | null;
+  is_loss_contribution: number;
+  is_big_loss_count: number;
+  oos_win_rate: number;
+  oos_net_pnl: number;
+  oos_avg_return_pct: number;
+  oos_profit_factor: number | null;
+  oos_loss_contribution: number;
+  oos_big_loss_count: number;
+  oos_confirms: boolean | null;
+  is_underperforming: boolean;
+  oos_underperforming: boolean | null;
+  is_pf_delta: number | null;
+  oos_pf_delta: number | null;
+  is_avg_return_delta: number;
+  oos_avg_return_delta: number | null;
+  sample_ok: boolean;
+}
+
+export interface StopLossAttributionBucket {
+  dimension: string;
+  bucket_key: string;
+  label: string;
+  is_trade_count: number;
+  is_stop_loss_count: number;
+  is_stop_loss_rate: number;
+  is_stop_loss_rate_delta: number;
+  is_stop_loss_net_pnl: number;
+  is_stop_loss_loss_share: number;
+  is_avg_loss_return_pct: number;
+  oos_trade_count: number;
+  oos_stop_loss_count: number;
+  oos_stop_loss_rate: number;
+  oos_stop_loss_rate_delta: number | null;
+  oos_stop_loss_net_pnl: number;
+  oos_stop_loss_loss_share: number;
+  oos_confirms: boolean | null;
+  bucket_family: string;
+  sample_ok: boolean;
+}
+
+export interface EarlyFailAttributionBucket {
+  dimension: string;
+  bucket_key: string;
+  label: string;
+  is_trade_count: number;
+  is_early_fail_count: number;
+  is_early_fail_rate: number;
+  is_early_fail_rate_delta: number;
+  is_first_bar_adverse_rate: number;
+  is_early_fail_stop_loss_rate: number;
+  oos_trade_count: number;
+  oos_early_fail_count: number;
+  oos_early_fail_rate: number;
+  oos_early_fail_rate_delta: number | null;
+  oos_first_bar_adverse_rate: number;
+  oos_early_fail_stop_loss_rate: number;
+  oos_confirms: boolean | null;
+  bucket_family: string;
   sample_ok: boolean;
 }
 
@@ -605,6 +669,10 @@ export interface TradeAttributionView {
     net_pnl: number;
     profit_factor: number | null;
     feature_meta_coverage: number;
+    early_path_is_trade_count?: number;
+    early_path_oos_trade_count?: number;
+    is_early_fail_rate?: number;
+    oos_early_fail_rate?: number;
     hypothesis_count: number;
     anti_overfit_passed: boolean;
   };
@@ -615,7 +683,9 @@ export interface TradeAttributionView {
     actual: number;
     required: number;
   }>;
-  buckets: TradeAttributionBucket[];
+  buckets?: TradeAttributionBucket[];
+  early_fail_buckets?: EarlyFailAttributionBucket[];
+  stop_loss_buckets?: StopLossAttributionBucket[];
   drawdown_trades: Array<Record<string, unknown>>;
   hypotheses: TradeAttributionHypothesis[];
 }

@@ -517,7 +517,30 @@ def test_workspace_api_research_candidate_filter_experiment_submits_fixed_parame
             f"/api/research-candidates/{quote(research_response['research_candidate_id'], safe='')}/filter-experiments",
             payload={
                 "batch_id": "filter-experiment-api-001",
-                "filter_types": ["adx"],
+                "signal_filter_sets": [
+                    {
+                        "filter_set_id": "local04-exclude-chop-mom3-1-3",
+                        "label": "局部位>=0.4 + 排除震荡MOM3",
+                        "mode": "stacked",
+                        "filters": [
+                            {
+                                "filter_type": "local_range_position",
+                                "enabled": True,
+                                "params": {"lookback_bars": 20, "min_position": 0.4},
+                            },
+                            {
+                                "filter_type": "entry_context_exclusion",
+                                "enabled": True,
+                                "params": {
+                                    "conditions": [
+                                        {"field": "range_chop_score_20", "min": 0.8},
+                                        {"field": "pre_entry_momentum_3_pct", "min": 0.01, "max": 0.03},
+                                    ]
+                                },
+                            },
+                        ],
+                    }
+                ],
             },
             method="POST",
         )

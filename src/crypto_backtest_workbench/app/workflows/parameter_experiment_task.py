@@ -65,6 +65,7 @@ class ParameterExperimentTaskRequest:
     cash_allocation_pct_candidates: tuple[float, ...] = ()
     risk_pct_per_trade_candidates: tuple[float, ...] = ()
     signal_filter_sets: tuple[dict[str, object], ...] = ()
+    execution_protection_sets: tuple[dict[str, object], ...] = ()
     benchmark_enabled: bool = True
     max_samples: int | None = None
     seed: int | None = None
@@ -140,6 +141,7 @@ def run_parameter_experiment_task_workflow(
     child_task_ids: list[str] = []
     failed_child_task_ids: list[str] = []
     for index, params in enumerate(combinations, start=1):
+        protection_params = _execution_protection_params(params.get("execution_protection_set"))
         run_id = _experiment_run_id(
             experiment_id=request.experiment_id,
             index=index,
@@ -172,6 +174,7 @@ def run_parameter_experiment_task_workflow(
                         if params.get("risk_pct_per_trade") is not None
                         else {}
                     ),
+                    **protection_params,
                 ),
                 validation_split=request.validation_split,
                 enable_buy_and_hold_benchmark=request.benchmark_enabled,
@@ -233,6 +236,7 @@ def run_parameter_experiment_task_workflow(
 def _build_parameter_combinations(request: ParameterExperimentTaskRequest) -> list[dict[str, object]]:
     cash_candidates = _cash_allocation_candidates(request) or (None,)
     risk_candidates = _risk_pct_candidates(request) or (None,)
+    protection_sets = request.execution_protection_sets or (None,)
     if request.strategy_name == "ema_pullback_atr_v2":
         filter_sets = request.signal_filter_sets or (None,)
         combinations = [
@@ -248,8 +252,9 @@ def _build_parameter_combinations(request: ParameterExperimentTaskRequest) -> li
                 "cash_allocation_pct": cash_allocation_pct,
                 "risk_pct_per_trade": risk_pct_per_trade,
                 "signal_filter_set": signal_filter_set,
+                "execution_protection_set": execution_protection_set,
             }
-            for trend_fast_period, trend_slow_period, atr_entry_tolerance, atr_stop_mult, risk_reward_ratio, leverage, cash_allocation_pct, risk_pct_per_trade, signal_filter_set in product(
+            for trend_fast_period, trend_slow_period, atr_entry_tolerance, atr_stop_mult, risk_reward_ratio, leverage, cash_allocation_pct, risk_pct_per_trade, signal_filter_set, execution_protection_set in product(
                 request.trend_fast_periods,
                 request.trend_slow_periods,
                 request.atr_entry_tolerances,
@@ -259,6 +264,7 @@ def _build_parameter_combinations(request: ParameterExperimentTaskRequest) -> li
                 cash_candidates,
                 risk_candidates,
                 filter_sets,
+                protection_sets,
             )
         ]
     else:
@@ -269,13 +275,15 @@ def _build_parameter_combinations(request: ParameterExperimentTaskRequest) -> li
                 "leverage": leverage,
                 "cash_allocation_pct": cash_allocation_pct,
                 "risk_pct_per_trade": risk_pct_per_trade,
+                "execution_protection_set": execution_protection_set,
             }
-            for fast_period, slow_period, leverage, cash_allocation_pct, risk_pct_per_trade in product(
+            for fast_period, slow_period, leverage, cash_allocation_pct, risk_pct_per_trade, execution_protection_set in product(
                 request.fast_periods,
                 request.slow_periods,
                 request.leverage_candidates,
                 cash_candidates,
                 risk_candidates,
+                protection_sets,
             )
         ]
     if not combinations:
@@ -449,6 +457,8 @@ def _request_search_space(request: ParameterExperimentTaskRequest) -> dict[str, 
             payload["risk_pct_per_trade_candidates"] = list(_risk_pct_candidates(request))
         if request.signal_filter_sets:
             payload["signal_filter_sets"] = list(request.signal_filter_sets)
+        if request.execution_protection_sets:
+            payload["execution_protection_sets"] = list(request.execution_protection_sets)
         return payload
     payload = {
         "fast_periods": list(request.fast_periods),
@@ -458,6 +468,8 @@ def _request_search_space(request: ParameterExperimentTaskRequest) -> dict[str, 
         payload["cash_allocation_pct_candidates"] = list(_cash_allocation_candidates(request))
     if _risk_pct_candidates(request):
         payload["risk_pct_per_trade_candidates"] = list(_risk_pct_candidates(request))
+    if request.execution_protection_sets:
+        payload["execution_protection_sets"] = list(request.execution_protection_sets)
     return payload
 
 
@@ -515,8 +527,16 @@ def _experiment_run_id(*, experiment_id: str, params: dict[str, object], index: 
             f"-l{_format_leverage_for_id(leverage)}"
             f"{risk_suffix}"
             f"{_filter_suffix(params)}"
+            f"{_protection_suffix(params)}"
         )
-    return f"{experiment_id}-run-{index:03d}-f{int(params['fast_period'])}-s{int(params['slow_period'])}-l{_format_leverage_for_id(leverage)}{risk_suffix}"
+    return (
+        f"{experiment_id}-run-{index:03d}"
+        f"-f{int(params['fast_period'])}"
+        f"-s{int(params['slow_period'])}"
+        f"-l{_format_leverage_for_id(leverage)}"
+        f"{risk_suffix}"
+        f"{_protection_suffix(params)}"
+    )
 
 
 def _risk_suffix(params: dict[str, object]) -> str:
@@ -540,6 +560,42 @@ def _filter_suffix(params: dict[str, object]) -> str:
         return f"-flt-{normalized[:24]}"
     digest = hashlib.sha256(json.dumps(signal_filter_set, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:8]
     return f"-flt-{digest}"
+
+
+def _protection_suffix(params: dict[str, object]) -> str:
+    protection_set = params.get("execution_protection_set")
+    if protection_set is None:
+        return ""
+    if not isinstance(protection_set, dict):
+        return "-guard-invalid"
+    label = str(protection_set.get("label") or protection_set.get("protection_set_id") or "").strip()
+    if label:
+        normalized = "".join(char if char.isalnum() else "-" for char in label.lower()).strip("-")
+        return f"-guard-{normalized[:24]}"
+    digest = hashlib.sha256(json.dumps(protection_set, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:8]
+    return f"-guard-{digest}"
+
+
+def _execution_protection_params(value: object) -> dict[str, object]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("execution_protection_set must be an object")
+    params = value.get("params")
+    if params is None:
+        params = value
+    if not isinstance(params, dict):
+        raise ValueError("execution_protection_set.params must be an object")
+    payload: dict[str, object] = {}
+    if params.get("max_equity_drawdown_pct") is not None:
+        payload["max_equity_drawdown_pct"] = float(params["max_equity_drawdown_pct"])
+    if params.get("cooldown_after_consecutive_stop_losses") is not None:
+        payload["cooldown_after_consecutive_stop_losses"] = int(params["cooldown_after_consecutive_stop_losses"])
+    if params.get("cooldown_bars") is not None:
+        payload["cooldown_bars"] = int(params["cooldown_bars"])
+    if params.get("cooldown_only_short_holding_bars") is not None:
+        payload["cooldown_only_short_holding_bars"] = int(params["cooldown_only_short_holding_bars"])
+    return payload
 
 
 def _format_leverage_for_id(value: float) -> str:

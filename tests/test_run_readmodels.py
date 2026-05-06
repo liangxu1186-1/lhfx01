@@ -19,12 +19,14 @@ from crypto_backtest_workbench.app.readmodels import (
     load_run_detail_view,
 )
 from crypto_backtest_workbench.app.readmodels.runs import _parameter_summary
+from crypto_backtest_workbench.app.readmodels.trade_attribution import _build_early_fail_buckets, _trade_features
 from crypto_backtest_workbench.domain.models import (
     CanonicalCandle,
     MarketType,
     Side,
     SignalAction,
     SignalIntent,
+    TradeRecord,
     ValidationSplit,
     ValidationTargetType,
 )
@@ -167,7 +169,108 @@ def test_trade_attribution_builds_candidate_buckets_and_checks(tmp_path) -> None
     assert attribution["summary"]["trade_count"] == 2
     assert attribution["summary"]["feature_meta_coverage"] == 1.0
     assert any(bucket["dimension"] == "side" for bucket in attribution["buckets"])
+    side_bucket = next(bucket for bucket in attribution["buckets"] if bucket["dimension"] == "side")
+    assert side_bucket["is_trade_count"] == 2
+    assert side_bucket["is_loss_contribution"] == side_bucket["loss_contribution"]
+    assert side_bucket["oos_trade_count"] == 0
+    assert side_bucket["oos_confirms"] is None
     assert any(check["key"] == "total_trade_sample" for check in attribution["anti_overfit_checks"])
+
+
+def test_early_fail_attribution_uses_entry_visible_dimensions_only() -> None:
+    rows: list[dict[str, object]] = []
+    for index in range(30):
+        rows.append(_early_fail_row(index=index, segment="is", trend_gap_atr=0.25, early_fail=True))
+    for index in range(30, 40):
+        rows.append(_early_fail_row(index=index, segment="is", trend_gap_atr=1.5, early_fail=False))
+    for index in range(40, 50):
+        rows.append(_early_fail_row(index=index, segment="oos", trend_gap_atr=0.25, early_fail=True))
+    for index in range(50, 52):
+        rows.append(_early_fail_row(index=index, segment="oos", trend_gap_atr=1.5, early_fail=False))
+
+    buckets = [bucket.as_dict() for bucket in _build_early_fail_buckets(rows)]
+
+    dimensions = {str(bucket["dimension"]) for bucket in buckets}
+    assert "trend_gap_atr" in dimensions
+    assert "path_first_bar_adverse" not in dimensions
+    assert "path_no_favorable_3" not in dimensions
+    trend_bucket = next(bucket for bucket in buckets if bucket["dimension"] == "trend_gap_atr" and bucket["bucket_key"] == "lt_0_5")
+    assert trend_bucket["is_early_fail_count"] == 30
+    assert trend_bucket["is_early_fail_rate"] == 1.0
+    assert trend_bucket["oos_confirms"] is True
+    assert trend_bucket["bucket_family"] == "single"
+    combo_bucket = next(bucket for bucket in buckets if bucket["dimension"] == "趋势+回踩" and bucket["bucket_key"] == "lt_0_5|lt_0_5")
+    assert combo_bucket["bucket_family"] == "combo"
+    assert combo_bucket["is_early_fail_count"] == 30
+    assert combo_bucket["oos_confirms"] is True
+
+
+def test_trade_attribution_adds_entry_context_features_before_path() -> None:
+    candles = _build_candles([100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 104.5, 106.0])
+    entry_candle = candles[-1]
+    trade = TradeRecord(
+        trade_id="trade-context",
+        run_id="run-context",
+        symbol="BTC/USDT:USDT",
+        side=Side.LONG,
+        entry_time=entry_candle.timestamp,
+        entry_price=entry_candle.close,
+        exit_time=entry_candle.timestamp,
+        exit_price=entry_candle.close,
+        qty=1.0,
+        planned_stop_loss_price=104.0,
+        planned_take_profit_price=110.0,
+        entry_signal_meta_json={
+            "feature_values": {
+                "trend_fast_ema": 104.5,
+                "trend_slow_ema": 103.0,
+                "entry_ema": 105.0,
+                "atr": 2.0,
+                "close": 106.0,
+                "high": 107.0,
+                "low": 104.8,
+                "previous_high": 105.5,
+                "previous_low": 103.5,
+            }
+        },
+    )
+
+    features = _trade_features(trade, candles=candles)
+
+    assert features["pre_entry_momentum_3_pct"] > 0
+    assert features["pre_entry_consecutive_move"] >= 1
+    assert 0 <= features["local_range_position_20"] <= 1
+    assert features["ema_reclaim"] == 1.0
+    assert features["ema_reclaim_strength_atr"] > 0
+    assert features["breakout_wick_atr"] > 0
+    assert 0 <= features["volatility_percentile_100"] <= 1
+
+
+def _early_fail_row(*, index: int, segment: str, trend_gap_atr: float, early_fail: bool) -> dict[str, object]:
+    return {
+        "run_id": "run-early",
+        "trade_id": f"trade-{index}",
+        "symbol": "BTC/USDT:USDT",
+        "side": "long",
+        "entry_time": datetime(2024, 1, 1, tzinfo=UTC).isoformat(),
+        "exit_time": datetime(2024, 1, 1, 1, tzinfo=UTC).isoformat(),
+        "exit_reason": "stop_loss_intrabar" if early_fail else "take_profit_intrabar",
+        "net_pnl": -10.0 if early_fail else 10.0,
+        "return_pct": -0.01 if early_fail else 0.01,
+        "holding_bars": 2,
+        "segment": segment,
+        "labels": ["loser"] if early_fail else ["winner"],
+        "features": {
+            "stop_distance_pct": 0.02,
+            "reward_risk_ratio": 2.0,
+            "atr_pct": 0.01,
+            "trend_gap_atr": trend_gap_atr,
+            "entry_distance_atr": 0.4,
+            "breakout_distance_atr": 0.6,
+            "path_first_bar_adverse": 1.0 if early_fail else 0.0,
+            "path_no_favorable_3": 1.0 if early_fail else 0.0,
+        },
+    }
 
 
 def _build_single_run_result(*, run_id: str):

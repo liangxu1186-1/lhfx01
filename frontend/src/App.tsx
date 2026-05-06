@@ -78,6 +78,8 @@ import type {
   ParameterLabRow,
   ResearchCandidateFilterResults,
   FilterResultGroup,
+  EarlyFailAttributionBucket,
+  StopLossAttributionBucket,
   TradeAttributionBucket,
   TradeAttributionView,
   ResearchCandidateView,
@@ -120,6 +122,53 @@ interface ResearchRunCandidate {
   reason: string;
 }
 
+interface RunDrawdownWindow {
+  peakIndex: number;
+  troughIndex: number;
+  peakTime: string;
+  troughTime: string;
+  peakEquity: number;
+  troughEquity: number;
+  maxDrawdown: number;
+  drawdownAmount: number;
+  recoveryTime: string | null;
+  recoveryBars: number | null;
+}
+
+interface RunDrawdownAttributionBucket {
+  dimension: string;
+  bucket_key: string;
+  label: string;
+  trade_count: number;
+  loss_count: number;
+  net_pnl: number;
+  loss_pnl: number;
+  loss_share: number;
+  avg_return_pct: number;
+  stop_loss_count: number;
+  stop_loss_rate: number;
+  early_exit_count: number;
+}
+
+interface RunEntryFeatureAttributionBucket {
+  dimension: string;
+  bucket_key: string;
+  label: string;
+  drawdown_trade_count: number;
+  drawdown_loss_count: number;
+  drawdown_loss_rate: number;
+  drawdown_loss_pnl: number;
+  drawdown_loss_share: number;
+  drawdown_avg_return_pct: number;
+  baseline_trade_count: number;
+  baseline_loss_rate: number | null;
+  baseline_avg_return_pct: number | null;
+  loss_rate_delta: number | null;
+  avg_return_delta: number | null;
+  sample_ok: boolean;
+  judgement: 'candidate' | 'weak' | 'baseline_missing' | 'not_issue';
+}
+
 interface RiskMatrixProgress {
   batchId: string;
   status: string;
@@ -134,7 +183,144 @@ interface FilterExperimentProgress {
   plannedRunCount: number;
 }
 
-type FilterExperimentMode = 'single' | 'stacked';
+type FilterExperimentProfile = 'early_fail_proxy' | 'general';
+
+interface DrawdownProtectionComparisonRow {
+  protection: string;
+  run_id: string;
+  total_return: number;
+  oos_total_return: number | null;
+  max_drawdown: number;
+  profit_factor: number | null;
+  trade_count: number;
+  oos_trade_count: number | null;
+  oos_delta: number | null;
+  drawdown_delta: number | null;
+  profit_factor_delta: number | null;
+  trade_retention: number | null;
+  verdict: 'baseline' | 'improved' | 'mixed' | 'worse';
+}
+
+const EARLY_FAIL_PROXY_FILTER_TYPES = [
+  'early_fail_proxy_core',
+] as const;
+
+const EARLY_FAIL_PROXY_SIGNAL_FILTER_SETS = [
+  ...[-0.005, 0, 0.005, 0.01].map((threshold) => ({
+    filter_set_id: `pre-mom3-gte-${String(threshold).replace('-', 'neg-').replace('.', 'p')}`,
+    label: `MOM3>=${formatPct(threshold)}`,
+    mode: 'single',
+    filters: [{
+      filter_type: 'pre_entry_momentum',
+      enabled: true,
+      params: { lookback_bars: 3, min_momentum_pct: threshold },
+    }],
+  })),
+  ...[0.4, 0.5, 0.6, 0.7].map((threshold) => ({
+    filter_set_id: `local-position-gte-${String(threshold).replace('.', 'p')}`,
+    label: `局部位>=${formatNumber(threshold, 1)}`,
+    mode: 'single',
+    filters: [{
+      filter_type: 'local_range_position',
+      enabled: true,
+      params: { lookback_bars: 20, min_position: threshold },
+    }],
+  })),
+  {
+    filter_set_id: 'local04-exclude-chop-mom3-1-3',
+    label: '局部位>=0.4 + 排除震荡MOM3',
+    mode: 'stacked',
+    filters: [
+      {
+        filter_type: 'local_range_position',
+        enabled: true,
+        params: { lookback_bars: 20, min_position: 0.4 },
+      },
+      {
+        filter_type: 'entry_context_exclusion',
+        enabled: true,
+        params: {
+          conditions: [
+            { field: 'range_chop_score_20', min: 0.8 },
+            { field: 'pre_entry_momentum_3_pct', min: 0.01, max: 0.03 },
+          ],
+        },
+      },
+    ],
+  },
+  {
+    filter_set_id: 'local04-exclude-chop-trendgap',
+    label: '局部位>=0.4 + 排除震荡趋势间距',
+    mode: 'stacked',
+    filters: [
+      {
+        filter_type: 'local_range_position',
+        enabled: true,
+        params: { lookback_bars: 20, min_position: 0.4 },
+      },
+      {
+        filter_type: 'entry_context_exclusion',
+        enabled: true,
+        params: {
+          conditions: [
+            { field: 'range_chop_score_20', min: 0.8 },
+            { field: 'trend_gap_atr', min: 0.5, max: 2 },
+          ],
+        },
+      },
+    ],
+  },
+  {
+    filter_set_id: 'local04-exclude-mom3-entrydist',
+    label: '局部位>=0.4 + 排除MOM3回踩',
+    mode: 'stacked',
+    filters: [
+      {
+        filter_type: 'local_range_position',
+        enabled: true,
+        params: { lookback_bars: 20, min_position: 0.4 },
+      },
+      {
+        filter_type: 'entry_context_exclusion',
+        enabled: true,
+        params: {
+          conditions: [
+            { field: 'pre_entry_momentum_3_pct', min: 0.01, max: 0.03 },
+            { field: 'entry_distance_atr', min: 0.5, max: 1 },
+          ],
+        },
+      },
+    ],
+  },
+  {
+    filter_set_id: 'early-fail-proxy-core',
+    label: 'MOM3>=0 + 连续>=1 + 局部位>=0.5',
+    mode: 'stacked',
+    filters: [
+      {
+        filter_type: 'pre_entry_momentum',
+        enabled: true,
+        params: { lookback_bars: 3, min_momentum_pct: 0 },
+      },
+      {
+        filter_type: 'consecutive_move',
+        enabled: true,
+        params: { min_consecutive: 1 },
+      },
+      {
+        filter_type: 'local_range_position',
+        enabled: true,
+        params: { lookback_bars: 20, min_position: 0.5 },
+      },
+    ],
+  },
+];
+
+const GENERAL_FILTER_TYPES = [
+  'higher_timeframe_trend',
+  'atr_percentile',
+  'adx',
+] as const;
 
 type ResearchConclusionBucketKey = 'primary' | 'robust' | 'aggressive' | 'risk_reduction' | 'excluded';
 
@@ -225,7 +411,21 @@ const TAB_OPTIONS = [
 const ALL_EXPERIMENTS = '__all__';
 const ALL_BATCHES = '__all_batches__';
 const SCREENING_VIEW_STATE_STORAGE_KEY = 'cbw.screening.view.v1';
+const RUN_DETAIL_READMODEL_VERSION = 'entry-feature-backfill-20260505-3';
 const makeParameterBatchId = () => `batch-${dayjs().format('YYYYMMDDHHmmssSSS')}`;
+function stableStringHash(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+const safeBatchKeyPart = (value: string) => {
+  const normalized = value.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'run';
+  return `${normalized.slice(0, 64)}-${stableStringHash(value)}`;
+};
 const TREND_PERIOD_LADDER = [2, 3, 5, 8, 13, 21, 34, 55, 89];
 const RESEARCH_LABEL_OPTIONS = [
   { label: '基准', value: 'baseline' },
@@ -546,6 +746,742 @@ function formatSignedNumber(value: number | null | undefined, digits = 2): strin
   }
   const sign = value > 0 ? '+' : '';
   return `${sign}${formatNumber(value, digits)}`;
+}
+
+function findRunMaxDrawdownWindow(equityRows: RunAnalysisView['equity_rows']): RunDrawdownWindow | null {
+  if (equityRows.length < 2) {
+    return null;
+  }
+  let peakIndex = 0;
+  let peakEquity = equityRows[0].strategy_equity;
+  let best: RunDrawdownWindow | null = null;
+  for (let index = 1; index < equityRows.length; index += 1) {
+    const equity = equityRows[index].strategy_equity;
+    if (equity > peakEquity) {
+      peakEquity = equity;
+      peakIndex = index;
+      continue;
+    }
+    if (peakEquity <= 0) {
+      continue;
+    }
+    const drawdown = (peakEquity - equity) / peakEquity;
+    if (!best || drawdown > best.maxDrawdown) {
+      best = {
+        peakIndex,
+        troughIndex: index,
+        peakTime: equityRows[peakIndex].timestamp,
+        troughTime: equityRows[index].timestamp,
+        peakEquity,
+        troughEquity: equity,
+        maxDrawdown: drawdown,
+        drawdownAmount: peakEquity - equity,
+        recoveryTime: null,
+        recoveryBars: null,
+      };
+    }
+  }
+  if (!best) {
+    return null;
+  }
+  const recoveryIndex = equityRows.findIndex((row, index) => index > best.troughIndex && row.strategy_equity >= best.peakEquity);
+  return {
+    ...best,
+    recoveryTime: recoveryIndex >= 0 ? equityRows[recoveryIndex].timestamp : null,
+    recoveryBars: recoveryIndex >= 0 ? recoveryIndex - best.troughIndex : null,
+  };
+}
+
+function recordFromUnknown(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== 'string') {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function finiteNumberFromUnknown(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function numericTradeMeta(trade: RunAnalysisView['trade_rows'][number], key: string): number | null {
+  const rowValue = finiteNumberFromUnknown((trade as unknown as Record<string, unknown>)[key]);
+  if (rowValue !== null) {
+    return rowValue;
+  }
+  const meta = recordFromUnknown(trade.entry_signal_meta_json);
+  const directValue = finiteNumberFromUnknown(meta?.[key]);
+  if (directValue !== null) {
+    return directValue;
+  }
+  const nestedFeatures = recordFromUnknown(meta?.feature_values);
+  return finiteNumberFromUnknown(nestedFeatures?.[key]);
+}
+
+function bucketNumber(value: number | null, buckets: Array<[number, string, string]>, fallback = '未知'): { key: string; label: string } {
+  if (value === null) {
+    return { key: 'unknown', label: fallback };
+  }
+  for (const [limit, key, label] of buckets) {
+    if (value < limit) {
+      return { key, label };
+    }
+  }
+  const last = buckets[buckets.length - 1];
+  return { key: `gte_${last?.[0] ?? 0}`, label: `>= ${last?.[0] ?? 0}` };
+}
+
+function runDrawdownBucketForTrade(trade: RunAnalysisView['trade_rows'][number], dimension: string): { key: string; label: string } {
+  if (dimension === 'side') {
+    return { key: trade.side, label: trade.side === 'long' ? '多头' : trade.side === 'short' ? '空头' : trade.side };
+  }
+  if (dimension === 'exit_reason') {
+    return { key: trade.exit_reason || 'open', label: tradeAttributionBucketLabel({ dimension: 'exit_reason', label: trade.exit_reason || 'open' }) };
+  }
+  if (dimension === 'holding_bars') {
+    if (trade.holding_bars <= 3) {
+      return { key: 'le_3', label: '<= 3 根' };
+    }
+    if (trade.holding_bars <= 12) {
+      return { key: '4_12', label: '4-12 根' };
+    }
+    return { key: 'gt_12', label: '> 12 根' };
+  }
+  if (dimension === 'pre_entry_momentum_3_pct' || dimension === 'pre_entry_momentum_5_pct') {
+    const value = numericTradeMeta(trade, dimension);
+    if (value === null) {
+      return { key: 'unknown', label: '未知' };
+    }
+    if (value < -0.01) {
+      return { key: 'lt_neg_1', label: '< -1%' };
+    }
+    if (value < 0) {
+      return { key: 'neg_1_0', label: '-1%-0%' };
+    }
+    if (value < 0.01) {
+      return { key: '0_1', label: '0%-1%' };
+    }
+    if (value < 0.03) {
+      return { key: '1_3', label: '1%-3%' };
+    }
+    return { key: 'gte_3', label: '>= 3%' };
+  }
+  if (dimension === 'pre_entry_consecutive_move') {
+    const value = numericTradeMeta(trade, dimension);
+    if (value === null) {
+      return { key: 'unknown', label: '未知' };
+    }
+    if (value <= 0) {
+      return { key: 'none', label: '连续顺向 0' };
+    }
+    if (value <= 2) {
+      return { key: '1_2', label: '连续顺向 1-2' };
+    }
+    if (value <= 4) {
+      return { key: '3_4', label: '连续顺向 3-4' };
+    }
+    return { key: 'gte_5', label: '连续顺向 >= 5' };
+  }
+  if (dimension === 'local_range_position_20') {
+    const value = numericTradeMeta(trade, dimension);
+    return bucketNumber(value, [
+      [0.4, 'lt_0_4', '< 0.4'],
+      [0.6, '0_4_0_6', '0.4-0.6'],
+      [0.8, '0_6_0_8', '0.6-0.8'],
+    ], '未知');
+  }
+  if (dimension === 'trend_gap_atr') {
+    const value = numericTradeMeta(trade, dimension);
+    return bucketNumber(value, [
+      [0.5, 'lt_0_5', '< 0.5'],
+      [1, '0_5_1', '0.5-1'],
+      [2, '1_2', '1-2'],
+    ], '未知');
+  }
+  if (dimension === 'entry_distance_atr') {
+    const value = numericTradeMeta(trade, dimension);
+    return bucketNumber(value, [
+      [0.25, 'lt_0_25', '< 0.25'],
+      [0.5, '0_25_0_5', '0.25-0.5'],
+      [1, '0_5_1', '0.5-1'],
+    ], '未知');
+  }
+  if (dimension === 'breakout_wick_atr' || dimension === 'range_chop_score_20') {
+    const value = numericTradeMeta(trade, dimension);
+    return bucketNumber(value, [
+      [0.2, 'lt_0_2', '< 0.2'],
+      [0.5, '0_2_0_5', '0.2-0.5'],
+      [0.8, '0_5_0_8', '0.5-0.8'],
+    ], '未知');
+  }
+  if (dimension === 'ema_fast_slope_3_atr') {
+    const value = numericTradeMeta(trade, dimension);
+    return bucketNumber(value, [
+      [-0.25, 'lt_neg_0_25', '< -0.25'],
+      [0, 'neg_0_25_0', '-0.25-0'],
+      [0.25, '0_0_25', '0-0.25'],
+      [0.75, '0_25_0_75', '0.25-0.75'],
+    ], '未知');
+  }
+  if (dimension === 'path_no_favorable_3') {
+    const value = numericTradeMeta(trade, dimension);
+    if (value === null) {
+      return { key: 'unknown', label: '未知' };
+    }
+    return value >= 0.5 ? { key: 'yes', label: '前三根无浮盈' } : { key: 'no', label: '前三根有浮盈' };
+  }
+  return { key: 'unknown', label: '未知' };
+}
+
+function buildRunDrawdownAttributionBuckets(trades: RunAnalysisView['trade_rows'], dimensions: string[]): RunDrawdownAttributionBucket[] {
+  const totalLoss = trades.reduce((sum, trade) => sum + (trade.net_pnl < 0 ? Math.abs(trade.net_pnl) : 0), 0);
+  const groups = new Map<string, RunDrawdownAttributionBucket>();
+  for (const trade of trades) {
+    for (const dimension of dimensions) {
+      const bucket = runDrawdownBucketForTrade(trade, dimension);
+      const groupKey = `${dimension}:${bucket.key}`;
+      const current = groups.get(groupKey) ?? {
+        dimension,
+        bucket_key: bucket.key,
+        label: bucket.label,
+        trade_count: 0,
+        loss_count: 0,
+        net_pnl: 0,
+        loss_pnl: 0,
+        loss_share: 0,
+        avg_return_pct: 0,
+        stop_loss_count: 0,
+        stop_loss_rate: 0,
+        early_exit_count: 0,
+      };
+      current.trade_count += 1;
+      current.net_pnl += trade.net_pnl;
+      current.avg_return_pct += trade.return_pct;
+      if (trade.net_pnl < 0) {
+        current.loss_count += 1;
+        current.loss_pnl += Math.abs(trade.net_pnl);
+      }
+      if (trade.exit_reason === 'stop_loss_intrabar') {
+        current.stop_loss_count += 1;
+      }
+      if (trade.holding_bars <= 3) {
+        current.early_exit_count += 1;
+      }
+      groups.set(groupKey, current);
+    }
+  }
+  return Array.from(groups.values())
+    .map((bucket) => ({
+      ...bucket,
+      avg_return_pct: bucket.trade_count ? bucket.avg_return_pct / bucket.trade_count : 0,
+      loss_share: totalLoss > 0 ? bucket.loss_pnl / totalLoss : 0,
+      stop_loss_rate: bucket.trade_count ? bucket.stop_loss_count / bucket.trade_count : 0,
+    }))
+    .filter((bucket) => bucket.loss_pnl > 0)
+    .sort((left, right) => right.loss_share - left.loss_share || right.loss_pnl - left.loss_pnl);
+}
+
+function buildRunEntryFeatureAttributionBuckets(
+  drawdownTrades: RunAnalysisView['trade_rows'],
+  baselineTrades: RunAnalysisView['trade_rows'],
+  dimensions: string[],
+): RunEntryFeatureAttributionBucket[] {
+  const totalDrawdownLoss = drawdownTrades.reduce((sum, trade) => sum + (trade.net_pnl < 0 ? Math.abs(trade.net_pnl) : 0), 0);
+  const rows: RunEntryFeatureAttributionBucket[] = [];
+
+  for (const dimension of dimensions) {
+    const drawdownGroups = new Map<string, { key: string; label: string; trades: RunAnalysisView['trade_rows'] }>();
+    const baselineGroups = new Map<string, { key: string; label: string; trades: RunAnalysisView['trade_rows'] }>();
+
+    for (const trade of drawdownTrades) {
+      const bucket = runDrawdownBucketForTrade(trade, dimension);
+      const current = drawdownGroups.get(bucket.key) ?? { key: bucket.key, label: bucket.label, trades: [] };
+      current.trades.push(trade);
+      drawdownGroups.set(bucket.key, current);
+    }
+    for (const trade of baselineTrades) {
+      const bucket = runDrawdownBucketForTrade(trade, dimension);
+      const current = baselineGroups.get(bucket.key) ?? { key: bucket.key, label: bucket.label, trades: [] };
+      current.trades.push(trade);
+      baselineGroups.set(bucket.key, current);
+    }
+
+    for (const group of drawdownGroups.values()) {
+      if (group.key === 'unknown') {
+        continue;
+      }
+      const drawdownTradeCount = group.trades.length;
+      const drawdownLossTrades = group.trades.filter((trade) => trade.net_pnl < 0);
+      const drawdownLossPnl = drawdownLossTrades.reduce((sum, trade) => sum + Math.abs(trade.net_pnl), 0);
+      if (drawdownLossPnl <= 0) {
+        continue;
+      }
+      const baseline = baselineGroups.get(group.key);
+      const baselineTradeCount = baseline?.trades.length ?? 0;
+      const baselineLossTrades = baseline?.trades.filter((trade) => trade.net_pnl < 0) ?? [];
+      const drawdownAvgReturn = group.trades.reduce((sum, trade) => sum + trade.return_pct, 0) / drawdownTradeCount;
+      const baselineAvgReturn = baselineTradeCount
+        ? baseline!.trades.reduce((sum, trade) => sum + trade.return_pct, 0) / baselineTradeCount
+        : null;
+      const drawdownLossRate = drawdownLossTrades.length / drawdownTradeCount;
+      const baselineLossRate = baselineTradeCount ? baselineLossTrades.length / baselineTradeCount : null;
+      const lossRateDelta = baselineLossRate === null ? null : drawdownLossRate - baselineLossRate;
+      const avgReturnDelta = baselineAvgReturn === null ? null : drawdownAvgReturn - baselineAvgReturn;
+      const drawdownLossShare = totalDrawdownLoss > 0 ? drawdownLossPnl / totalDrawdownLoss : 0;
+      const sample_ok = drawdownTradeCount >= 5 && baselineTradeCount >= 20;
+      const judgement: RunEntryFeatureAttributionBucket['judgement'] = baselineTradeCount === 0
+        ? 'baseline_missing'
+        : sample_ok && drawdownLossShare >= 0.15 && (lossRateDelta ?? 0) >= 0.15 && (avgReturnDelta ?? 0) < 0
+          ? 'candidate'
+          : drawdownLossShare >= 0.1 && ((lossRateDelta ?? 0) > 0.05 || (avgReturnDelta ?? 0) < 0)
+            ? 'weak'
+            : 'not_issue';
+
+      rows.push({
+        dimension,
+        bucket_key: group.key,
+        label: group.label,
+        drawdown_trade_count: drawdownTradeCount,
+        drawdown_loss_count: drawdownLossTrades.length,
+        drawdown_loss_rate: drawdownLossRate,
+        drawdown_loss_pnl: drawdownLossPnl,
+        drawdown_loss_share: drawdownLossShare,
+        drawdown_avg_return_pct: drawdownAvgReturn,
+        baseline_trade_count: baselineTradeCount,
+        baseline_loss_rate: baselineLossRate,
+        baseline_avg_return_pct: baselineAvgReturn,
+        loss_rate_delta: lossRateDelta,
+        avg_return_delta: avgReturnDelta,
+        sample_ok,
+        judgement,
+      });
+    }
+  }
+
+  return rows.sort((left, right) => {
+    const judgementRank = (value: RunEntryFeatureAttributionBucket['judgement']) => (
+      value === 'candidate' ? 3 : value === 'weak' ? 2 : value === 'baseline_missing' ? 1 : 0
+    );
+    return judgementRank(right.judgement) - judgementRank(left.judgement)
+      || right.drawdown_loss_share - left.drawdown_loss_share
+      || right.drawdown_loss_pnl - left.drawdown_loss_pnl;
+  });
+}
+
+function runEntryFeatureJudgement(bucket: RunEntryFeatureAttributionBucket): { text: string; color: string } {
+  if (bucket.judgement === 'candidate') {
+    return { text: '候选', color: 'red' };
+  }
+  if (bucket.judgement === 'weak') {
+    return { text: '弱线索', color: 'orange' };
+  }
+  if (bucket.judgement === 'baseline_missing') {
+    return { text: '缺基线', color: 'default' };
+  }
+  return { text: '一般', color: 'blue' };
+}
+
+function buildRunEntryFeatureConclusion(
+  buckets: RunEntryFeatureAttributionBucket[],
+): { type: 'warning' | 'info' | 'success'; message: string; description: string } {
+  const candidates = buckets.filter((bucket) => bucket.judgement === 'candidate');
+  if (candidates.length) {
+    const top = candidates[0];
+    return {
+      type: 'warning',
+      message: `${tradeAttributionDimensionLabel(top.dimension)} ${top.label} 是优先验证的入场前回撤代理`,
+      description: `最大回撤段亏损占比 ${formatPct(top.drawdown_loss_share)}，亏损率比非回撤段高 ${formatSignedPct(top.loss_rate_delta)}，均收益差 ${formatSignedPct(top.avg_return_delta)}。下一步适合把它转成过滤实验，而不是继续调 DD 停开。`,
+    };
+  }
+  const weak = buckets.filter((bucket) => bucket.judgement === 'weak');
+  if (weak.length) {
+    const top = weak[0];
+    return {
+      type: 'info',
+      message: `${tradeAttributionDimensionLabel(top.dimension)} ${top.label} 有弱线索，但还不足以直接做规则`,
+      description: `它贡献了 ${formatPct(top.drawdown_loss_share)} 的回撤段亏损；但样本或相对非回撤段差异不够强，建议结合第二个特征做组合拆解。`,
+    };
+  }
+  return {
+    type: 'success',
+    message: '当前回撤段没有被单一入场前特征稳定解释',
+    description: '这通常说明需要补充更贴近行情状态的特征，或用两个特征组合拆解，例如动量+局部位置、波动+趋势间距。',
+  };
+}
+
+const TRADE_ATTRIBUTION_DIMENSION_LABELS: Record<string, string> = {
+  side: '方向',
+  exit_reason: '退出结果',
+  segment: '样本段',
+  holding_bars: '持仓时长',
+  stop_distance_pct: '止损距离',
+  take_profit_distance_pct: '止盈距离',
+  reward_risk_ratio: '盈亏比',
+  atr_pct: '波动率',
+  trend_gap_pct: '趋势间距',
+  trend_gap_atr: '趋势间距',
+  entry_distance_atr: '回踩贴近度',
+  breakout_distance_atr: '突破力度',
+  pre_entry_momentum_3_pct: '入场前3根动量',
+  pre_entry_momentum_5_pct: '入场前5根动量',
+  pre_entry_consecutive_move: '连续顺向',
+  local_range_position_20: '20根局部位置',
+  local_extreme_distance_atr: '局部极值距离',
+  ema_reclaim: 'EMA收回',
+  ema_reclaim_strength_atr: 'EMA收回力度',
+  ema_fast_slope_3_atr: '快线斜率',
+  range_chop_score_20: '震荡程度',
+  breakout_wick_atr: '突破影线压力',
+  volatility_percentile_100: '波动分位',
+  '趋势+回踩': '趋势+回踩',
+  '趋势+突破': '趋势+突破',
+  '波动+回踩': '波动+回踩',
+  '方向+趋势': '方向+趋势',
+  '动量+回踩': '动量+回踩',
+  '局部位置+突破': '局部位置+突破',
+  '波动分位+趋势': '波动分位+趋势',
+  'EMA收回+突破': 'EMA收回+突破',
+  path_mfe_3_stop_r: '前三根浮盈',
+  path_mae_1_stop_r: '首根反向幅度',
+  path_mae_3_stop_r: '前三根反向幅度',
+  path_first_bar_adverse: '首根路径',
+  path_no_favorable_3: '前三根路径',
+};
+
+const TRADE_ATTRIBUTION_DIMENSION_HELP: Record<string, string> = {
+  side: '入场前已知，可比较多空两侧是否质量差异明显。',
+  exit_reason: '交易结束后的结果，只能解释亏损来源，不能直接当入场过滤条件。',
+  segment: '样本切分标签，主要用于检查 IS/OOS 覆盖。',
+  holding_bars: '交易结束后才知道的持仓长度，只能辅助解释，不能直接过滤入场。',
+  stop_distance_pct: '止损距离占价格比例，来自入场时的风险结构。',
+  take_profit_distance_pct: '止盈距离占价格比例，来自入场时的目标空间。',
+  reward_risk_ratio: '止盈距离与止损距离的比例，来自入场时的收益风险结构。',
+  atr_pct: '入场时 ATR 占价格比例，反映当时波动环境。',
+  trend_gap_pct: '入场前快慢趋势线拉开的距离，占价格比例。',
+  trend_gap_atr: '入场前快慢趋势线拉开的距离，以 ATR 为单位；不是止损倍数。',
+  entry_distance_atr: '回踩点距离入场 EMA 的距离，以 ATR 为单位。',
+  breakout_distance_atr: '价格突破前高/前低的幅度，以 ATR 为单位。',
+  pre_entry_momentum_3_pct: '入场前 3 根 K 的顺交易方向涨跌幅；数值越高表示越追顺向拉伸。',
+  pre_entry_momentum_5_pct: '入场前 5 根 K 的顺交易方向涨跌幅，用来观察入场前是否已经消耗过多。',
+  pre_entry_consecutive_move: '入场前连续顺交易方向收盘的根数。',
+  local_range_position_20: '入场价在前 20 根局部区间里的顺向位置；越高越接近多头前高或空头前低。',
+  local_extreme_distance_atr: '入场价距离前 20 根顺向局部高/低点的距离，以 ATR 为单位。',
+  ema_reclaim: '信号 K 是否触及入场 EMA 后又按交易方向收回。',
+  ema_reclaim_strength_atr: '信号 K 收盘相对入场 EMA 的顺向距离，以 ATR 为单位。',
+  ema_fast_slope_3_atr: '入场前快 EMA 最近 3 根的顺交易方向斜率，以 ATR 为单位。',
+  range_chop_score_20: '前 20 根总振幅相对首尾净位移的比值归一化；越高越接近震荡消耗。',
+  breakout_wick_atr: '突破前高/前低后留下的反向影线压力，以 ATR 为单位。',
+  volatility_percentile_100: '当前 ATR 相对前 100 根波动范围的分位，反映波动环境是否极端。',
+  '趋势+回踩': '入场前趋势间距与回踩贴近度的组合。',
+  '趋势+突破': '入场前趋势间距与突破力度的组合。',
+  '波动+回踩': '入场前波动水平与回踩贴近度的组合。',
+  '方向+趋势': '交易方向与入场前趋势间距的组合。',
+  '动量+回踩': '入场前顺向拉伸与回踩贴近度的组合。',
+  '局部位置+突破': '20 根局部位置与突破影线压力的组合。',
+  '波动分位+趋势': '波动分位与趋势间距的组合。',
+  'EMA收回+突破': 'EMA 收回状态与突破影线压力的组合。',
+  path_mfe_3_stop_r: '入场后前三根 K 的最大浮盈，按止损距离 R 计。',
+  path_mae_1_stop_r: '入场后第一根 K 的最大反向幅度，按止损距离 R 计。',
+  path_mae_3_stop_r: '入场后前三根 K 的最大反向幅度，按止损距离 R 计。',
+  path_first_bar_adverse: '入场后第一根 K 是否反向大于顺向。',
+  path_no_favorable_3: '入场后三根 K 是否基本没有给出浮盈空间。',
+};
+
+const TRADE_ATTRIBUTION_ACTIONABLE_DIMENSIONS = new Set([
+  'side',
+  'atr_pct',
+  'trend_gap_pct',
+  'trend_gap_atr',
+  'entry_distance_atr',
+  'breakout_distance_atr',
+  'pre_entry_momentum_3_pct',
+  'pre_entry_momentum_5_pct',
+  'pre_entry_consecutive_move',
+  'local_range_position_20',
+  'local_extreme_distance_atr',
+  'ema_reclaim',
+  'ema_reclaim_strength_atr',
+  'ema_fast_slope_3_atr',
+  'range_chop_score_20',
+  'breakout_wick_atr',
+  'volatility_percentile_100',
+  '趋势+回踩',
+  '趋势+突破',
+  '波动+回踩',
+  '方向+趋势',
+  '动量+回踩',
+  '局部位置+突破',
+  '波动分位+趋势',
+  'EMA收回+突破',
+]);
+
+const TRADE_ATTRIBUTION_RESULT_DIMENSIONS = new Set(['exit_reason', 'segment', 'holding_bars']);
+
+type TradeAttributionLabelLike = {
+  dimension: string;
+  label: string;
+};
+
+function tradeAttributionDimensionLabel(value: string): string {
+  return TRADE_ATTRIBUTION_DIMENSION_LABELS[value] ?? value;
+}
+
+function tradeAttributionDimensionHelp(value: string): string {
+  return TRADE_ATTRIBUTION_DIMENSION_HELP[value] ?? '归因分桶字段。';
+}
+
+function tradeAttributionBucketLabel(bucket: TradeAttributionLabelLike): string {
+  const raw = bucket.label.replace(`${bucket.dimension} `, '');
+  if (bucket.dimension === 'side') {
+    return raw === 'long' ? '多头' : raw === 'short' ? '空头' : raw;
+  }
+  if (bucket.dimension === 'exit_reason') {
+    const labels: Record<string, string> = {
+      stop_loss_intrabar: '触发止损',
+      take_profit_intrabar: '触发止盈',
+      open: '未平仓',
+    };
+    return labels[raw] ?? raw;
+  }
+  if (bucket.dimension === 'segment') {
+    return raw.toUpperCase();
+  }
+  if (bucket.dimension === 'holding_bars') {
+    return raw.replace('holding <= 3', '<= 3 根').replace('holding 4-12', '4-12 根').replace('holding > 12', '> 12 根');
+  }
+  if (bucket.dimension.includes('+')) {
+    return raw
+      .replace(/long/g, '多头')
+      .replace(/short/g, '空头')
+      .replace(/path_first_bar_adverse /g, '')
+      .replace(/path_no_favorable_3 /g, '');
+  }
+  if (bucket.dimension.startsWith('path_')) {
+    return raw.replace(`${bucket.dimension} `, '');
+  }
+  if (bucket.dimension.endsWith('_atr')) {
+    return `${raw} ATR`;
+  }
+  return raw;
+}
+
+function earlyFailAttributionJudgement(bucket: EarlyFailAttributionBucket): { text: string; color: string } {
+  if (!bucket.sample_ok) {
+    return { text: '样本不足', color: 'default' };
+  }
+  if (bucket.oos_trade_count > 0 && bucket.oos_trade_count < 10) {
+    return { text: 'OOS不足', color: 'orange' };
+  }
+  if (bucket.oos_confirms === true) {
+    return { text: 'OOS复现', color: 'red' };
+  }
+  if (bucket.is_early_fail_rate_delta >= 0.05) {
+    return { text: 'IS高早败', color: 'red' };
+  }
+  if (bucket.oos_confirms === false) {
+    return { text: 'OOS未复现', color: 'default' };
+  }
+  if (bucket.is_early_fail_rate_delta <= -0.03) {
+    return { text: '低早败', color: 'green' };
+  }
+  return { text: '接近总体', color: 'blue' };
+}
+
+function earlyFailAttributionScore(bucket: EarlyFailAttributionBucket): number {
+  return (bucket.sample_ok ? 100 : 0)
+    + (bucket.oos_confirms ? 50 : 0)
+    + Math.max(0, bucket.is_early_fail_rate_delta) * 120
+    + bucket.is_early_fail_count
+    + bucket.is_early_fail_stop_loss_rate * 20;
+}
+
+function buildEarlyFailAttributionConclusion(buckets: EarlyFailAttributionBucket[]): { type: 'warning' | 'info' | 'success'; message: string; description: string } {
+  if (!buckets.length) {
+    return {
+      type: 'info',
+      message: '没有达到复验门槛的早期失败入场前共性',
+      description: '强信号为空时，下方会展示可用的弱线索；这些线索只能说明方向，不适合直接转过滤规则。',
+    };
+  }
+  const confirmed = buckets.filter((bucket) => bucket.oos_confirms === true);
+  if (confirmed.length) {
+    const top = confirmed[0];
+    return {
+      type: 'warning',
+      message: `${tradeAttributionDimensionLabel(top.dimension)} ${tradeAttributionBucketLabel(top)} 更容易出现早期失败`,
+      description: `IS 早败率高于总体 ${formatSignedPct(top.is_early_fail_rate_delta)}，早败后止损率 ${formatPct(top.is_early_fail_stop_loss_rate)}；OOS 同桶早败率也高于总体 ${formatSignedPct(top.oos_early_fail_rate_delta)}。这是过滤实验候选，不是直接交易规则。`,
+    };
+  }
+  const top = buckets[0];
+  if (top.is_early_fail_rate_delta >= 0.05) {
+    return {
+      type: 'info',
+      message: `${tradeAttributionDimensionLabel(top.dimension)} ${tradeAttributionBucketLabel(top)} 在 IS 中早败偏高，但 OOS 暂未确认`,
+      description: `IS ${top.is_trade_count} 笔中 ${top.is_early_fail_count} 笔早败，早败率高于总体 ${formatSignedPct(top.is_early_fail_rate_delta)}。需要 OOS 或跨候选复验后才能转成过滤实验。`,
+    };
+  }
+  return {
+    type: 'success',
+    message: '没有稳定复现的早期失败入场前代理特征',
+    description: '当前早期失败没有被入场前分桶稳定解释；下方弱线索可用于判断是否需要补充特征或继续做组合拆解。',
+  };
+}
+
+function tradeAttributionBucketTagColor(bucket: TradeAttributionBucket): string {
+  if (!bucket.sample_ok) {
+    return 'default';
+  }
+  if (bucket.is_underperforming) {
+    return 'red';
+  }
+  if (!bucket.is_underperforming && bucket.is_avg_return_delta >= 0 && (bucket.is_profit_factor ?? 0) >= 1) {
+    return 'green';
+  }
+  return 'blue';
+}
+
+function tradeAttributionBucketIssueScore(bucket: TradeAttributionBucket): number {
+  const pfDeltaPenalty = bucket.is_pf_delta === null ? 0 : Math.max(0, -bucket.is_pf_delta) * 20;
+  const returnPenalty = Math.max(0, -bucket.is_avg_return_delta) * 1000;
+  const netPenalty = bucket.is_net_pnl < 0 ? 10 : 0;
+  return (bucket.is_underperforming ? 100 : 0) + (bucket.oos_confirms ? 50 : 0) + pfDeltaPenalty + returnPenalty + netPenalty;
+}
+
+function tradeAttributionBucketJudgement(bucket: TradeAttributionBucket): { text: string; color: string } {
+  if (!bucket.sample_ok) {
+    return { text: '样本不足', color: 'default' };
+  }
+  if (TRADE_ATTRIBUTION_RESULT_DIMENSIONS.has(bucket.dimension)) {
+    return { text: '解释结果', color: 'orange' };
+  }
+  if (bucket.oos_confirms === true) {
+    return { text: 'OOS复现', color: 'red' };
+  }
+  if (bucket.is_underperforming) {
+    return { text: 'IS变差', color: 'red' };
+  }
+  if (bucket.oos_confirms === false) {
+    return { text: 'OOS未复现', color: 'default' };
+  }
+  if (!bucket.is_underperforming && bucket.is_avg_return_delta >= 0 && (bucket.is_profit_factor ?? 0) >= 1) {
+    return { text: '相对健康', color: 'green' };
+  }
+  return { text: '观察', color: 'blue' };
+}
+
+function stopLossAttributionJudgement(bucket: StopLossAttributionBucket): { text: string; color: string } {
+  if (!bucket.sample_ok) {
+    return { text: '样本不足', color: 'default' };
+  }
+  if (bucket.oos_confirms === true) {
+    return { text: 'OOS复现', color: 'red' };
+  }
+  if (bucket.is_stop_loss_rate_delta >= 0.05) {
+    return { text: 'IS高止损', color: 'red' };
+  }
+  if (bucket.oos_confirms === false) {
+    return { text: 'OOS未复现', color: 'default' };
+  }
+  if (bucket.is_stop_loss_rate_delta <= -0.03) {
+    return { text: '低止损', color: 'green' };
+  }
+  return { text: '接近总体', color: 'blue' };
+}
+
+function stopLossAttributionScore(bucket: StopLossAttributionBucket): number {
+  return (bucket.sample_ok ? 100 : 0)
+    + (bucket.oos_confirms ? 50 : 0)
+    + bucket.is_stop_loss_loss_share * 200
+    + Math.max(0, bucket.is_stop_loss_rate_delta) * 100
+    + bucket.is_stop_loss_count;
+}
+
+function buildStopLossAttributionConclusion(buckets: StopLossAttributionBucket[]): { type: 'warning' | 'info' | 'success'; message: string; description: string } {
+  if (!buckets.length) {
+    return {
+      type: 'info',
+      message: '没有找到足够样本的止损亏损拆解',
+      description: '当前可用入场特征不足，或止损样本没有形成稳定分桶。',
+    };
+  }
+  const confirmed = buckets.filter((bucket) => bucket.oos_confirms === true);
+  if (confirmed.length) {
+    const top = confirmed[0];
+    return {
+      type: 'warning',
+      message: `${tradeAttributionDimensionLabel(top.dimension)} ${tradeAttributionBucketLabel(top as unknown as TradeAttributionBucket)} 是优先复验的止损原因`,
+      description: `IS 止损亏损 ${formatNumber(top.is_stop_loss_net_pnl, 2)}，占 IS 止损亏损 ${formatPct(top.is_stop_loss_loss_share)}，止损率高于总体 ${formatSignedPct(top.is_stop_loss_rate_delta)}；OOS 同桶止损率也高于总体 ${formatSignedPct(top.oos_stop_loss_rate_delta)}。`,
+    };
+  }
+  const top = buckets[0];
+  if (top.is_stop_loss_loss_share >= 0.1) {
+    return {
+      type: 'info',
+      message: `IS 止损亏损主要集中在 ${tradeAttributionDimensionLabel(top.dimension)} ${tradeAttributionBucketLabel(top as unknown as TradeAttributionBucket)}，但 OOS 暂未确认`,
+      description: `这说明它是 IS 里的亏损来源之一：IS 止损亏损 ${formatNumber(top.is_stop_loss_net_pnl, 2)}，占比 ${formatPct(top.is_stop_loss_loss_share)}。如果 OOS高于总体没有同步为正，不能直接按这个桶改规则。`,
+    };
+  }
+  return {
+    type: 'success',
+    message: '没有稳定复现的止损原因',
+    description: '当前止损亏损没有被某个入场前特征稳定解释。更可能是策略常态止损、可用特征不够，或原因需要用组合特征/行情阶段继续拆解。',
+  };
+}
+
+function isPrimaryTradeAttributionBucket(bucket: TradeAttributionBucket, totalTradeCount: number): boolean {
+  if (!bucket.sample_ok || !TRADE_ATTRIBUTION_ACTIONABLE_DIMENSIONS.has(bucket.dimension)) {
+    return false;
+  }
+  if (totalTradeCount > 0 && bucket.trade_count / totalTradeCount > 0.95) {
+    return false;
+  }
+  return bucket.is_trade_count >= 30 && (bucket.is_underperforming || bucket.oos_confirms !== null);
+}
+
+function isPrimaryStopLossAttributionBucket(bucket: StopLossAttributionBucket): boolean {
+  return bucket.sample_ok
+    && bucket.is_trade_count >= 30
+    && (bucket.is_stop_loss_rate_delta >= 0.03 || bucket.is_stop_loss_loss_share >= 0.1);
+}
+
+function isPathStopLossAttributionBucket(bucket: StopLossAttributionBucket): boolean {
+  return bucket.sample_ok
+    && bucket.is_trade_count >= 20
+    && (bucket.bucket_family === 'combo' || bucket.dimension.startsWith('path_'))
+    && (bucket.is_stop_loss_rate_delta >= 0.03 || bucket.is_stop_loss_loss_share >= 0.08);
+}
+
+function isPrimaryEarlyFailAttributionBucket(bucket: EarlyFailAttributionBucket): boolean {
+  return bucket.sample_ok
+    && bucket.is_trade_count >= 30
+    && TRADE_ATTRIBUTION_ACTIONABLE_DIMENSIONS.has(bucket.dimension)
+    && (
+      bucket.oos_confirms === true
+      || bucket.bucket_family === 'combo'
+      || bucket.is_early_fail_rate_delta >= 0.05
+    );
+}
+
+function isFallbackEarlyFailAttributionBucket(bucket: EarlyFailAttributionBucket): boolean {
+  return bucket.sample_ok
+    && bucket.is_trade_count >= 30
+    && TRADE_ATTRIBUTION_ACTIONABLE_DIMENSIONS.has(bucket.dimension);
 }
 
 function compactStrategyName(value: string): string {
@@ -1161,6 +2097,53 @@ function buildLocalResearchCandidateFilterResults(
   };
 }
 
+function protectionSummaryLabel(row: ParameterLabRow): string {
+  return row.execution_protection_summary || '无保护';
+}
+
+function buildDrawdownProtectionComparisonRows(rows: ParameterLabRow[]): DrawdownProtectionComparisonRow[] {
+  if (!rows.length) {
+    return [];
+  }
+  const baseline = rows.find((row) => !row.execution_protection_summary || row.execution_protection_summary === '无保护') ?? rows[0];
+  return rows.map((row) => {
+    const oosDelta = row.oos_total_return !== null && baseline.oos_total_return !== null
+      ? row.oos_total_return - baseline.oos_total_return
+      : null;
+    const drawdownDelta = row.max_drawdown - baseline.max_drawdown;
+    const profitFactorDelta = row.profit_factor !== null && baseline.profit_factor !== null
+      ? row.profit_factor - baseline.profit_factor
+      : null;
+    const tradeRetention = baseline.trade_count > 0 ? row.trade_count / baseline.trade_count : null;
+    const isBaseline = row.run_id === baseline.run_id;
+    const drawdownImproved = drawdownDelta < -0.005;
+    const oosNotDamaged = oosDelta === null || oosDelta >= -0.02;
+    const pfNotDamaged = profitFactorDelta === null || profitFactorDelta >= -0.03;
+    const verdict: DrawdownProtectionComparisonRow['verdict'] = isBaseline
+      ? 'baseline'
+      : drawdownImproved && oosNotDamaged && pfNotDamaged
+        ? 'improved'
+        : drawdownDelta > 0.005 || (oosDelta !== null && oosDelta < -0.1)
+          ? 'worse'
+          : 'mixed';
+    return {
+      protection: protectionSummaryLabel(row),
+      run_id: row.run_id,
+      total_return: row.total_return,
+      oos_total_return: row.oos_total_return,
+      max_drawdown: row.max_drawdown,
+      profit_factor: row.profit_factor,
+      trade_count: row.trade_count,
+      oos_trade_count: row.oos_trade_count,
+      oos_delta: isBaseline ? null : oosDelta,
+      drawdown_delta: isBaseline ? null : drawdownDelta,
+      profit_factor_delta: isBaseline ? null : profitFactorDelta,
+      trade_retention: isBaseline ? 1 : tradeRetention,
+      verdict,
+    };
+  });
+}
+
 function scoreResearchRun(row: ParameterLabRow): ResearchRunCandidate {
   const gap = runIsoosGap(row);
   const oosReturn = row.oos_total_return ?? row.total_return;
@@ -1263,6 +2246,56 @@ function parsePositiveNumberList(value: unknown): number[] {
     .split(',')
     .map((entry) => Number.parseFloat(entry.trim()))
     .filter((entry) => Number.isFinite(entry) && entry > 0);
+}
+
+function firstPolicyNumber(value: unknown): number | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const firstValue = Object.values(value as Record<string, unknown>)[0];
+  const numeric = Number(firstValue);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function numericConfigValue(value: unknown, fallback: number): number {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function drawdownProtectionSets(): Array<Record<string, unknown>> {
+  return [
+    { protection_set_id: 'none', label: '无保护', params: {} },
+    { protection_set_id: 'dd-stop-20', label: 'DD停开20%', params: { max_equity_drawdown_pct: 0.2 } },
+    { protection_set_id: 'dd-stop-30', label: 'DD停开30%', params: { max_equity_drawdown_pct: 0.3 } },
+    {
+      protection_set_id: 'cooldown-2-24',
+      label: '2短止冷却24K',
+      params: {
+        cooldown_after_consecutive_stop_losses: 2,
+        cooldown_bars: 24,
+        cooldown_only_short_holding_bars: 3,
+      },
+    },
+    {
+      protection_set_id: 'cooldown-3-72',
+      label: '3短止冷却72K',
+      params: {
+        cooldown_after_consecutive_stop_losses: 3,
+        cooldown_bars: 72,
+        cooldown_only_short_holding_bars: 3,
+      },
+    },
+    {
+      protection_set_id: 'dd20-cooldown-2-24',
+      label: 'DD20%+2止24K',
+      params: {
+        max_equity_drawdown_pct: 0.2,
+        cooldown_after_consecutive_stop_losses: 2,
+        cooldown_bars: 24,
+        cooldown_only_short_holding_bars: 3,
+      },
+    },
+  ];
 }
 
 function uniqueSortedNumbers(values: number[]): number[] {
@@ -1629,7 +2662,6 @@ function WorkspaceShell() {
   const [selectedExperimentId, setSelectedExperimentId] = useState(ALL_EXPERIMENTS);
   const [selectedExperimentDetail, setSelectedExperimentDetail] = useState<ParameterExperimentDetail | null>(null);
   const [selectedRun, setSelectedRun] = useState<RunAnalysisView | null>(null);
-  const [runDetailCache, setRunDetailCache] = useState<Record<string, RunAnalysisView>>({});
   const [error, setError] = useState<string | null>(null);
   const [shellLoading, setShellLoading] = useState(true);
   const [sectionLoading, setSectionLoading] = useState(false);
@@ -1645,6 +2677,9 @@ function WorkspaceShell() {
   const [lastActionResult, setLastActionResult] = useState('');
   const [submitting, setSubmitting] = useState<'ingest' | 'run' | 'experiment' | null>(null);
   const [neighborhoodRunId, setNeighborhoodRunId] = useState<string | null>(null);
+  const [drawdownProtectionRunId, setDrawdownProtectionRunId] = useState<string | null>(null);
+  const [drawdownProtectionCandidateId, setDrawdownProtectionCandidateId] = useState<string | null>(null);
+  const [drawdownProtectionProgressByCandidateId, setDrawdownProtectionProgressByCandidateId] = useState<Record<string, FilterExperimentProgress>>({});
   const [riskMatrixCandidateId, setRiskMatrixCandidateId] = useState<string | null>(null);
   const [riskMatrixProgressByCandidateId, setRiskMatrixProgressByCandidateId] = useState<Record<string, RiskMatrixProgress>>({});
   const [filterExperimentCandidateId, setFilterExperimentCandidateId] = useState<string | null>(null);
@@ -1684,7 +2719,6 @@ function WorkspaceShell() {
     setSelectedExperimentId(ALL_EXPERIMENTS);
     setSelectedExperimentDetail(null);
     setSelectedRun(null);
-    setRunDetailCache({});
   }
 
   async function refreshShell() {
@@ -1787,9 +2821,11 @@ function WorkspaceShell() {
       return;
     }
     if (!runs.some((entry) => entry.run_id === selectedRunId)) {
-      setSelectedRunId(runs[0].run_id);
+      const runIds = new Set(runs.map((entry) => entry.run_id));
+      const comparedRunId = compareRunIds.find((runId) => runIds.has(runId));
+      setSelectedRunId(comparedRunId ?? runs[0].run_id);
     }
-  }, [runs, selectedRunId]);
+  }, [compareRunIds, runs, selectedRunId]);
 
   useEffect(() => {
     if (!runs.length) {
@@ -1861,15 +2897,6 @@ function WorkspaceShell() {
             setSelectedRun(null);
             return;
           }
-          const cachedRun = runDetailCache[selectedRunId];
-          if (cachedRun) {
-            setSelectedRun(cachedRun);
-            setError(null);
-            return;
-          }
-          if (selectedRun?.run_id === selectedRunId) {
-            return;
-          }
           setSectionLoading(true);
           const payload = await loadRunDetail(selectedRunId);
           if (cancelled) {
@@ -1877,7 +2904,6 @@ function WorkspaceShell() {
           }
           applyPayloadMeta(payload);
           setSelectedRun(payload.run);
-          setRunDetailCache((current) => ({ ...current, [payload.run.run_id]: payload.run }));
           setError(null);
           return;
         }
@@ -1931,7 +2957,7 @@ function WorkspaceShell() {
     return () => {
       cancelled = true;
     };
-  }, [activeTab, overview, parameterExperimentBatches.length, parameterResearch, parameterExperiments.length, runDetailCache, selectedRun, selectedRunId]);
+  }, [activeTab, overview, parameterExperimentBatches.length, parameterResearch, parameterExperiments.length, selectedRunId, RUN_DETAIL_READMODEL_VERSION]);
 
   useEffect(() => {
     if (activeTab !== 'overview' || overview === null) {
@@ -2463,6 +3489,169 @@ function WorkspaceShell() {
     }
   }
 
+  async function handleRunDrawdownProtectionExperiment(run: RunAnalysisView, progressKey?: string) {
+    const trackingKey = progressKey ?? run.run_id;
+    setDrawdownProtectionRunId(run.run_id);
+    setDrawdownProtectionCandidateId(trackingKey);
+    try {
+      const strategyParams = (run.manifest.resolved_config_json.strategy_params ?? {}) as Record<string, unknown>;
+      const executionConstraints = (run.manifest.resolved_config_json.execution_constraints ?? {}) as Record<string, unknown>;
+      const strategyName = String(strategyParams.strategy_name ?? run.strategy_name);
+      const qtyPolicyRef = String(strategyParams.qty_policy_ref ?? 'risk_pct_of_equity');
+      const batchId = `drawdown-guard-${safeBatchKeyPart(trackingKey)}-${dayjs().format('YYYYMMDDHHmmssSSS')}`;
+      const experimentPayload: Record<string, unknown> = {
+        batch_id: batchId,
+        snapshot_ids: [run.dataset_snapshot_id],
+        strategy_name: strategyName,
+        strategy_version: strategyName === 'ema_pullback_atr_v2' ? 'v2' : 'v1',
+        search_type: 'grid',
+        leverage_candidates: [numericConfigValue(executionConstraints.leverage, 1)],
+        qty_policy_ref: qtyPolicyRef,
+        initial_cash: numericConfigValue(executionConstraints.initial_cash, run.metrics.initial_equity || 10000),
+        fee_rate: numericConfigValue(executionConstraints.fee_rate, 0),
+        slippage_bps: numericConfigValue(executionConstraints.slippage_bps, 0),
+        min_notional: numericConfigValue(executionConstraints.min_notional, 0),
+        benchmark: 'buy_and_hold',
+        validation_split_mode: 'auto_ratio',
+        oos_ratio: 0.3,
+        warmup_bars: 0,
+        execution_protection_sets: drawdownProtectionSets(),
+      };
+      if (usesRiskPct(qtyPolicyRef)) {
+        experimentPayload.risk_pct_per_trade = firstPolicyNumber(executionConstraints.risk_pct_per_trade_by_policy) ?? Number(strategyParams.risk_pct_per_trade ?? 0.01);
+      }
+      if (usesCashAllocation(qtyPolicyRef)) {
+        experimentPayload.cash_allocation_pct = firstPolicyNumber(executionConstraints.cash_allocation_pct_by_policy) ?? Number(strategyParams.cash_allocation_pct ?? 95);
+      }
+      if (strategyName === 'ema_pullback_atr_v2') {
+        const trendFast = Number(strategyParams.trend_fast_period);
+        const trendSlow = Number(strategyParams.trend_slow_period);
+        if (!Number.isFinite(trendFast) || !Number.isFinite(trendSlow)) {
+          throw new Error('当前 Run 缺少 EMA Pullback ATR v2 趋势周期参数，不能发起回撤保护实验');
+        }
+        Object.assign(experimentPayload, {
+          trend_fast_periods: [trendFast],
+          trend_slow_periods: [trendSlow],
+          atr_entry_tolerances: [numericConfigValue(strategyParams.atr_entry_tolerance, 1)],
+          atr_stop_mults: [numericConfigValue(strategyParams.atr_stop_mult, 1.5)],
+          risk_reward_ratios: [numericConfigValue(strategyParams.risk_reward_ratio, 1.5)],
+          entry_ema_period: numericConfigValue(strategyParams.entry_ema_period, 21),
+          atr_period: numericConfigValue(strategyParams.atr_period, 14),
+          min_atr_pct_of_price: numericConfigValue(strategyParams.min_atr_pct_of_price, 0.002),
+          min_stop_pct: numericConfigValue(strategyParams.min_stop_pct, 0.003),
+        });
+      } else {
+        const fastPeriod = Number(strategyParams.fast_period);
+        const slowPeriod = Number(strategyParams.slow_period);
+        if (!Number.isFinite(fastPeriod) || !Number.isFinite(slowPeriod)) {
+          throw new Error('当前 Run 缺少 EMA 交叉周期参数，不能发起回撤保护实验');
+        }
+        Object.assign(experimentPayload, {
+          fast_periods: [fastPeriod],
+          slow_periods: [slowPeriod],
+        });
+      }
+
+      const result = await postParameterExperimentBatch(experimentPayload);
+      const createdBatchId = String(result.batch_id ?? batchId);
+      const plannedRunCount = Number(result.planned_run_count ?? drawdownProtectionSets().length);
+      setDrawdownProtectionProgressByCandidateId((current) => ({
+        ...current,
+        [trackingKey]: {
+          batchId: createdBatchId,
+          status: 'pending',
+          runCount: 0,
+          plannedRunCount,
+        },
+      }));
+      const summaryText = `回撤保护实验已提交：${createdBatchId}${plannedRunCount ? `（${plannedRunCount} 个 run）` : ''}`;
+      setLastActionResult(summaryText);
+      message.success(`${summaryText}，完成后自动跳到参数结果`);
+      let latestBatch: ParameterExperimentBatchSummary | undefined;
+      const deadline = Date.now() + 180_000;
+      while (Date.now() < deadline) {
+        const batchPayload = await loadParameterExperimentBatches();
+        applyPayloadMeta(batchPayload);
+        setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
+        latestBatch = batchPayload.parameter_experiment_batches.find((batch) => batch.batch_id === createdBatchId);
+        if (latestBatch) {
+          setDrawdownProtectionProgressByCandidateId((current) => ({
+            ...current,
+            [trackingKey]: {
+              batchId: createdBatchId,
+              status: latestBatch?.status ?? 'pending',
+              runCount: Number(latestBatch?.run_count ?? 0),
+              plannedRunCount: Number(latestBatch?.planned_run_count ?? plannedRunCount),
+            },
+          }));
+        }
+        if (latestBatch?.status === 'success' || latestBatch?.status === 'failed') {
+          break;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 1500));
+      }
+      const [batchPayload, experimentsPayload, parameterPayload] = await Promise.all([
+        loadParameterExperimentBatches(),
+        loadParameterExperiments(),
+        loadParameters(),
+      ]);
+      applyPayloadMeta(batchPayload);
+      setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
+      setParameterExperiments(experimentsPayload.parameter_experiments);
+      setParameterLab(parameterPayload.parameter_lab);
+      setSelectedBatchId(createdBatchId || ALL_BATCHES);
+      setSelectedBatchDetail(null);
+      setSelectedExperimentId(ALL_EXPERIMENTS);
+      setSelectedExperimentDetail(null);
+      setActiveTab('parameters');
+      setError(null);
+      latestBatch = batchPayload.parameter_experiment_batches.find((batch) => batch.batch_id === createdBatchId) ?? latestBatch;
+      const finalStatus = latestBatch?.status ?? 'unknown';
+      setDrawdownProtectionProgressByCandidateId((current) => ({
+        ...current,
+        [trackingKey]: {
+          batchId: createdBatchId,
+          status: finalStatus,
+          runCount: Number(latestBatch?.run_count ?? 0),
+          plannedRunCount: Number(latestBatch?.planned_run_count ?? plannedRunCount),
+        },
+      }));
+      if (latestBatch?.status === 'success') {
+        message.success(`回撤保护实验已完成：${createdBatchId}`);
+      } else if (latestBatch?.status === 'failed') {
+        message.error(`回撤保护实验失败：${createdBatchId}`);
+      } else {
+        message.info(`回撤保护实验仍在后台运行：${createdBatchId}，稍后刷新会更新结果`);
+      }
+    } catch (submitError: unknown) {
+      const text = submitError instanceof Error ? submitError.message : '回撤保护实验提交失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setDrawdownProtectionRunId(null);
+      setDrawdownProtectionCandidateId(null);
+    }
+  }
+
+  async function handleParameterRowDrawdownProtectionExperiment(rowOrRunId: ParameterLabRow | string, progressKey?: string) {
+    const runId = typeof rowOrRunId === 'string' ? rowOrRunId : rowOrRunId.run_id;
+    const trackingKey = progressKey ?? runId;
+    setDrawdownProtectionRunId(runId);
+    setDrawdownProtectionCandidateId(trackingKey);
+    try {
+      const payload = await loadRunDetail(runId);
+      applyPayloadMeta(payload);
+      await handleRunDrawdownProtectionExperiment(payload.run, trackingKey);
+    } catch (loadError: unknown) {
+      const text = loadError instanceof Error ? loadError.message : '回撤保护实验提交失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setDrawdownProtectionRunId(null);
+      setDrawdownProtectionCandidateId(null);
+    }
+  }
+
   async function handleRunRiskMatrix(candidate: ResearchCandidateView) {
     setRiskMatrixCandidateId(candidate.candidate_id);
     try {
@@ -2553,15 +3742,22 @@ function WorkspaceShell() {
     }
   }
 
-  async function handleRunFilterExperiment(candidate: ResearchCandidateView, mode: FilterExperimentMode = 'single') {
+  async function handleRunFilterExperiment(candidate: ResearchCandidateView, profile: FilterExperimentProfile = 'early_fail_proxy') {
     setFilterExperimentCandidateId(candidate.candidate_id);
     try {
-      const result = await postResearchCandidateFilterExperiment(candidate.candidate_id, {
+      const filterTypes = profile === 'early_fail_proxy' ? EARLY_FAIL_PROXY_FILTER_TYPES : GENERAL_FILTER_TYPES;
+      const mode = profile === 'early_fail_proxy' ? 'single' : 'stacked';
+      const payload: Record<string, unknown> = {
         mode,
-        filter_types: ['higher_timeframe_trend', 'atr_percentile', 'adx'],
         oos_ratio: 0.3,
         warmup_bars: 0,
-      });
+      };
+      if (profile === 'early_fail_proxy') {
+        payload.signal_filter_sets = EARLY_FAIL_PROXY_SIGNAL_FILTER_SETS;
+      } else {
+        payload.filter_types = [...filterTypes];
+      }
+      const result = await postResearchCandidateFilterExperiment(candidate.candidate_id, payload);
       const createdBatchId = String(result.batch_id ?? '');
       const plannedRunCount = Number(result.planned_run_count ?? 0);
       setFilterExperimentProgressByCandidateId((current) => ({
@@ -2573,7 +3769,7 @@ function WorkspaceShell() {
           plannedRunCount,
         },
       }));
-      const modeLabel = mode === 'stacked' ? '叠加过滤实验' : '单指标过滤实验';
+      const modeLabel = profile === 'early_fail_proxy' ? '早败代理过滤实验' : '通用过滤实验';
       const summaryText = `${modeLabel}已提交：${createdBatchId}${plannedRunCount ? `（${plannedRunCount} 个 run）` : ''}，完成后会自动刷新`;
       setLastActionResult(summaryText);
       message.success(summaryText);
@@ -2628,7 +3824,9 @@ function WorkspaceShell() {
         },
       }));
       if (finalStatus === 'success') {
-        message.success(`过滤器实验已完成：${createdBatchId}，可在批次明细或初筛池查看过滤后 run`);
+        setFilterResults(null);
+        setFilterResultsCandidateId(candidate.candidate_id);
+        message.success(`过滤器实验已完成：${createdBatchId}，正在打开过滤结果对比`);
       } else if (finalStatus === 'failed') {
         message.error(`过滤器实验失败：${createdBatchId}`);
       } else {
@@ -2909,7 +4107,6 @@ function WorkspaceShell() {
     const payload = await loadRunDetail(runId);
     applyPayloadMeta(payload);
     setSelectedRun(payload.run);
-    setRunDetailCache((current) => ({ ...current, [payload.run.run_id]: payload.run }));
   }
 
   async function handleDeleteResearchNote(note: ResearchNote) {
@@ -2925,7 +4122,6 @@ function WorkspaceShell() {
         const payload = await loadRunDetail(note.target_id);
         applyPayloadMeta(payload);
         setSelectedRun(payload.run);
-        setRunDetailCache((current) => ({ ...current, [payload.run.run_id]: payload.run }));
       }
       await refreshResearchWorkflow();
       setLastActionResult(`研究备注已删除：${note.note_id}`);
@@ -3071,6 +4267,7 @@ function WorkspaceShell() {
               runs={runs}
               selectedRun={selectedRun}
               selectedRunId={selectedRunId}
+              setSelectedRun={setSelectedRun}
               setSelectedRunId={setSelectedRunId}
               deletingRunId={deletingRunId}
               onDeleteRun={handleDeleteRun}
@@ -3078,6 +4275,8 @@ function WorkspaceShell() {
               onDeleteResearchNote={handleDeleteResearchNote}
               savingResearchNote={savingResearchNote}
               deletingResearchNoteId={deletingResearchNoteId}
+              onRunDrawdownProtectionExperiment={handleRunDrawdownProtectionExperiment}
+              drawdownProtectionRunId={drawdownProtectionRunId}
             />
           )}
           {activeTab === 'parameters' && (parameterResearch || parameterLab) && (
@@ -3111,8 +4310,12 @@ function WorkspaceShell() {
               neighborhoodRunId={neighborhoodRunId}
               onSubmitExperiment={handleSubmitParameterExperiment}
               onRunTrendNeighborhood={handleRunTrendNeighborhood}
+              onRunDrawdownProtectionExperiment={handleParameterRowDrawdownProtectionExperiment}
               onRunRiskMatrix={handleRunRiskMatrix}
               onRunFilterExperiment={handleRunFilterExperiment}
+              drawdownProtectionRunId={drawdownProtectionRunId}
+              drawdownProtectionCandidateId={drawdownProtectionCandidateId}
+              drawdownProtectionProgressByCandidateId={drawdownProtectionProgressByCandidateId}
               riskMatrixCandidateId={riskMatrixCandidateId}
               riskMatrixProgressByCandidateId={riskMatrixProgressByCandidateId}
               filterExperimentCandidateId={filterExperimentCandidateId}
@@ -3932,8 +5135,9 @@ function OverviewView({
 
 function AnalysisView({
   runs,
-  selectedRun,
+  selectedRun: shellSelectedRun,
   selectedRunId,
+  setSelectedRun,
   setSelectedRunId,
   deletingRunId,
   onDeleteRun,
@@ -3941,10 +5145,13 @@ function AnalysisView({
   onDeleteResearchNote,
   savingResearchNote,
   deletingResearchNoteId,
+  onRunDrawdownProtectionExperiment,
+  drawdownProtectionRunId,
 }: {
   runs: RunSummaryView[];
   selectedRun: RunAnalysisView | null;
   selectedRunId: string;
+  setSelectedRun: (value: RunAnalysisView | null) => void;
   setSelectedRunId: (value: string) => void;
   deletingRunId: string | null;
   onDeleteRun: (runId: string) => Promise<void>;
@@ -3952,11 +5159,40 @@ function AnalysisView({
   onDeleteResearchNote: (note: ResearchNote) => Promise<void>;
   savingResearchNote: boolean;
   deletingResearchNoteId: string | null;
+  onRunDrawdownProtectionExperiment: (run: RunAnalysisView) => Promise<void>;
+  drawdownProtectionRunId: string | null;
 }) {
   const [tradeSideFilter, setTradeSideFilter] = useState<string>('all');
   const [tradeOutcomeFilter, setTradeOutcomeFilter] = useState<'all' | 'win' | 'loss' | 'open'>('all');
   const [tradeReasonQuery, setTradeReasonQuery] = useState('');
+  const [freshSelectedRun, setFreshSelectedRun] = useState<RunAnalysisView | null>(null);
   const [researchNoteForm] = Form.useForm();
+  const selectedRun = freshSelectedRun?.run_id === selectedRunId ? freshSelectedRun : shellSelectedRun;
+
+  useEffect(() => {
+    if (!selectedRunId) {
+      setFreshSelectedRun(null);
+      return;
+    }
+    let cancelled = false;
+    async function refreshRunDetail() {
+      try {
+        const payload = await loadRunDetail(selectedRunId);
+        if (!cancelled) {
+          setFreshSelectedRun(payload.run);
+          setSelectedRun(payload.run);
+        }
+      } catch {
+        if (!cancelled) {
+          setFreshSelectedRun(null);
+        }
+      }
+    }
+    void refreshRunDetail();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedRunId, setSelectedRun]);
 
   const tradeColumns = useMemo<ColumnDef<RunAnalysisView['trade_rows'][number]>[]>(() => [
     {
@@ -3995,6 +5231,159 @@ function AnalysisView({
     { header: '代码', accessorKey: 'warning_code' },
     { header: '消息', accessorKey: 'message' },
   ], []);
+  const drawdownAttributionColumns = useMemo<ColumnDef<RunDrawdownAttributionBucket>[]>(() => [
+    {
+      id: 'dimension',
+      header: '维度',
+      size: 150,
+      minSize: 130,
+      accessorFn: (row) => row.dimension,
+      cell: ({ row }) => tradeAttributionDimensionLabel(row.original.dimension),
+    },
+    {
+      id: 'label',
+      header: '分桶',
+      size: 150,
+      minSize: 130,
+      accessorFn: (row) => row.label,
+      cell: ({ row }) => <Tag color={row.original.loss_share >= 0.25 ? 'red' : 'blue'}>{row.original.label}</Tag>,
+    },
+    { id: 'trade_count', header: '区间交易', size: 92, minSize: 84, accessorFn: (row) => row.trade_count },
+    { id: 'loss_count', header: '亏损笔', size: 82, minSize: 74, accessorFn: (row) => row.loss_count },
+    {
+      id: 'loss_pnl',
+      header: '亏损额',
+      size: 112,
+      minSize: 100,
+      accessorFn: (row) => row.loss_pnl,
+      cell: ({ row }) => <Text type="danger">{formatNumber(row.original.loss_pnl, 2)}</Text>,
+    },
+    {
+      id: 'loss_share',
+      header: '亏损占比',
+      size: 100,
+      minSize: 90,
+      accessorFn: (row) => row.loss_share,
+      cell: ({ row }) => <Text type={row.original.loss_share >= 0.25 ? 'danger' : undefined}>{formatPct(row.original.loss_share)}</Text>,
+    },
+    {
+      id: 'net_pnl',
+      header: '净收益',
+      size: 112,
+      minSize: 100,
+      accessorFn: (row) => row.net_pnl,
+      cell: ({ row }) => <Text type={row.original.net_pnl < 0 ? 'danger' : 'success'}>{formatNumber(row.original.net_pnl, 2)}</Text>,
+    },
+    {
+      id: 'avg_return_pct',
+      header: '均收益',
+      size: 94,
+      minSize: 84,
+      accessorFn: (row) => row.avg_return_pct,
+      cell: ({ row }) => formatPct(row.original.avg_return_pct),
+    },
+    {
+      id: 'stop_loss_rate',
+      header: '止损率',
+      size: 94,
+      minSize: 84,
+      accessorFn: (row) => row.stop_loss_rate,
+      cell: ({ row }) => formatPct(row.original.stop_loss_rate),
+    },
+    { id: 'early_exit_count', header: '<=3根', size: 82, minSize: 74, accessorFn: (row) => row.early_exit_count },
+  ], []);
+  const entryFeatureAttributionColumns = useMemo<ColumnDef<RunEntryFeatureAttributionBucket>[]>(() => [
+    {
+      id: 'judgement',
+      header: '判断',
+      size: 92,
+      minSize: 82,
+      accessorFn: (row) => row.judgement,
+      cell: ({ row }) => {
+        const judgement = runEntryFeatureJudgement(row.original);
+        return <Tag color={judgement.color}>{judgement.text}</Tag>;
+      },
+    },
+    {
+      id: 'dimension',
+      header: '入场前维度',
+      size: 170,
+      minSize: 150,
+      accessorFn: (row) => row.dimension,
+      cell: ({ row }) => (
+        <Tooltip title={tradeAttributionDimensionHelp(row.original.dimension)}>
+          <Text strong>{tradeAttributionDimensionLabel(row.original.dimension)}</Text>
+        </Tooltip>
+      ),
+    },
+    {
+      id: 'label',
+      header: '分桶',
+      size: 150,
+      minSize: 130,
+      accessorFn: (row) => row.label,
+      cell: ({ row }) => <Tag color={row.original.judgement === 'candidate' ? 'red' : 'blue'}>{row.original.label}</Tag>,
+    },
+    { id: 'drawdown_trade_count', header: '回撤段交易', size: 112, minSize: 100, accessorFn: (row) => row.drawdown_trade_count },
+    { id: 'drawdown_loss_count', header: '回撤段亏损', size: 112, minSize: 100, accessorFn: (row) => row.drawdown_loss_count },
+    {
+      id: 'drawdown_loss_rate',
+      header: '回撤段亏损率',
+      size: 124,
+      minSize: 112,
+      accessorFn: (row) => row.drawdown_loss_rate,
+      cell: ({ row }) => <Text type={row.original.drawdown_loss_rate >= 0.7 ? 'danger' : undefined}>{formatPct(row.original.drawdown_loss_rate)}</Text>,
+    },
+    {
+      id: 'baseline_loss_rate',
+      header: '非回撤亏损率',
+      size: 124,
+      minSize: 112,
+      accessorFn: (row) => row.baseline_loss_rate ?? Number.NEGATIVE_INFINITY,
+      cell: ({ row }) => formatPct(row.original.baseline_loss_rate),
+    },
+    {
+      id: 'loss_rate_delta',
+      header: '亏损率差',
+      size: 108,
+      minSize: 98,
+      accessorFn: (row) => row.loss_rate_delta ?? Number.NEGATIVE_INFINITY,
+      cell: ({ row }) => <Text type={(row.original.loss_rate_delta ?? 0) > 0 ? 'danger' : 'success'}>{formatSignedPct(row.original.loss_rate_delta)}</Text>,
+    },
+    {
+      id: 'drawdown_loss_share',
+      header: '回撤亏损占比',
+      size: 124,
+      minSize: 112,
+      accessorFn: (row) => row.drawdown_loss_share,
+      cell: ({ row }) => <Text type={row.original.drawdown_loss_share >= 0.15 ? 'danger' : undefined}>{formatPct(row.original.drawdown_loss_share)}</Text>,
+    },
+    {
+      id: 'drawdown_avg_return_pct',
+      header: '回撤均收益',
+      size: 112,
+      minSize: 100,
+      accessorFn: (row) => row.drawdown_avg_return_pct,
+      cell: ({ row }) => formatPct(row.original.drawdown_avg_return_pct),
+    },
+    {
+      id: 'baseline_avg_return_pct',
+      header: '非回撤均收益',
+      size: 124,
+      minSize: 112,
+      accessorFn: (row) => row.baseline_avg_return_pct ?? Number.NEGATIVE_INFINITY,
+      cell: ({ row }) => formatPct(row.original.baseline_avg_return_pct),
+    },
+    {
+      id: 'avg_return_delta',
+      header: '均收益差',
+      size: 108,
+      minSize: 98,
+      accessorFn: (row) => row.avg_return_delta ?? Number.NEGATIVE_INFINITY,
+      cell: ({ row }) => <Text type={(row.original.avg_return_delta ?? 0) < 0 ? 'danger' : 'success'}>{formatSignedPct(row.original.avg_return_delta)}</Text>,
+    },
+    { id: 'baseline_trade_count', header: '非回撤样本', size: 108, minSize: 96, accessorFn: (row) => row.baseline_trade_count },
+  ], []);
 
   const tradeRows = selectedRun?.trade_rows ?? [];
   const researchNotes = selectedRun?.research_notes ?? [];
@@ -4002,6 +5391,124 @@ function AnalysisView({
     () => pickChartSamples(selectedRun?.equity_rows ?? [], 1500),
     [selectedRun],
   );
+  const drawdownWindow = useMemo(
+    () => findRunMaxDrawdownWindow(selectedRun?.equity_rows ?? []),
+    [selectedRun],
+  );
+  const drawdownTrades = useMemo(() => {
+    if (!drawdownWindow) {
+      return [];
+    }
+    const peakTs = dayjs(drawdownWindow.peakTime).valueOf();
+    const troughTs = dayjs(drawdownWindow.troughTime).valueOf();
+    return tradeRows.filter((trade) => {
+      if (!trade.exit_time) {
+        return false;
+      }
+      const exitTs = dayjs(trade.exit_time).valueOf();
+      return exitTs >= peakTs && exitTs <= troughTs;
+    });
+  }, [drawdownWindow, tradeRows]);
+  const drawdownLossTrades = useMemo(
+    () => drawdownTrades.filter((trade) => trade.net_pnl < 0),
+    [drawdownTrades],
+  );
+  const nonDrawdownTrades = useMemo(() => {
+    if (!drawdownWindow) {
+      return tradeRows;
+    }
+    const peakTs = dayjs(drawdownWindow.peakTime).valueOf();
+    const troughTs = dayjs(drawdownWindow.troughTime).valueOf();
+    return tradeRows.filter((trade) => {
+      if (!trade.exit_time) {
+        return false;
+      }
+      const exitTs = dayjs(trade.exit_time).valueOf();
+      return exitTs < peakTs || exitTs > troughTs;
+    });
+  }, [drawdownWindow, tradeRows]);
+  const drawdownAttributionBuckets = useMemo(
+    () => buildRunDrawdownAttributionBuckets(drawdownLossTrades, [
+      'side',
+      'exit_reason',
+      'holding_bars',
+      'pre_entry_momentum_3_pct',
+      'pre_entry_momentum_5_pct',
+      'pre_entry_consecutive_move',
+      'trend_gap_atr',
+      'entry_distance_atr',
+      'local_range_position_20',
+      'breakout_wick_atr',
+      'range_chop_score_20',
+      'path_no_favorable_3',
+    ]),
+    [drawdownLossTrades],
+  );
+  const entryFeatureAttributionBuckets = useMemo(
+    () => buildRunEntryFeatureAttributionBuckets(drawdownTrades, nonDrawdownTrades, [
+      'side',
+      'pre_entry_momentum_3_pct',
+      'pre_entry_momentum_5_pct',
+      'pre_entry_consecutive_move',
+      'trend_gap_atr',
+      'entry_distance_atr',
+      'local_range_position_20',
+      'breakout_wick_atr',
+      'range_chop_score_20',
+    ]),
+    [drawdownTrades, nonDrawdownTrades],
+  );
+  const drawdownLossTotal = useMemo(
+    () => drawdownLossTrades.reduce((sum, trade) => sum + Math.abs(trade.net_pnl), 0),
+    [drawdownLossTrades],
+  );
+  const drawdownFeatureCoverage = useMemo(() => {
+    const featureKeys = [
+      'pre_entry_momentum_3_pct',
+      'pre_entry_momentum_5_pct',
+      'pre_entry_consecutive_move',
+      'trend_gap_atr',
+      'entry_distance_atr',
+      'local_range_position_20',
+      'breakout_wick_atr',
+      'range_chop_score_20',
+    ];
+    return featureKeys.map((key) => ({
+      key,
+      label: tradeAttributionDimensionLabel(key),
+      count: drawdownLossTrades.filter((trade) => numericTradeMeta(trade, key) !== null).length,
+    }));
+  }, [drawdownLossTrades]);
+  const drawdownFeatureCoverageText = drawdownFeatureCoverage
+    .map((item) => `${item.label} ${item.count}/${drawdownLossTrades.length}`)
+    .join('；');
+  const drawdownFeatureCoverageTotal = drawdownFeatureCoverage.reduce((sum, item) => sum + item.count, 0);
+  useEffect(() => {
+    if (!selectedRun || selectedRun.run_id !== selectedRunId || drawdownLossTrades.length === 0 || drawdownFeatureCoverageTotal > 0) {
+      return;
+    }
+    let cancelled = false;
+    async function refreshRunDetail() {
+      try {
+        const payload = await loadRunDetail(selectedRunId);
+        if (!cancelled) {
+          setSelectedRun(payload.run);
+        }
+      } catch {
+        // Keep the visible stale run; the outer shell will show API errors on regular loads.
+      }
+    }
+    void refreshRunDetail();
+    return () => {
+      cancelled = true;
+    };
+  }, [drawdownFeatureCoverageTotal, drawdownLossTrades.length, selectedRun, selectedRunId, setSelectedRun]);
+  const drawdownNetPnl = useMemo(
+    () => drawdownTrades.reduce((sum, trade) => sum + trade.net_pnl, 0),
+    [drawdownTrades],
+  );
+  const topDrawdownBucket = drawdownAttributionBuckets[0] ?? null;
+  const entryFeatureConclusion = buildRunEntryFeatureConclusion(entryFeatureAttributionBuckets);
   const tradeSideOptions = Array.from(new Set(tradeRows.map((row) => row.side))).sort();
   const tradeSummaryStats = useMemo(() => {
     const closedTrades = tradeRows.filter((row) => row.exit_time !== null);
@@ -4114,6 +5621,12 @@ function AnalysisView({
               >
                 {selectedRunIsTracked ? '已追踪' : '冻结追踪'}
               </Button>
+              <Button
+                loading={drawdownProtectionRunId === selectedRun.run_id}
+                onClick={() => void onRunDrawdownProtectionExperiment(selectedRun)}
+              >
+                回撤保护实验
+              </Button>
               <Select
                 value={selectedRunId}
                 style={{ minWidth: 360 }}
@@ -4180,6 +5693,110 @@ function AnalysisView({
             style={{ width: '100%' }}
             useResizeHandler
           />
+        </Card>
+      </Col>
+
+      <Col span={24}>
+        <Card title="最大回撤归因（单 Run）">
+          {drawdownWindow ? (
+            <Space direction="vertical" size={12} style={{ width: '100%' }}>
+              <Alert
+                type={topDrawdownBucket && topDrawdownBucket.loss_share >= 0.25 ? 'warning' : 'info'}
+                showIcon
+                message={topDrawdownBucket
+                  ? `${tradeAttributionDimensionLabel(topDrawdownBucket.dimension)} ${topDrawdownBucket.label} 是本次最大回撤段的主要亏损来源`
+                  : '最大回撤段没有匹配到已平仓亏损交易'}
+                description={topDrawdownBucket
+                  ? `峰值到谷值期间，该分桶贡献 ${formatPct(topDrawdownBucket.loss_share)} 的区间亏损，止损率 ${formatPct(topDrawdownBucket.stop_loss_rate)}。这是单 run 路径归因，只说明这次回撤怎么形成。`
+                  : '可能是浮亏、未平仓仓位或权益曲线点位与交易平仓时间错位导致。'}
+              />
+              <Alert
+                type={drawdownFeatureCoverage.every((item) => item.count > 0) ? 'success' : 'warning'}
+                showIcon
+                message="回撤段入场特征覆盖率"
+                description={drawdownFeatureCoverageText || '当前回撤段没有亏损交易可检查。'}
+              />
+              <Descriptions size="small" column={{ xs: 1, md: 3 }}>
+                <Descriptions.Item label="峰值时间">{formatDateTime(drawdownWindow.peakTime)}</Descriptions.Item>
+                <Descriptions.Item label="谷值时间">{formatDateTime(drawdownWindow.troughTime)}</Descriptions.Item>
+                <Descriptions.Item label="最大回撤">{formatPct(drawdownWindow.maxDrawdown)}</Descriptions.Item>
+                <Descriptions.Item label="峰值权益">{formatNumber(drawdownWindow.peakEquity, 2)}</Descriptions.Item>
+                <Descriptions.Item label="谷值权益">{formatNumber(drawdownWindow.troughEquity, 2)}</Descriptions.Item>
+                <Descriptions.Item label="回撤金额">{formatNumber(drawdownWindow.drawdownAmount, 2)}</Descriptions.Item>
+                <Descriptions.Item label="区间交易">{drawdownTrades.length}</Descriptions.Item>
+                <Descriptions.Item label="区间亏损交易">{drawdownLossTrades.length}</Descriptions.Item>
+                <Descriptions.Item label="区间净收益">
+                  <Text type={drawdownNetPnl < 0 ? 'danger' : 'success'}>{formatNumber(drawdownNetPnl, 2)}</Text>
+                </Descriptions.Item>
+                <Descriptions.Item label="区间亏损额">{formatNumber(drawdownLossTotal, 2)}</Descriptions.Item>
+                <Descriptions.Item label="恢复时间">
+                  {drawdownWindow.recoveryTime ? formatDateTime(drawdownWindow.recoveryTime) : '未恢复'}
+                </Descriptions.Item>
+                <Descriptions.Item label="谷值后恢复K数">
+                  {drawdownWindow.recoveryBars === null ? '--' : drawdownWindow.recoveryBars}
+                </Descriptions.Item>
+              </Descriptions>
+              {drawdownAttributionBuckets.length ? (
+                <DataTable
+                  columns={drawdownAttributionColumns}
+                  data={drawdownAttributionBuckets}
+                  tableClassName="cbw-parameter-group-table"
+                  initialPageSize={8}
+                  pageSizeOptions={[8, 12, 24]}
+                  initialSorting={[{ id: 'loss_share', desc: true }]}
+                />
+              ) : (
+                <Alert
+                  type="info"
+                  showIcon
+                  message="没有可分桶的区间亏损交易"
+                  description="如果权益回撤主要来自未平仓浮亏，需要后续补充持仓级浮亏归因。"
+                />
+              )}
+            </Space>
+          ) : (
+            <Alert type="info" showIcon message="当前权益曲线没有形成有效回撤窗口" />
+          )}
+        </Card>
+      </Col>
+
+      <Col span={24}>
+        <Card title="入场前特征归因（最大回撤段）">
+          {drawdownWindow ? (
+            <Space direction="vertical" size={12} style={{ width: '100%' }}>
+              <Alert
+                type={entryFeatureConclusion.type}
+                showIcon
+                message={entryFeatureConclusion.message}
+                description={entryFeatureConclusion.description}
+              />
+              <Alert
+                type="info"
+                showIcon
+                message="这张表只看入场前可见特征"
+                description={`对比峰值到谷值期间的交易与非回撤段交易。回撤段样本 ${drawdownTrades.length} 笔，非回撤段样本 ${nonDrawdownTrades.length} 笔；候选行适合转成过滤实验。`}
+              />
+              {entryFeatureAttributionBuckets.length ? (
+                <DataTable
+                  columns={entryFeatureAttributionColumns}
+                  data={entryFeatureAttributionBuckets}
+                  tableClassName="cbw-parameter-group-table"
+                  initialPageSize={8}
+                  pageSizeOptions={[8, 12, 24]}
+                  initialSorting={[{ id: 'drawdown_loss_share', desc: true }]}
+                />
+              ) : (
+                <Alert
+                  type="info"
+                  showIcon
+                  message="没有形成可对比的入场前分桶"
+                  description="通常是交易样本太少，或当前 run 的交易没有记录足够的 entry_signal_meta_json。"
+                />
+              )}
+            </Space>
+          ) : (
+            <Alert type="info" showIcon message="当前权益曲线没有形成有效回撤窗口" />
+          )}
         </Card>
       </Col>
 
@@ -4523,8 +6140,12 @@ function ParametersView({
   neighborhoodRunId,
   onSubmitExperiment,
   onRunTrendNeighborhood,
+  onRunDrawdownProtectionExperiment,
   onRunRiskMatrix,
   onRunFilterExperiment,
+  drawdownProtectionRunId,
+  drawdownProtectionCandidateId,
+  drawdownProtectionProgressByCandidateId,
   riskMatrixCandidateId,
   riskMatrixProgressByCandidateId,
   filterExperimentCandidateId,
@@ -4569,8 +6190,12 @@ function ParametersView({
   neighborhoodRunId: string | null;
   onSubmitExperiment: (values: Record<string, unknown>) => Promise<void>;
   onRunTrendNeighborhood: (row: ParameterLabRow) => Promise<void>;
+  onRunDrawdownProtectionExperiment: (rowOrRunId: ParameterLabRow | string, progressKey?: string) => Promise<void>;
   onRunRiskMatrix: (candidate: ResearchCandidateView) => Promise<void>;
-  onRunFilterExperiment: (candidate: ResearchCandidateView, mode?: FilterExperimentMode) => Promise<void>;
+  onRunFilterExperiment: (candidate: ResearchCandidateView, profile?: FilterExperimentProfile) => Promise<void>;
+  drawdownProtectionRunId: string | null;
+  drawdownProtectionCandidateId: string | null;
+  drawdownProtectionProgressByCandidateId: Record<string, FilterExperimentProgress>;
   riskMatrixCandidateId: string | null;
   riskMatrixProgressByCandidateId: Record<string, RiskMatrixProgress>;
   filterExperimentCandidateId: string | null;
@@ -5526,6 +7151,11 @@ function ParametersView({
     )),
     [batchManualLabelsByRunId, filteredBatchGroupRunIds, hasBatchGroupFilters, selectedBatchRows, autoLabelsByRunId, manualLabelsByRunId, selectedBatchGroupMetricsByRunId, minScoreFilter, minConfidenceFilter],
   );
+  const isDrawdownProtectionBatch = selectedBatchId !== ALL_BATCHES && selectedBatchId.startsWith('drawdown-guard-');
+  const drawdownProtectionComparisonRows = useMemo(
+    () => (isDrawdownProtectionBatch ? buildDrawdownProtectionComparisonRows(selectedBatchRows) : []),
+    [isDrawdownProtectionBatch, selectedBatchRows],
+  );
   const recommendedResearchRuns = useMemo<ResearchRunCandidate[]>(() => {
     if (selectedBatchId === ALL_BATCHES) {
       return [];
@@ -5643,6 +7273,12 @@ function ParametersView({
     () => new Map(allRows.map((row) => [row.run_id, row] as const)),
     [allRows],
   );
+  const latestDrawdownProtectionBatchForKey = useCallback((key: string) => {
+    const prefix = `drawdown-guard-${safeBatchKeyPart(key)}-`;
+    return [...batches]
+      .filter((batch) => batch.batch_id.startsWith(prefix))
+      .sort((left, right) => dayjs(right.created_at).valueOf() - dayjs(left.created_at).valueOf())[0];
+  }, [batches]);
   const [runCompareIds, setRunCompareIds] = useState<string[]>([]);
   const [runCompareOpen, setRunCompareOpen] = useState(false);
   const runCompareRows = useMemo(
@@ -5754,24 +7390,20 @@ function ParametersView({
         } as ResearchCandidateView;
         return (
           <Space size={[4, 4]} wrap>
-            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '固定当前参数，只测试 HTF 趋势 / ATR 分位 / ADX 三个单指标'}>
+            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '固定当前参数，只跑早败代理阈值扫描：MOM3 与局部位置'}>
               <Button
                 size="small"
                 loading={filterExperimentCandidateId === row.original.group_key || running}
                 disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2'}
-                onClick={() => void onRunFilterExperiment(candidateLike, 'single')}
-              >
-                单指标
-              </Button>
+                onClick={() => void onRunFilterExperiment(candidateLike, 'early_fail_proxy')}
+              >早败</Button>
             </Tooltip>
-            <Tooltip title="固定当前参数，同时跑单指标和趋势/ATR/ADX核心叠加">
+            <Tooltip title="固定当前参数，只跑通用过滤：HTF、ATR 分位、ADX">
               <Button
                 size="small"
                 disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2'}
-                onClick={() => void onRunFilterExperiment(candidateLike, 'stacked')}
-              >
-                叠加
-              </Button>
+                onClick={() => void onRunFilterExperiment(candidateLike, 'general')}
+              >通用</Button>
             </Tooltip>
           </Space>
         );
@@ -5905,6 +7537,59 @@ function ParametersView({
     { id: 'leverage', header: '杠杆', size: 70, minSize: 66, accessorFn: (row) => row.leverage ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => row.original.leverage ?? '--' },
     { id: 'risk_pct_per_trade', header: 'risk', size: 78, minSize: 72, accessorFn: (row) => row.risk_pct_per_trade ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => compactPct(row.original.risk_pct_per_trade) ?? '--' },
     {
+      id: 'filter_experiment',
+      header: '过滤实验',
+      size: 190,
+      minSize: 170,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const group = researchParameterGroups.find((item) => item.run_ids.includes(row.original.run_id));
+        const candidateId = group?.group_key;
+        const progress = candidateId ? filterExperimentProgressByCandidateId[candidateId] : undefined;
+        const running = Boolean(progress && progress.status !== 'success' && progress.status !== 'failed');
+        const candidateLike = candidateId ? {
+          candidate_id: candidateId,
+          source_run_ids: group?.run_ids ?? [row.original.run_id],
+          strategy_name: group?.strategy_name ?? row.original.strategy_name,
+          symbol: group?.symbol ?? row.original.symbol,
+          timeframe: group?.timeframe ?? row.original.timeframe,
+          validation_split_id: group?.validation_split_id ?? row.original.validation_split_id,
+          entry_structure: {},
+          risk_profile: {},
+          representative_run_id: group?.representative_run_id ?? row.original.run_id,
+          representative_run_score: group?.research_score ?? row.original.score,
+          status: group?.classification ?? row.original.pool_status,
+          recommendation: '',
+          neighborhood_summary: {},
+          risk_matrix_summary: {},
+          latest_note: null,
+          updated_at: null,
+        } as ResearchCandidateView : null;
+        return (
+          <Space size={[4, 4]} wrap>
+            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '固定当前参数，只跑早败代理阈值扫描：MOM3 与局部位置'}>
+              <Button
+                size="small"
+                loading={Boolean(candidateId && filterExperimentCandidateId === candidateId) || running}
+                disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2' || !candidateLike}
+                onClick={() => candidateLike ? void onRunFilterExperiment(candidateLike, 'early_fail_proxy') : undefined}
+              >早败</Button>
+            </Tooltip>
+            <Tooltip title="固定当前参数，只跑通用过滤：HTF、ATR 分位、ADX">
+              <Button
+                size="small"
+                disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2' || !candidateLike}
+                onClick={() => candidateLike ? void onRunFilterExperiment(candidateLike, 'general') : undefined}
+              >通用</Button>
+            </Tooltip>
+            <Button size="small" disabled={!candidateId} onClick={() => candidateId ? setFilterResultsCandidateId(candidateId) : undefined}>
+              看结果
+            </Button>
+          </Space>
+        );
+      },
+    },
+    {
       id: 'actions',
       header: '操作',
       size: 330,
@@ -5941,7 +7626,7 @@ function ParametersView({
         );
       },
     },
-  ], [addRunToCompare, neighborhoodRunId, onOpenRun, onRunTrendNeighborhood, rowsByRunId, savingResearchNote]);
+  ], [addRunToCompare, filterExperimentCandidateId, filterExperimentProgressByCandidateId, neighborhoodRunId, onOpenRun, onRunFilterExperiment, onRunTrendNeighborhood, researchParameterGroups, rowsByRunId, savingResearchNote]);
   const researchPoolColumns = useMemo<ColumnDef<ResearchCandidateView>[]>(() => [
     {
       id: 'candidate',
@@ -5977,26 +7662,65 @@ function ParametersView({
         const running = Boolean(progress && progress.status !== 'success' && progress.status !== 'failed');
         return (
           <Space size={[4, 4]} wrap>
-            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '固定当前参数，只测试 HTF 趋势 / ATR 分位 / ADX 三个单指标'}>
+            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '固定当前参数，只跑早败代理阈值扫描：MOM3 与局部位置'}>
               <Button
                 size="small"
                 loading={filterExperimentCandidateId === row.original.candidate_id || running}
                 disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2'}
-                onClick={() => void onRunFilterExperiment(row.original, 'single')}
-              >
-                单指标
-              </Button>
+                onClick={() => void onRunFilterExperiment(row.original, 'early_fail_proxy')}
+              >早败</Button>
             </Tooltip>
-            <Tooltip title="固定当前参数，同时跑单指标和趋势/ATR/ADX核心叠加">
+            <Tooltip title="固定当前参数，只跑通用过滤：HTF、ATR 分位、ADX">
               <Button
                 size="small"
                 disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2'}
-                onClick={() => void onRunFilterExperiment(row.original, 'stacked')}
-              >
-                叠加
-              </Button>
+                onClick={() => void onRunFilterExperiment(row.original, 'general')}
+              >通用</Button>
             </Tooltip>
             <Button size="small" onClick={() => setFilterResultsCandidateId(row.original.candidate_id)}>
+              看结果
+            </Button>
+          </Space>
+        );
+      },
+    },
+    {
+      id: 'drawdown_protection',
+      header: '回撤保护',
+      size: 180,
+      minSize: 160,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const representativeRunId = row.original.representative_run_id ?? null;
+        const progress = drawdownProtectionProgressByCandidateId[row.original.candidate_id];
+        const latestBatch = latestDrawdownProtectionBatchForKey(row.original.candidate_id);
+        const resultBatchId = progress?.batchId || latestBatch?.batch_id;
+        const running = Boolean(progress && progress.status !== 'success' && progress.status !== 'failed')
+          || latestBatch?.status === 'pending'
+          || latestBatch?.status === 'running';
+        return (
+          <Space size={[4, 4]} wrap>
+            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '固定代表 Run 原始参数，只展开 DD 停开与连续短止冷却保护'}>
+              <Button
+                size="small"
+                loading={drawdownProtectionCandidateId === row.original.candidate_id || drawdownProtectionRunId === representativeRunId || running}
+                disabled={!representativeRunId || running}
+                onClick={() => representativeRunId ? void onRunDrawdownProtectionExperiment(representativeRunId, row.original.candidate_id) : undefined}
+              >
+                跑保护
+              </Button>
+            </Tooltip>
+            <Button
+              size="small"
+              disabled={!resultBatchId}
+              onClick={() => {
+                if (!resultBatchId) {
+                  return;
+                }
+                setSelectedBatchId(resultBatchId);
+                setWorkspaceMode('batch');
+              }}
+            >
               看结果
             </Button>
           </Space>
@@ -6067,7 +7791,7 @@ function ParametersView({
         );
       },
     },
-  ], [addRunToCompare, filterExperimentCandidateId, filterExperimentProgressByCandidateId, neighborhoodRunId, onOpenRun, onRunFilterExperiment, onRunRiskMatrix, onRunTrendNeighborhood, riskMatrixCandidateId, riskMatrixProgressByCandidateId, rowsByRunId]);
+  ], [addRunToCompare, drawdownProtectionCandidateId, drawdownProtectionProgressByCandidateId, drawdownProtectionRunId, filterExperimentCandidateId, filterExperimentProgressByCandidateId, latestDrawdownProtectionBatchForKey, neighborhoodRunId, onOpenRun, onRunDrawdownProtectionExperiment, onRunFilterExperiment, onRunRiskMatrix, onRunTrendNeighborhood, riskMatrixCandidateId, riskMatrixProgressByCandidateId, rowsByRunId, setSelectedBatchId]);
   const stablePoolColumns = useMemo<ColumnDef<StableCandidateView>[]>(() => [
     {
       id: 'candidate',
@@ -6121,26 +7845,65 @@ function ParametersView({
         } as ResearchCandidateView;
         return (
           <Space size={[4, 4]} wrap>
-            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '固定当前稳定组合，只测试 HTF 趋势 / ATR 分位 / ADX 三个单指标'}>
+            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '固定当前稳定组合，只跑早败代理阈值扫描：MOM3 与局部位置'}>
               <Button
                 size="small"
                 loading={filterExperimentCandidateId === row.original.stable_candidate_id || running}
                 disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2'}
-                onClick={() => void onRunFilterExperiment(candidateLike, 'single')}
-              >
-                单指标
-              </Button>
+                onClick={() => void onRunFilterExperiment(candidateLike, 'early_fail_proxy')}
+              >早败</Button>
             </Tooltip>
-            <Tooltip title="固定当前稳定组合，同时跑单指标和趋势/ATR/ADX核心叠加">
+            <Tooltip title="固定当前稳定组合，只跑通用过滤：HTF、ATR 分位、ADX">
               <Button
                 size="small"
                 disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2'}
-                onClick={() => void onRunFilterExperiment(candidateLike, 'stacked')}
-              >
-                叠加
-              </Button>
+                onClick={() => void onRunFilterExperiment(candidateLike, 'general')}
+              >通用</Button>
             </Tooltip>
             <Button size="small" onClick={() => setFilterResultsCandidateId(row.original.stable_candidate_id)}>
+              看结果
+            </Button>
+          </Space>
+        );
+      },
+    },
+    {
+      id: 'drawdown_protection',
+      header: '回撤保护',
+      size: 180,
+      minSize: 160,
+      enableSorting: false,
+      cell: ({ row }) => {
+        const representativeRunId = row.original.representative_run_id ?? null;
+        const progress = drawdownProtectionProgressByCandidateId[row.original.stable_candidate_id];
+        const latestBatch = latestDrawdownProtectionBatchForKey(row.original.stable_candidate_id);
+        const resultBatchId = progress?.batchId || latestBatch?.batch_id;
+        const running = Boolean(progress && progress.status !== 'success' && progress.status !== 'failed')
+          || latestBatch?.status === 'pending'
+          || latestBatch?.status === 'running';
+        return (
+          <Space size={[4, 4]} wrap>
+            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '固定稳定组合代表 Run 原始参数，只展开 DD 停开与连续短止冷却保护'}>
+              <Button
+                size="small"
+                loading={drawdownProtectionCandidateId === row.original.stable_candidate_id || drawdownProtectionRunId === representativeRunId || running}
+                disabled={!representativeRunId || running}
+                onClick={() => representativeRunId ? void onRunDrawdownProtectionExperiment(representativeRunId, row.original.stable_candidate_id) : undefined}
+              >
+                跑保护
+              </Button>
+            </Tooltip>
+            <Button
+              size="small"
+              disabled={!resultBatchId}
+              onClick={() => {
+                if (!resultBatchId) {
+                  return;
+                }
+                setSelectedBatchId(resultBatchId);
+                setWorkspaceMode('batch');
+              }}
+            >
               看结果
             </Button>
           </Space>
@@ -6166,7 +7929,7 @@ function ParametersView({
           </Space>
       ),
     },
-  ], [addRunToCompare, filterExperimentCandidateId, filterExperimentProgressByCandidateId, onOpenRun, onRunFilterExperiment]);
+  ], [addRunToCompare, drawdownProtectionCandidateId, drawdownProtectionProgressByCandidateId, drawdownProtectionRunId, filterExperimentCandidateId, filterExperimentProgressByCandidateId, latestDrawdownProtectionBatchForKey, onOpenRun, onRunDrawdownProtectionExperiment, onRunFilterExperiment, rowsByRunId, setSelectedBatchId]);
   const filterResultGroupColumns = useMemo<ColumnDef<FilterResultGroup>[]>(() => [
     {
       id: 'filter_summary',
@@ -6243,24 +8006,328 @@ function ParametersView({
       ),
     },
   ], [addRunToCompare, onOpenRun]);
+  const primaryTradeAttributionBuckets = useMemo(() => {
+    if (!tradeAttribution) {
+      return [];
+    }
+    return (tradeAttribution.buckets ?? [])
+      .filter((bucket) => isPrimaryTradeAttributionBucket(bucket, tradeAttribution.summary.trade_count))
+      .sort((left, right) => tradeAttributionBucketIssueScore(right) - tradeAttributionBucketIssueScore(left))
+      .slice(0, 12);
+  }, [tradeAttribution]);
+  const primaryEarlyFailAttributionBuckets = useMemo(() => {
+    if (!tradeAttribution) {
+      return [];
+    }
+    return (tradeAttribution.early_fail_buckets ?? [])
+      .filter(isPrimaryEarlyFailAttributionBucket)
+      .sort((left, right) => earlyFailAttributionScore(right) - earlyFailAttributionScore(left))
+      .slice(0, 12);
+  }, [tradeAttribution]);
+  const fallbackEarlyFailAttributionBuckets = useMemo(() => {
+    if (!tradeAttribution || primaryEarlyFailAttributionBuckets.length) {
+      return [];
+    }
+    return (tradeAttribution.early_fail_buckets ?? [])
+      .filter(isFallbackEarlyFailAttributionBucket)
+      .sort((left, right) => earlyFailAttributionScore(right) - earlyFailAttributionScore(left))
+      .slice(0, 12);
+  }, [tradeAttribution, primaryEarlyFailAttributionBuckets.length]);
+  const visibleEarlyFailAttributionBuckets = primaryEarlyFailAttributionBuckets.length
+    ? primaryEarlyFailAttributionBuckets
+    : fallbackEarlyFailAttributionBuckets;
+  const primaryStopLossAttributionBuckets = useMemo(() => {
+    if (!tradeAttribution) {
+      return [];
+    }
+    return (tradeAttribution.stop_loss_buckets ?? [])
+      .filter(isPrimaryStopLossAttributionBucket)
+      .sort((left, right) => stopLossAttributionScore(right) - stopLossAttributionScore(left))
+      .slice(0, 12);
+  }, [tradeAttribution]);
+  const pathStopLossAttributionBuckets = useMemo(() => {
+    if (!tradeAttribution) {
+      return [];
+    }
+    return (tradeAttribution.stop_loss_buckets ?? [])
+      .filter(isPathStopLossAttributionBucket)
+      .sort((left, right) => stopLossAttributionScore(right) - stopLossAttributionScore(left))
+      .slice(0, 12);
+  }, [tradeAttribution]);
+  const stopLossAttributionConclusion = useMemo(
+    () => buildStopLossAttributionConclusion(pathStopLossAttributionBuckets.length ? pathStopLossAttributionBuckets : primaryStopLossAttributionBuckets),
+    [pathStopLossAttributionBuckets, primaryStopLossAttributionBuckets],
+  );
+  const earlyFailAttributionConclusion = useMemo(
+    () => buildEarlyFailAttributionConclusion(visibleEarlyFailAttributionBuckets),
+    [visibleEarlyFailAttributionBuckets],
+  );
+  const earlyFailBaselineText = useMemo(() => {
+    if (!tradeAttribution) {
+      return '总体早败率 --';
+    }
+    return `IS总体早败率 ${formatPct(tradeAttribution.summary.is_early_fail_rate)} / OOS总体早败率 ${formatPct(tradeAttribution.summary.oos_early_fail_rate)}；路径样本 IS ${formatNumber(tradeAttribution.summary.early_path_is_trade_count, 0)} / OOS ${formatNumber(tradeAttribution.summary.early_path_oos_trade_count, 0)}`;
+  }, [tradeAttribution]);
+  const earlyFailAttributionColumns = useMemo<ColumnDef<EarlyFailAttributionBucket>[]>(() => [
+    {
+      id: 'judgement',
+      header: '判断',
+      size: 100,
+      minSize: 90,
+      accessorFn: (row) => earlyFailAttributionScore(row),
+      cell: ({ row }) => {
+        const judgement = earlyFailAttributionJudgement(row.original);
+        return <Tag color={judgement.color}>{judgement.text}</Tag>;
+      },
+    },
+    {
+      id: 'bucket_family',
+      header: '类型',
+      size: 70,
+      minSize: 64,
+      accessorFn: (row) => row.bucket_family,
+      cell: ({ row }) => <Tag color={row.original.bucket_family === 'combo' ? 'purple' : 'blue'}>{row.original.bucket_family === 'combo' ? '组合' : '单项'}</Tag>,
+    },
+    {
+      id: 'dimension',
+      header: '入场前维度',
+      size: 150,
+      minSize: 130,
+      accessorFn: (row) => tradeAttributionDimensionLabel(row.dimension),
+      cell: ({ row }) => (
+        <Tooltip title={tradeAttributionDimensionHelp(row.original.dimension)}>
+          <Text strong>{tradeAttributionDimensionLabel(row.original.dimension)}</Text>
+        </Tooltip>
+      ),
+    },
+    {
+      id: 'label',
+      header: '分桶',
+      size: 190,
+      minSize: 170,
+      accessorFn: (row) => tradeAttributionBucketLabel(row),
+      cell: ({ row }) => <Tag color={row.original.is_early_fail_rate_delta >= 0.05 ? 'red' : row.original.is_early_fail_rate_delta <= -0.03 ? 'green' : 'blue'}>{tradeAttributionBucketLabel(row.original)}</Tag>,
+    },
+    { id: 'is_trade_count', header: 'IS交易', size: 82, minSize: 76, accessorFn: (row) => row.is_trade_count, cell: ({ row }) => row.original.is_trade_count },
+    { id: 'is_early_fail_count', header: 'IS早败', size: 82, minSize: 76, accessorFn: (row) => row.is_early_fail_count, cell: ({ row }) => row.original.is_early_fail_count },
+    { id: 'is_early_fail_rate', header: 'IS早败率', size: 96, minSize: 88, accessorFn: (row) => row.is_early_fail_rate, cell: ({ row }) => formatPct(row.original.is_early_fail_rate) },
+    {
+      id: 'is_early_fail_rate_delta',
+      header: '高于总体',
+      size: 96,
+      minSize: 88,
+      accessorFn: (row) => row.is_early_fail_rate_delta,
+      cell: ({ row }) => <Text type={row.original.is_early_fail_rate_delta > 0 ? 'danger' : 'success'}>{formatSignedPct(row.original.is_early_fail_rate_delta)}</Text>,
+    },
+    { id: 'is_first_bar_adverse_rate', header: '首根反向率', size: 112, minSize: 100, accessorFn: (row) => row.is_first_bar_adverse_rate, cell: ({ row }) => formatPct(row.original.is_first_bar_adverse_rate) },
+    { id: 'is_early_fail_stop_loss_rate', header: '早败后止损率', size: 126, minSize: 114, accessorFn: (row) => row.is_early_fail_stop_loss_rate, cell: ({ row }) => <Text type="danger">{formatPct(row.original.is_early_fail_stop_loss_rate)}</Text> },
+    { id: 'oos_trade_count', header: 'OOS交易', size: 88, minSize: 80, accessorFn: (row) => row.oos_trade_count, cell: ({ row }) => row.original.oos_trade_count },
+    { id: 'oos_early_fail_count', header: 'OOS早败', size: 92, minSize: 84, accessorFn: (row) => row.oos_early_fail_count, cell: ({ row }) => row.original.oos_early_fail_count },
+    { id: 'oos_early_fail_rate', header: 'OOS早败率', size: 108, minSize: 98, accessorFn: (row) => row.oos_early_fail_rate, cell: ({ row }) => formatPct(row.original.oos_early_fail_rate) },
+    {
+      id: 'oos_early_fail_rate_delta',
+      header: 'OOS高于总体',
+      size: 120,
+      minSize: 108,
+      accessorFn: (row) => row.oos_early_fail_rate_delta ?? 0,
+      cell: ({ row }) => <Text type={Number(row.original.oos_early_fail_rate_delta ?? 0) > 0 ? 'danger' : 'success'}>{formatSignedPct(row.original.oos_early_fail_rate_delta)}</Text>,
+    },
+    {
+      id: 'oos_sample',
+      header: 'OOS样本',
+      size: 96,
+      minSize: 88,
+      accessorFn: (row) => row.oos_trade_count,
+      cell: ({ row }) => (
+        row.original.oos_trade_count >= 10
+          ? <Tag color="green">可复验</Tag>
+          : <Tag color="orange">不足10</Tag>
+      ),
+    },
+  ], []);
+  const stopLossAttributionColumns = useMemo<ColumnDef<StopLossAttributionBucket>[]>(() => [
+    {
+      id: 'judgement',
+      header: '判断',
+      size: 100,
+      minSize: 90,
+      accessorFn: (row) => stopLossAttributionScore(row),
+      cell: ({ row }) => {
+        const judgement = stopLossAttributionJudgement(row.original);
+        return <Tag color={judgement.color}>{judgement.text}</Tag>;
+      },
+    },
+    {
+      id: 'bucket_family',
+      header: '类型',
+      size: 70,
+      minSize: 64,
+      accessorFn: (row) => row.bucket_family,
+      cell: ({ row }) => <Tag color={row.original.bucket_family === 'combo' ? 'purple' : 'blue'}>{row.original.bucket_family === 'combo' ? '组合' : '单项'}</Tag>,
+    },
+    {
+      id: 'dimension',
+      header: '维度',
+      size: 150,
+      minSize: 130,
+      accessorFn: (row) => tradeAttributionDimensionLabel(row.dimension),
+      cell: ({ row }) => (
+        <Tooltip title={tradeAttributionDimensionHelp(row.original.dimension)}>
+          <Text strong>{tradeAttributionDimensionLabel(row.original.dimension)}</Text>
+        </Tooltip>
+      ),
+    },
+    {
+      id: 'label',
+      header: '分桶',
+      size: 190,
+      minSize: 170,
+      accessorFn: (row) => tradeAttributionBucketLabel(row as unknown as TradeAttributionBucket),
+      cell: ({ row }) => <Tag color={row.original.is_stop_loss_rate_delta >= 0.05 ? 'red' : row.original.is_stop_loss_rate_delta <= -0.03 ? 'green' : 'blue'}>{tradeAttributionBucketLabel(row.original as unknown as TradeAttributionBucket)}</Tag>,
+    },
+    { id: 'is_trade_count', header: 'IS交易', size: 82, minSize: 76, accessorFn: (row) => row.is_trade_count, cell: ({ row }) => row.original.is_trade_count },
+    { id: 'is_stop_loss_count', header: 'IS止损', size: 82, minSize: 76, accessorFn: (row) => row.is_stop_loss_count, cell: ({ row }) => row.original.is_stop_loss_count },
+    { id: 'is_stop_loss_rate', header: 'IS止损率', size: 96, minSize: 88, accessorFn: (row) => row.is_stop_loss_rate, cell: ({ row }) => formatPct(row.original.is_stop_loss_rate) },
+    {
+      id: 'is_stop_loss_net_pnl',
+      header: 'IS止损亏损',
+      size: 112,
+      minSize: 102,
+      accessorFn: (row) => row.is_stop_loss_net_pnl,
+      cell: ({ row }) => <Text type="danger">{formatNumber(row.original.is_stop_loss_net_pnl, 2)}</Text>,
+    },
+    { id: 'is_stop_loss_loss_share', header: 'IS亏损占比', size: 104, minSize: 94, accessorFn: (row) => row.is_stop_loss_loss_share, cell: ({ row }) => formatPct(row.original.is_stop_loss_loss_share) },
+    {
+      id: 'is_stop_loss_rate_delta',
+      header: '高于总体',
+      size: 96,
+      minSize: 88,
+      accessorFn: (row) => row.is_stop_loss_rate_delta,
+      cell: ({ row }) => <Text type={row.original.is_stop_loss_rate_delta > 0 ? 'danger' : 'success'}>{formatSignedPct(row.original.is_stop_loss_rate_delta)}</Text>,
+    },
+    { id: 'is_avg_loss_return_pct', header: '止损均损', size: 96, minSize: 88, accessorFn: (row) => row.is_avg_loss_return_pct, cell: ({ row }) => <Text type="danger">{formatPct(row.original.is_avg_loss_return_pct)}</Text> },
+    { id: 'oos_trade_count', header: 'OOS交易', size: 88, minSize: 80, accessorFn: (row) => row.oos_trade_count, cell: ({ row }) => row.original.oos_trade_count },
+    { id: 'oos_stop_loss_count', header: 'OOS止损', size: 90, minSize: 82, accessorFn: (row) => row.oos_stop_loss_count, cell: ({ row }) => row.original.oos_stop_loss_count },
+    { id: 'oos_stop_loss_rate', header: 'OOS止损率', size: 104, minSize: 94, accessorFn: (row) => row.oos_stop_loss_rate, cell: ({ row }) => formatPct(row.original.oos_stop_loss_rate) },
+    {
+      id: 'oos_stop_loss_net_pnl',
+      header: 'OOS止损亏损',
+      size: 126,
+      minSize: 114,
+      accessorFn: (row) => row.oos_stop_loss_net_pnl,
+      cell: ({ row }) => <Text type="danger">{formatNumber(row.original.oos_stop_loss_net_pnl, 2)}</Text>,
+    },
+    { id: 'oos_stop_loss_loss_share', header: 'OOS亏损占比', size: 116, minSize: 104, accessorFn: (row) => row.oos_stop_loss_loss_share, cell: ({ row }) => formatPct(row.original.oos_stop_loss_loss_share) },
+    {
+      id: 'oos_stop_loss_rate_delta',
+      header: 'OOS高于总体',
+      size: 120,
+      minSize: 108,
+      accessorFn: (row) => row.oos_stop_loss_rate_delta ?? 0,
+      cell: ({ row }) => <Text type={Number(row.original.oos_stop_loss_rate_delta ?? 0) > 0 ? 'danger' : 'success'}>{formatSignedPct(row.original.oos_stop_loss_rate_delta)}</Text>,
+    },
+  ], []);
   const tradeAttributionBucketColumns = useMemo<ColumnDef<TradeAttributionBucket>[]>(() => [
-    { id: 'dimension', header: '维度', size: 130, minSize: 110, accessorFn: (row) => row.dimension, cell: ({ row }) => row.original.dimension },
+    {
+      id: 'judgement',
+      header: '判断',
+      size: 92,
+      minSize: 82,
+      accessorFn: (row) => tradeAttributionBucketIssueScore(row),
+      cell: ({ row }) => {
+        const judgement = tradeAttributionBucketJudgement(row.original);
+        return <Tag color={judgement.color}>{judgement.text}</Tag>;
+      },
+    },
+    {
+      id: 'dimension',
+      header: '维度',
+      size: 150,
+      minSize: 130,
+      accessorFn: (row) => tradeAttributionDimensionLabel(row.dimension),
+      cell: ({ row }) => (
+        <Tooltip title={tradeAttributionDimensionHelp(row.original.dimension)}>
+          <Text strong>{tradeAttributionDimensionLabel(row.original.dimension)}</Text>
+        </Tooltip>
+      ),
+    },
     {
       id: 'label',
       header: '分桶',
       size: 220,
       minSize: 180,
-      accessorFn: (row) => row.label,
-      cell: ({ row }) => <Tag color={row.original.sample_ok ? 'blue' : 'default'}>{row.original.label}</Tag>,
+      accessorFn: (row) => tradeAttributionBucketLabel(row),
+      cell: ({ row }) => <Tag color={tradeAttributionBucketTagColor(row.original)}>{tradeAttributionBucketLabel(row.original)}</Tag>,
     },
-    { id: 'trade_count', header: '交易', size: 72, minSize: 66, accessorFn: (row) => row.trade_count, cell: ({ row }) => row.original.trade_count },
-    { id: 'oos_trade_count', header: 'OOS', size: 72, minSize: 66, accessorFn: (row) => row.oos_trade_count, cell: ({ row }) => row.original.oos_trade_count },
-    { id: 'win_rate', header: '胜率', size: 82, minSize: 76, accessorFn: (row) => row.win_rate, cell: ({ row }) => formatPct(row.original.win_rate) },
-    { id: 'net_pnl', header: '净盈亏', size: 96, minSize: 88, accessorFn: (row) => row.net_pnl, cell: ({ row }) => formatNumber(row.original.net_pnl, 2) },
-    { id: 'avg_return_pct', header: '均收益', size: 88, minSize: 80, accessorFn: (row) => row.avg_return_pct, cell: ({ row }) => formatPct(row.original.avg_return_pct) },
-    { id: 'profit_factor', header: 'PF', size: 72, minSize: 66, accessorFn: (row) => row.profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.profit_factor, 2) },
-    { id: 'loss_contribution', header: '亏损贡献', size: 96, minSize: 88, accessorFn: (row) => row.loss_contribution, cell: ({ row }) => formatPct(row.original.loss_contribution) },
-    { id: 'big_loss_count', header: '大亏', size: 68, minSize: 62, accessorFn: (row) => row.big_loss_count, cell: ({ row }) => row.original.big_loss_count },
+    { id: 'is_trade_count', header: 'IS交易', size: 82, minSize: 76, accessorFn: (row) => row.is_trade_count, cell: ({ row }) => row.original.is_trade_count },
+    { id: 'is_win_rate', header: 'IS胜率', size: 86, minSize: 78, accessorFn: (row) => row.is_win_rate, cell: ({ row }) => formatPct(row.original.is_win_rate) },
+    {
+      id: 'is_net_pnl',
+      header: 'IS净贡献',
+      size: 112,
+      minSize: 102,
+      accessorFn: (row) => row.is_net_pnl,
+      cell: ({ row }) => <Text type={row.original.is_net_pnl < 0 ? 'danger' : 'success'}>{formatNumber(row.original.is_net_pnl, 2)}</Text>,
+    },
+    { id: 'is_profit_factor', header: 'IS PF', size: 76, minSize: 70, accessorFn: (row) => row.is_profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.is_profit_factor, 2) },
+    {
+      id: 'is_pf_delta',
+      header: 'IS PF差',
+      size: 86,
+      minSize: 78,
+      accessorFn: (row) => row.is_pf_delta ?? 0,
+      cell: ({ row }) => <Text type={Number(row.original.is_pf_delta ?? 0) < 0 ? 'danger' : 'success'}>{formatSignedNumber(row.original.is_pf_delta, 2)}</Text>,
+    },
+    {
+      id: 'is_avg_return_delta',
+      header: 'IS均收益差',
+      size: 112,
+      minSize: 102,
+      accessorFn: (row) => row.is_avg_return_delta,
+      cell: ({ row }) => <Text type={row.original.is_avg_return_delta < 0 ? 'danger' : 'success'}>{formatSignedPct(row.original.is_avg_return_delta)}</Text>,
+    },
+    {
+      id: 'is_loss_contribution',
+      header: 'IS毛亏损占比',
+      size: 122,
+      minSize: 112,
+      accessorFn: (row) => row.is_loss_contribution,
+      cell: ({ row }) => (
+        <Tooltip title="该桶内亏损交易的毛亏损，占全部 IS 毛亏损的比例；不扣除同桶盈利，所以不能单独代表这个桶不好。">
+          <Text>{formatPct(row.original.is_loss_contribution)}</Text>
+        </Tooltip>
+      ),
+    },
+    { id: 'oos_trade_count', header: 'OOS交易', size: 88, minSize: 80, accessorFn: (row) => row.oos_trade_count, cell: ({ row }) => row.original.oos_trade_count },
+    {
+      id: 'oos_net_pnl',
+      header: 'OOS净贡献',
+      size: 116,
+      minSize: 106,
+      accessorFn: (row) => row.oos_net_pnl,
+      cell: ({ row }) => <Text type={row.original.oos_net_pnl < 0 ? 'danger' : 'success'}>{formatNumber(row.original.oos_net_pnl, 2)}</Text>,
+    },
+    { id: 'oos_profit_factor', header: 'OOS PF', size: 86, minSize: 78, accessorFn: (row) => row.oos_profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.oos_profit_factor, 2) },
+    {
+      id: 'oos_pf_delta',
+      header: 'OOS PF差',
+      size: 94,
+      minSize: 84,
+      accessorFn: (row) => row.oos_pf_delta ?? 0,
+      cell: ({ row }) => <Text type={Number(row.original.oos_pf_delta ?? 0) < 0 ? 'danger' : 'success'}>{formatSignedNumber(row.original.oos_pf_delta, 2)}</Text>,
+    },
+    {
+      id: 'oos_loss_contribution',
+      header: 'OOS毛亏损占比',
+      size: 130,
+      minSize: 118,
+      accessorFn: (row) => row.oos_loss_contribution,
+      cell: ({ row }) => (
+        <Tooltip title="该桶内亏损交易的毛亏损，占全部 OOS 毛亏损的比例；只辅助定位亏损来源。">
+          <Text>{formatPct(row.original.oos_loss_contribution)}</Text>
+        </Tooltip>
+      ),
+    },
   ], []);
   const riskCompareColumns = useMemo<ColumnDef<ParameterGroupView>[]>(() => [
     {
@@ -6336,6 +8403,66 @@ function ParametersView({
       ),
     },
   ], [addRunToCompare, onOpenRun]);
+  const drawdownProtectionComparisonColumns = useMemo<ColumnDef<DrawdownProtectionComparisonRow>[]>(() => [
+    {
+      id: 'verdict',
+      header: '判断',
+      size: 92,
+      minSize: 86,
+      accessorFn: (row) => row.verdict,
+      cell: ({ row }) => {
+        if (row.original.verdict === 'baseline') {
+          return <Tag>基准</Tag>;
+        }
+        if (row.original.verdict === 'improved') {
+          return <Tag color="green">候选</Tag>;
+        }
+        if (row.original.verdict === 'worse') {
+          return <Tag color="red">变差</Tag>;
+        }
+        return <Tag color="gold">权衡</Tag>;
+      },
+    },
+    {
+      id: 'protection',
+      header: '保护方案',
+      size: 220,
+      minSize: 190,
+      accessorFn: (row) => row.protection,
+      cell: ({ row }) => <Tag color={row.original.verdict === 'baseline' ? 'default' : 'orange'}>{row.original.protection}</Tag>,
+    },
+    { id: 'oos_total_return', header: 'OOS', size: 96, minSize: 88, accessorFn: (row) => row.oos_total_return ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.oos_total_return) },
+    {
+      id: 'oos_delta',
+      header: 'OOS 变化',
+      size: 96,
+      minSize: 88,
+      accessorFn: (row) => row.oos_delta ?? 0,
+      cell: ({ row }) => <Text type={Number(row.original.oos_delta ?? 0) >= 0 ? 'success' : 'danger'}>{formatSignedPct(row.original.oos_delta)}</Text>,
+    },
+    { id: 'max_drawdown', header: '最大回撤', size: 104, minSize: 96, accessorFn: (row) => row.max_drawdown, cell: ({ row }) => formatPct(row.original.max_drawdown) },
+    {
+      id: 'drawdown_delta',
+      header: '回撤变化',
+      size: 104,
+      minSize: 96,
+      accessorFn: (row) => row.drawdown_delta ?? 0,
+      cell: ({ row }) => <Text type={Number(row.original.drawdown_delta ?? 0) <= 0 ? 'success' : 'danger'}>{formatSignedPct(row.original.drawdown_delta)}</Text>,
+    },
+    { id: 'profit_factor', header: 'PF', size: 74, minSize: 68, accessorFn: (row) => row.profit_factor ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatNumber(row.original.profit_factor, 2) },
+    { id: 'profit_factor_delta', header: 'PF 变化', size: 84, minSize: 78, accessorFn: (row) => row.profit_factor_delta ?? 0, cell: ({ row }) => formatSignedNumber(row.original.profit_factor_delta, 2) },
+    { id: 'trade_count', header: '交易数', size: 82, minSize: 76, accessorFn: (row) => row.trade_count, cell: ({ row }) => row.original.trade_count },
+    { id: 'trade_retention', header: '交易保留', size: 96, minSize: 88, accessorFn: (row) => row.trade_retention ?? Number.NEGATIVE_INFINITY, cell: ({ row }) => formatPct(row.original.trade_retention) },
+    { id: 'total_return', header: '总收益', size: 96, minSize: 88, accessorFn: (row) => row.total_return, cell: ({ row }) => formatPct(row.original.total_return) },
+    {
+      id: 'actions',
+      header: '操作',
+      size: 92,
+      minSize: 84,
+      enableSorting: false,
+      cell: ({ row }) => <Button size="small" onClick={() => onOpenRun(row.original.run_id)}>打开</Button>,
+    },
+  ], [onOpenRun]);
   const experimentResultColumns = useMemo<ColumnDef<ParameterLabRow>[]>(() => [
     {
       header: 'Run',
@@ -6367,6 +8494,7 @@ function ParametersView({
         <Space direction="vertical" size={0}>
           <Text>{row.original.parameter_summary || `${row.original.fast_period ?? '--'} / ${row.original.slow_period ?? '--'}`}</Text>
           {row.original.signal_filter_summary ? <Tag color="blue">{row.original.signal_filter_summary}</Tag> : null}
+          {row.original.execution_protection_summary ? <Tag color="orange">{row.original.execution_protection_summary}</Tag> : null}
         </Space>
       ),
     },
@@ -8338,6 +10466,26 @@ function ParametersView({
                           ) : <Text type="secondary">当前批次还没有人工结论。</Text>}
                         </Space>
                       </Card>
+                      {isDrawdownProtectionBatch ? (
+                        <Card size="small" title="回撤保护对比">
+                          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                            <Alert
+                              type="info"
+                              showIcon
+                              message="以无保护 Run 为基准，对比每个保护方案的 OOS、最大回撤、PF 和交易保留。"
+                              description="候选表示回撤下降且 OOS/PF 没有明显受损；权衡表示风险收益需要人工判断。"
+                            />
+                            <DataTable
+                              columns={drawdownProtectionComparisonColumns}
+                              data={drawdownProtectionComparisonRows}
+                              tableClassName="cbw-parameter-result-table"
+                              initialPageSize={12}
+                              pageSizeOptions={[12, 24]}
+                              initialSorting={[{ id: 'drawdown_delta', desc: false }]}
+                            />
+                          </Space>
+                        </Card>
+                      ) : null}
                       <Card size="small" title="推荐研究 Run">
                         <Paragraph type="secondary">
                           按样本外收益、超额、交易数、回撤和 IS/OOS 差综合排序。可直接打开分析，或固定风险参数后跑趋势周期邻域。
@@ -8859,7 +11007,7 @@ function ParametersView({
                 type="info"
                 showIcon
                 message="还没有匹配到过滤后 Run"
-                description="先在研究池点击单指标或叠加提交过滤器实验；实验完成后再打开这里查看。"
+                description="先在研究池点击早败或通用提交过滤器实验；实验完成后再打开这里查看。"
               />
             )}
           </Space>
@@ -8903,6 +11051,90 @@ function ParametersView({
                 </Space>
               )}
             />
+            <Alert
+              type="info"
+              showIcon
+              message="早期失败归因流程：先把前三根无浮盈当失败标签，再倒推入场前代理特征"
+              description={`早期失败定义为入场后三根最大浮盈 < 0.25R；主表优先展示趋势、回踩、突破、波动与方向组合。${earlyFailBaselineText}。`}
+            />
+            <Card size="small" title="早期失败归因（主看）">
+              <Alert
+                type={earlyFailAttributionConclusion.type}
+                showIcon
+                message={earlyFailAttributionConclusion.message}
+                description={earlyFailAttributionConclusion.description}
+                style={{ marginBottom: 12 }}
+              />
+              {!primaryEarlyFailAttributionBuckets.length && fallbackEarlyFailAttributionBuckets.length ? (
+                <Alert
+                  type="warning"
+                  showIcon
+                  message="没有强信号，下面仅展示弱线索"
+                  description="这些行没有满足 OOS 复现或明显高于总体的门槛，只用于说明当前入场前特征的解释力偏弱。"
+                  style={{ marginBottom: 12 }}
+                />
+              ) : null}
+              {visibleEarlyFailAttributionBuckets.length ? (
+                <DataTable
+                  columns={earlyFailAttributionColumns}
+                  data={visibleEarlyFailAttributionBuckets}
+                  tableClassName="cbw-parameter-group-table"
+                  stickyColumnCount={4}
+                  initialPageSize={8}
+                  pageSizeOptions={[8, 12, 24]}
+                  initialSorting={[{ id: 'judgement', desc: true }]}
+                />
+              ) : (
+                <Alert
+                  type="info"
+                  showIcon
+                  message="没有可展示的早期失败入场前线索"
+                  description="当前候选的入场前特征覆盖不足，或没有任何维度达到最低 IS 样本门槛。"
+                />
+              )}
+            </Card>
+            <Alert
+              type="info"
+              showIcon
+              message="止损归因流程：IS 找高止损共性，OOS 看是否复现"
+              description="止损归因保留入场后路径线索，用来解释已经发生的止损亏损；它不能替代早期失败的入场前过滤实验。"
+            />
+            <Card size="small" title="止损归因（辅助）">
+              <Alert
+                type={stopLossAttributionConclusion.type}
+                showIcon
+                message={stopLossAttributionConclusion.message}
+                description={stopLossAttributionConclusion.description}
+                style={{ marginBottom: 12 }}
+              />
+              {pathStopLossAttributionBuckets.length ? (
+                <DataTable
+                  columns={stopLossAttributionColumns}
+                  data={pathStopLossAttributionBuckets}
+                  tableClassName="cbw-parameter-group-table"
+                  initialPageSize={8}
+                  pageSizeOptions={[8, 12, 24]}
+                  initialSorting={[{ id: 'judgement', desc: true }]}
+                />
+              ) : (
+                <Alert
+                  type="info"
+                  showIcon
+                  message="没有明显高于总体的止损共性"
+                  description="这通常说明止损分布更像策略本身的常态损耗，或当前可用的入场特征还不足以解释止损原因。"
+                />
+              )}
+            </Card>
+            <Card size="small" title="止损亏损拆解（全部线索）">
+              <DataTable
+                columns={stopLossAttributionColumns}
+                data={primaryStopLossAttributionBuckets}
+                tableClassName="cbw-parameter-group-table"
+                initialPageSize={8}
+                pageSizeOptions={[8, 12, 24]}
+                initialSorting={[{ id: 'judgement', desc: true }]}
+              />
+            </Card>
             {tradeAttribution.hypotheses.length ? (
               <Card size="small" title="候选归因假设">
                 <Space direction="vertical" size={8} style={{ width: '100%' }}>
@@ -8920,14 +11152,33 @@ function ParametersView({
             ) : (
               <Alert type="info" showIcon message="暂时没有生成可复验的归因假设" />
             )}
-            <Card size="small" title="归因分桶">
+            <Card size="small" title="收益归因（辅助）">
+              {primaryTradeAttributionBuckets.length ? (
+                <DataTable
+                  columns={tradeAttributionBucketColumns}
+                  data={primaryTradeAttributionBuckets}
+                  tableClassName="cbw-parameter-group-table"
+                  initialPageSize={8}
+                  pageSizeOptions={[8, 12, 24]}
+                  initialSorting={[{ id: 'judgement', desc: true }]}
+                />
+              ) : (
+                <Alert
+                  type="info"
+                  showIcon
+                  message="没有足够稳定的入场前分桶"
+                  description="当前 Run 仍可看全部分桶做现象排查，但还不适合直接形成入场过滤规则。"
+                />
+              )}
+            </Card>
+            <Card size="small" title="全部分桶（含结果解释）">
               <DataTable
                 columns={tradeAttributionBucketColumns}
-                data={tradeAttribution.buckets}
+                data={tradeAttribution.buckets ?? []}
                 tableClassName="cbw-parameter-group-table"
                 initialPageSize={10}
                 pageSizeOptions={[10, 20, 40]}
-                initialSorting={[{ id: 'loss_contribution', desc: true }]}
+                initialSorting={[{ id: 'judgement', desc: true }]}
               />
             </Card>
             <Card size="small" title="大亏交易">

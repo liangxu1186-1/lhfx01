@@ -58,7 +58,7 @@ async function parseResponse<T>(response: Response): Promise<T> {
 }
 
 async function fetchJson<T>(path: string): Promise<T> {
-  const response = await fetch(apiUrl(path));
+  const response = await fetch(apiUrl(path), { cache: 'no-store' });
   return parseResponse<T>(response);
 }
 

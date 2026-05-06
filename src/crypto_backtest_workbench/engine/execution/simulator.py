@@ -36,6 +36,10 @@ class ExecutionConstraints:
     qty_by_policy: dict[str, float] = field(default_factory=dict)
     cash_allocation_pct_by_policy: dict[str, float] = field(default_factory=dict)
     risk_pct_per_trade_by_policy: dict[str, float] = field(default_factory=dict)
+    max_equity_drawdown_pct: float | None = None
+    cooldown_after_consecutive_stop_losses: int | None = None
+    cooldown_bars: int | None = None
+    cooldown_only_short_holding_bars: int | None = None
 
 
 @dataclass(slots=True)
@@ -52,6 +56,7 @@ class ExecutionResult:
 class _OpenPosition:
     trade: TradeRecord
     reserved_margin: float
+    entry_index: int
 
 
 def simulate_signals(
@@ -68,6 +73,14 @@ def simulate_signals(
     for risk_pct in constraints.risk_pct_per_trade_by_policy.values():
         if risk_pct <= 0 or risk_pct >= 1:
             raise ValueError("risk_pct_per_trade must be in (0, 1)")
+    if constraints.max_equity_drawdown_pct is not None and not 0 < constraints.max_equity_drawdown_pct < 1:
+        raise ValueError("max_equity_drawdown_pct must be in (0, 1)")
+    if constraints.cooldown_after_consecutive_stop_losses is not None and constraints.cooldown_after_consecutive_stop_losses <= 0:
+        raise ValueError("cooldown_after_consecutive_stop_losses must be positive")
+    if constraints.cooldown_bars is not None and constraints.cooldown_bars <= 0:
+        raise ValueError("cooldown_bars must be positive")
+    if constraints.cooldown_only_short_holding_bars is not None and constraints.cooldown_only_short_holding_bars <= 0:
+        raise ValueError("cooldown_only_short_holding_bars must be positive")
 
     sorted_candles = sorted(candles, key=lambda candle: candle.timestamp)
     index_by_timestamp = {candle.timestamp: index for index, candle in enumerate(sorted_candles)}
@@ -112,11 +125,15 @@ def simulate_signals(
         unrealized_pnl=0.0,
     )
     position: _OpenPosition | None = None
+    peak_equity = constraints.initial_cash
+    cooldown_until_index = -1
+    consecutive_protected_stop_losses = 0
 
     for index, candle in enumerate(sorted_candles):
         if position is not None:
             sltp_order, sltp_fill, closed_position = _maybe_close_for_planned_sltp(
                 candle=candle,
+                candle_index=index,
                 constraints=constraints,
                 account=account,
                 position=position,
@@ -125,12 +142,46 @@ def simulate_signals(
                 orders.append(sltp_order)
                 fills.append(sltp_fill)
                 trades.append(closed_position.trade)
+                if _is_protected_stop_loss(closed_position.trade, constraints=constraints):
+                    consecutive_protected_stop_losses += 1
+                    if (
+                        constraints.cooldown_after_consecutive_stop_losses is not None
+                        and constraints.cooldown_bars is not None
+                        and consecutive_protected_stop_losses >= constraints.cooldown_after_consecutive_stop_losses
+                    ):
+                        cooldown_until_index = max(cooldown_until_index, index + constraints.cooldown_bars)
+                        consecutive_protected_stop_losses = 0
+                else:
+                    consecutive_protected_stop_losses = 0
                 position = None
+        peak_equity = max(peak_equity, account.equity)
+        drawdown_guard_blocks_open = (
+            constraints.max_equity_drawdown_pct is not None
+            and peak_equity > 0
+            and (peak_equity - account.equity) / peak_equity >= constraints.max_equity_drawdown_pct
+        )
+        cooldown_blocks_open = index < cooldown_until_index
 
         for signal in scheduled_signals.get(index, ()):
+            if signal.action is SignalAction.OPEN and (drawdown_guard_blocks_open or cooldown_blocks_open):
+                warnings.append(
+                    _warning(
+                        run_id=signal.run_id,
+                        warning_code="OPEN_SKIPPED_DRAWDOWN_PROTECTION",
+                        message="Open signal skipped by drawdown protection.",
+                        payload={
+                            "signal_id": signal.signal_id,
+                            "drawdown_guard_blocks_open": drawdown_guard_blocks_open,
+                            "cooldown_blocks_open": cooldown_blocks_open,
+                            "cooldown_until_index": cooldown_until_index,
+                        },
+                    )
+                )
+                continue
             signal_orders, signal_fills, signal_trades, signal_warnings, position = _execute_signal(
                 signal=signal,
                 candle=candle,
+                candle_index=index,
                 constraints=constraints,
                 account=account,
                 position=position,
@@ -142,6 +193,7 @@ def simulate_signals(
             if position is not None and position.trade.entry_time == candle.timestamp:
                 sltp_order, sltp_fill, closed_position = _maybe_close_for_planned_sltp(
                     candle=candle,
+                    candle_index=index,
                     constraints=constraints,
                     account=account,
                     position=position,
@@ -150,11 +202,23 @@ def simulate_signals(
                     orders.append(sltp_order)
                     fills.append(sltp_fill)
                     trades.append(closed_position.trade)
+                    if _is_protected_stop_loss(closed_position.trade, constraints=constraints):
+                        consecutive_protected_stop_losses += 1
+                        if (
+                            constraints.cooldown_after_consecutive_stop_losses is not None
+                            and constraints.cooldown_bars is not None
+                            and consecutive_protected_stop_losses >= constraints.cooldown_after_consecutive_stop_losses
+                        ):
+                            cooldown_until_index = max(cooldown_until_index, index + constraints.cooldown_bars)
+                            consecutive_protected_stop_losses = 0
+                    else:
+                        consecutive_protected_stop_losses = 0
                     position = None
 
         unrealized_pnl = _unrealized_pnl(position, candle.close)
         account.unrealized_pnl = unrealized_pnl
         account.equity = account.available_cash + account.used_margin + unrealized_pnl
+        peak_equity = max(peak_equity, account.equity)
         equity_curve.append(
             EquityPoint(
                 timestamp=candle.timestamp,
@@ -178,10 +242,20 @@ def simulate_signals(
     )
 
 
+def _is_protected_stop_loss(trade: TradeRecord, *, constraints: ExecutionConstraints) -> bool:
+    if not str(trade.exit_reason or "").startswith("stop_loss"):
+        return False
+    holding_limit = constraints.cooldown_only_short_holding_bars
+    if holding_limit is not None and trade.holding_bars > holding_limit:
+        return False
+    return True
+
+
 def _execute_signal(
     *,
     signal: SignalIntent,
     candle: CanonicalCandle,
+    candle_index: int,
     constraints: ExecutionConstraints,
     account: AccountSnapshot,
     position: _OpenPosition | None,
@@ -211,7 +285,7 @@ def _execute_signal(
                 )
             )
             return orders, fills, trades, warnings, position
-        order, fill, next_position = _open_position(signal, candle, constraints, account)
+        order, fill, next_position = _open_position(signal, candle, candle_index, constraints, account)
         orders.append(order)
         if fill is not None:
             fills.append(fill)
@@ -228,7 +302,7 @@ def _execute_signal(
                 )
             )
             return orders, fills, trades, warnings, None
-        order, fill = _close_position(signal, candle, constraints, account, position)
+        order, fill = _close_position(signal, candle, candle_index, constraints, account, position)
         orders.append(order)
         fills.append(fill)
         trades.append(position.trade)
@@ -236,12 +310,12 @@ def _execute_signal(
 
     if signal.action is SignalAction.REVERSE:
         if position is not None:
-            close_order, close_fill = _close_position(signal, candle, constraints, account, position)
+            close_order, close_fill = _close_position(signal, candle, candle_index, constraints, account, position)
             orders.append(close_order)
             fills.append(close_fill)
             trades.append(position.trade)
             position = None
-        open_order, open_fill, next_position = _open_position(signal, candle, constraints, account)
+        open_order, open_fill, next_position = _open_position(signal, candle, candle_index, constraints, account)
         orders.append(open_order)
         if open_fill is not None:
             fills.append(open_fill)
@@ -253,6 +327,7 @@ def _execute_signal(
 def _open_position(
     signal: SignalIntent,
     candle: CanonicalCandle,
+    candle_index: int,
     constraints: ExecutionConstraints,
     account: AccountSnapshot,
 ) -> tuple[OrderRequest, FillEvent | None, _OpenPosition | None]:
@@ -310,12 +385,13 @@ def _open_position(
         fee=fee,
         slippage_cost=abs(fill_price - candle.open) * qty,
     )
-    return order, fill, _OpenPosition(trade=trade, reserved_margin=margin)
+    return order, fill, _OpenPosition(trade=trade, reserved_margin=margin, entry_index=candle_index)
 
 
 def _close_position(
     signal: SignalIntent,
     candle: CanonicalCandle,
+    candle_index: int,
     constraints: ExecutionConstraints,
     account: AccountSnapshot,
     position: _OpenPosition,
@@ -338,6 +414,7 @@ def _close_position(
     trade.net_pnl = net_pnl
     trade.return_pct = gross_pnl / (trade.entry_price * trade.qty) if trade.entry_price > 0 and trade.qty > 0 else 0.0
     trade.exit_reason = signal.reason_code
+    trade.holding_bars = max(0, candle_index - position.entry_index)
 
     order = OrderRequest(
         order_id=_next_id("order"),
@@ -368,6 +445,7 @@ def _close_position(
 def _maybe_close_for_planned_sltp(
     *,
     candle: CanonicalCandle,
+    candle_index: int,
     constraints: ExecutionConstraints,
     account: AccountSnapshot,
     position: _OpenPosition,
@@ -383,6 +461,7 @@ def _maybe_close_for_planned_sltp(
         fill_price=fill_price,
         request_price=candle.open,
         request_time=candle.timestamp,
+        candle_index=candle_index,
         constraints=constraints,
         account=account,
         position=position,
@@ -429,6 +508,7 @@ def _close_position_at_price(
     fill_price: float,
     request_price: float,
     request_time,
+    candle_index: int,
     constraints: ExecutionConstraints,
     account: AccountSnapshot,
     position: _OpenPosition,
@@ -450,6 +530,7 @@ def _close_position_at_price(
     trade.net_pnl = net_pnl
     trade.return_pct = gross_pnl / (trade.entry_price * trade.qty) if trade.entry_price > 0 and trade.qty > 0 else 0.0
     trade.exit_reason = reason_code
+    trade.holding_bars = max(0, candle_index - position.entry_index)
 
     order = OrderRequest(
         order_id=_next_id("order"),

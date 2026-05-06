@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import csv
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from math import isfinite, isnan
+from pathlib import Path
 
 from crypto_backtest_workbench.domain.models import (
     BacktestRun,
@@ -347,9 +349,17 @@ def _coerce_policy_float(value: object) -> float | None:
     return _coerce_float(first_value)
 
 
-def build_trade_rows(detail: RunDetailView) -> list[dict[str, object]]:
+def build_trade_rows(detail: RunDetailView, *, data_dir: Path | None = None) -> list[dict[str, object]]:
+    feature_rows = _load_feature_rows_by_timestamp(detail=detail, data_dir=data_dir)
     rows: list[dict[str, object]] = []
     for trade in detail.execution.trades:
+        entry_signal_meta_json = trade.entry_signal_meta_json
+        if feature_rows:
+            entry_signal_meta_json = _with_backfilled_entry_features(
+                detail=detail,
+                trade=trade,
+                feature_rows=feature_rows,
+            )
         rows.append(
             {
                 "trade_id": trade.trade_id,
@@ -369,10 +379,192 @@ def build_trade_rows(detail: RunDetailView) -> list[dict[str, object]]:
                 "exit_reason": trade.exit_reason,
                 "planned_stop_loss_price": trade.planned_stop_loss_price,
                 "planned_take_profit_price": trade.planned_take_profit_price,
-                "entry_signal_meta_json": trade.entry_signal_meta_json,
+                "entry_signal_meta_json": entry_signal_meta_json,
+                **_entry_feature_columns(entry_signal_meta_json),
             }
         )
     return rows
+
+
+def _entry_feature_columns(entry_signal_meta_json: object) -> dict[str, object]:
+    if not isinstance(entry_signal_meta_json, dict):
+        return {}
+    feature_values = entry_signal_meta_json.get("feature_values")
+    if not isinstance(feature_values, dict):
+        return {}
+    keys = (
+        "pre_entry_momentum_3_pct",
+        "pre_entry_momentum_5_pct",
+        "pre_entry_consecutive_move",
+        "trend_gap_atr",
+        "entry_distance_atr",
+        "local_range_position_20",
+        "local_extreme_distance_atr",
+        "breakout_wick_atr",
+        "range_chop_score_20",
+        "ema_fast_slope_3_atr",
+        "atr_pct",
+    )
+    return {key: value for key in keys if (value := _coerce_float(feature_values.get(key))) is not None}
+
+
+def _load_feature_rows_by_timestamp(*, detail: RunDetailView, data_dir: Path | None) -> dict[datetime, dict[str, float]]:
+    if data_dir is None:
+        return {}
+    feature_artifact_id = detail.manifest.feature_artifact_id
+    if not feature_artifact_id:
+        return {}
+    path = data_dir / "features" / feature_artifact_id / "feature_rows.csv"
+    if not path.exists():
+        return {}
+    rows: dict[datetime, dict[str, float]] = {}
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            timestamp_raw = row.get("timestamp")
+            if not timestamp_raw:
+                continue
+            values: dict[str, float] = {}
+            for key, value in row.items():
+                if key in {"timestamp", "symbol"} or value in {None, ""}:
+                    continue
+                try:
+                    values[key] = float(value)
+                except ValueError:
+                    continue
+            rows[datetime.fromisoformat(timestamp_raw)] = values
+    return rows
+
+
+def _with_backfilled_entry_features(*, detail: RunDetailView, trade, feature_rows: dict[datetime, dict[str, float]]) -> dict[str, object]:
+    meta = dict(trade.entry_signal_meta_json or {})
+    raw_features = meta.get("feature_values")
+    feature_values = dict(raw_features) if isinstance(raw_features, dict) else {}
+    if not feature_values:
+        meta["feature_values"] = feature_values
+    params = detail.manifest.resolved_config_json.get("strategy_params")
+    if not isinstance(params, dict):
+        params = {}
+    current = feature_rows.get(trade.entry_time)
+    if current is None:
+        return meta
+    timestamps = sorted(feature_rows)
+    try:
+        index = timestamps.index(trade.entry_time)
+    except ValueError:
+        return meta
+    history = [feature_rows[timestamp] for timestamp in timestamps[: index + 1]]
+    side = trade.side.value
+    trend_fast_period = _coerce_int(params.get("trend_fast_period"))
+    trend_slow_period = _coerce_int(params.get("trend_slow_period"))
+    entry_ema_period = _coerce_int(params.get("entry_ema_period")) or 21
+    atr_period = _coerce_int(params.get("atr_period")) or 14
+    trend_fast_column = f"ema_close_{trend_fast_period}" if trend_fast_period is not None else ""
+    trend_slow_column = f"ema_close_{trend_slow_period}" if trend_slow_period is not None else ""
+    entry_ema_column = f"ema_close_{entry_ema_period}"
+    atr_column = f"atr_{atr_period}"
+
+    def set_missing(key: str, value: float | None) -> None:
+        if value is not None and _coerce_float(feature_values.get(key)) is None:
+            feature_values[key] = value
+
+    close = _coerce_float(current.get("close"))
+    high = _coerce_float(current.get("high"))
+    low = _coerce_float(current.get("low"))
+    trend_fast = _coerce_float(feature_values.get("trend_fast_ema")) or _coerce_float(current.get(trend_fast_column))
+    trend_slow = _coerce_float(feature_values.get("trend_slow_ema")) or _coerce_float(current.get(trend_slow_column))
+    entry_ema = _coerce_float(feature_values.get("entry_ema")) or _coerce_float(current.get(entry_ema_column))
+    atr = _coerce_float(feature_values.get("atr")) or _coerce_float(current.get(atr_column))
+    previous = history[:-1]
+    previous_row = previous[-1] if previous else {}
+    previous_high = _coerce_float(feature_values.get("previous_high")) or _coerce_float(previous_row.get("high"))
+    previous_low = _coerce_float(feature_values.get("previous_low")) or _coerce_float(previous_row.get("low"))
+
+    set_missing("close", close)
+    set_missing("high", high)
+    set_missing("low", low)
+    set_missing("trend_fast_ema", trend_fast)
+    set_missing("trend_slow_ema", trend_slow)
+    set_missing("entry_ema", entry_ema)
+    set_missing("atr", atr)
+    set_missing("previous_high", previous_high)
+    set_missing("previous_low", previous_low)
+    if close is not None and close > 0 and atr is not None:
+        set_missing("atr_pct", atr / close)
+    if close is not None and close > 0 and trend_fast is not None and trend_slow is not None:
+        set_missing("trend_gap_pct", abs(trend_fast - trend_slow) / close)
+    if atr is not None and atr > 0 and trend_fast is not None and trend_slow is not None:
+        set_missing("trend_gap_atr", abs(trend_fast - trend_slow) / atr)
+    if atr is not None and atr > 0 and entry_ema is not None and close is not None:
+        touch_value = low if side == "long" else high
+        if touch_value is not None:
+            set_missing("entry_distance_atr", abs(touch_value - entry_ema) / atr)
+        close_distance = close - entry_ema if side == "long" else entry_ema - close
+        set_missing("ema_reclaim_strength_atr", close_distance / atr)
+        if low is not None and high is not None:
+            touched_ema = low <= entry_ema if side == "long" else high >= entry_ema
+            closed_back = close >= entry_ema if side == "long" else close <= entry_ema
+            set_missing("ema_reclaim", 1.0 if touched_ema and closed_back else 0.0)
+
+    for lookback in (3, 5):
+        if len(history) > lookback and close is not None:
+            base = _coerce_float(history[-lookback - 1].get("close"))
+            if base is not None and base > 0:
+                raw = (close - base) / base
+                set_missing(f"pre_entry_momentum_{lookback}_pct", raw if side == "long" else -raw)
+
+    consecutive = 0
+    for left, right in zip(reversed(history[:-1]), reversed(history)):
+        left_close = _coerce_float(left.get("close"))
+        right_close = _coerce_float(right.get("close"))
+        if left_close is None or right_close is None:
+            break
+        moved_with_side = right_close > left_close if side == "long" else right_close < left_close
+        if not moved_with_side:
+            break
+        consecutive += 1
+    set_missing("pre_entry_consecutive_move", float(consecutive))
+
+    if atr is not None and atr > 0 and len(history) > 3 and trend_fast is not None:
+        previous_fast = _coerce_float(history[-4].get(trend_fast_column))
+        if previous_fast is not None:
+            raw_slope = (trend_fast - previous_fast) / atr
+            set_missing("ema_fast_slope_3_atr", raw_slope if side == "long" else -raw_slope)
+
+    prior_20 = previous[-20:]
+    if close is not None and prior_20:
+        highs = [_coerce_float(row.get("high")) for row in prior_20]
+        lows = [_coerce_float(row.get("low")) for row in prior_20]
+        closes = [_coerce_float(row.get("close")) for row in prior_20]
+        valid_highs = [value for value in highs if value is not None]
+        valid_lows = [value for value in lows if value is not None]
+        valid_closes = [value for value in closes if value is not None]
+        if valid_highs and valid_lows:
+            local_high = max(valid_highs)
+            local_low = min(valid_lows)
+            range_size = local_high - local_low
+            if range_size > 0:
+                raw_position = (close - local_low) / range_size
+                set_missing("local_range_position_20", raw_position if side == "long" else 1 - raw_position)
+                if atr is not None and atr > 0:
+                    extreme = local_high if side == "long" else local_low
+                    set_missing("local_extreme_distance_atr", abs(close - extreme) / atr)
+        if len(valid_closes) >= 2:
+            net_move = abs(valid_closes[-1] - valid_closes[0])
+            gross_move = sum(abs(right - left) for left, right in zip(valid_closes, valid_closes[1:]))
+            if gross_move > 0:
+                set_missing("range_chop_score_20", max(0.0, min(1.0, 1.0 - net_move / gross_move)))
+
+    if atr is not None and atr > 0 and close is not None:
+        if side == "long" and previous_high is not None and high is not None and high > previous_high:
+            set_missing("breakout_wick_atr", max(0.0, high - max(close, previous_high)) / atr)
+        elif side == "short" and previous_low is not None and low is not None and low < previous_low:
+            set_missing("breakout_wick_atr", max(0.0, min(close, previous_low) - low) / atr)
+        else:
+            set_missing("breakout_wick_atr", 0.0)
+    meta["feature_values"] = feature_values
+    meta["feature_backfilled"] = True
+    return meta
 
 
 def filter_trade_rows(

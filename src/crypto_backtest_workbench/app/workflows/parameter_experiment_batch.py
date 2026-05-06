@@ -60,6 +60,7 @@ class ParameterExperimentBatchRequest:
     cash_allocation_pct_candidates: tuple[float, ...] = ()
     risk_pct_per_trade_candidates: tuple[float, ...] = ()
     signal_filter_sets: tuple[dict[str, object], ...] = ()
+    execution_protection_sets: tuple[dict[str, object], ...] = ()
     benchmark_enabled: bool = True
     max_samples: int | None = None
     seed: int | None = None
@@ -127,6 +128,7 @@ def build_parameter_experiment_batch(
             cash_allocation_pct_candidates=request.cash_allocation_pct_candidates,
             risk_pct_per_trade_candidates=request.risk_pct_per_trade_candidates,
             signal_filter_sets=request.signal_filter_sets,
+            execution_protection_sets=request.execution_protection_sets,
             benchmark_enabled=request.benchmark_enabled,
             max_samples=request.max_samples,
             seed=request.seed,
@@ -210,6 +212,8 @@ def _batch_search_space(request: ParameterExperimentBatchRequest) -> dict[str, o
             payload["risk_pct_per_trade_candidates"] = list(request.risk_pct_per_trade_candidates)
         if request.signal_filter_sets:
             payload["signal_filter_sets"] = list(request.signal_filter_sets)
+        if request.execution_protection_sets:
+            payload["execution_protection_sets"] = list(request.execution_protection_sets)
         return payload
     payload = {
         "fast_periods": list(request.fast_periods),
@@ -223,6 +227,8 @@ def _batch_search_space(request: ParameterExperimentBatchRequest) -> dict[str, o
         payload["risk_pct_per_trade"] = request.risk_pct_per_trade
     if request.risk_pct_per_trade_candidates:
         payload["risk_pct_per_trade_candidates"] = list(request.risk_pct_per_trade_candidates)
+    if request.execution_protection_sets:
+        payload["execution_protection_sets"] = list(request.execution_protection_sets)
     return payload
 
 

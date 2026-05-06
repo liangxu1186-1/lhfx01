@@ -278,6 +278,7 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                         trade_attribution=load_research_candidate_trade_attribution(
                             FileRunRepository(self.server.data_dir),
                             candidate_id=candidate_id,
+                            data_dir=self.server.data_dir,
                         ).as_dict(),
                     ),
                 )
@@ -775,6 +776,7 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             fee_rate=float(payload.get("fee_rate", 0.0)),
             slippage_bps=float(payload.get("slippage_bps", 0.0)),
             min_notional=float(payload.get("min_notional", 0.0)),
+            execution_protection_sets=_optional_dict_tuple(payload, "execution_protection_sets"),
             benchmark_enabled=str(payload.get("benchmark", "buy_and_hold")) == "buy_and_hold",
             max_samples=int(payload["max_samples"]) if payload.get("max_samples") is not None else None,
             seed=int(payload["seed"]) if payload.get("seed") is not None else None,
@@ -861,6 +863,7 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             fee_rate=float(payload.get("fee_rate", 0.0)),
             slippage_bps=float(payload.get("slippage_bps", 0.0)),
             min_notional=float(payload.get("min_notional", 0.0)),
+            execution_protection_sets=_optional_dict_tuple(payload, "execution_protection_sets"),
             benchmark_enabled=str(payload.get("benchmark", "buy_and_hold")) == "buy_and_hold",
             max_samples=int(payload["max_samples"]) if payload.get("max_samples") is not None else None,
             seed=int(payload["seed"]) if payload.get("seed") is not None else None,
@@ -1873,6 +1876,20 @@ def _optional_float_tuple(payload: dict[str, object], field_name: str) -> tuple[
     return tuple(float(item) for item in value)
 
 
+def _optional_dict_tuple(payload: dict[str, object], field_name: str) -> tuple[dict[str, object], ...]:
+    value = payload.get(field_name)
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{field_name} must be a non-empty array")
+    items: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError(f"{field_name} must contain only objects")
+        items.append(dict(item))
+    return tuple(items)
+
+
 def _require_str_list(payload: dict[str, object], field_name: str) -> list[str]:
     value = payload.get(field_name)
     if not isinstance(value, list) or not value:
@@ -1998,6 +2015,81 @@ def _default_signal_filter_set(filter_type: str) -> dict[str, object]:
                 }
             ],
         }
+    if filter_type == "pre_entry_momentum_3":
+        return {
+            "filter_set_id": "pre-mom3-nonnegative",
+            "label": "pre-mom3>=0",
+            "mode": "single",
+            "filters": [
+                {
+                    "filter_type": "pre_entry_momentum",
+                    "enabled": True,
+                    "params": {"lookback_bars": 3, "min_momentum_pct": 0.0},
+                }
+            ],
+        }
+    if filter_type == "pre_entry_momentum_5":
+        return {
+            "filter_set_id": "pre-mom5-nonnegative",
+            "label": "pre-mom5>=0",
+            "mode": "single",
+            "filters": [
+                {
+                    "filter_type": "pre_entry_momentum",
+                    "enabled": True,
+                    "params": {"lookback_bars": 5, "min_momentum_pct": 0.0},
+                }
+            ],
+        }
+    if filter_type == "consecutive_move":
+        return {
+            "filter_set_id": "consecutive-move-1",
+            "label": "consecutive>=1",
+            "mode": "single",
+            "filters": [
+                {
+                    "filter_type": "consecutive_move",
+                    "enabled": True,
+                    "params": {"min_consecutive": 1},
+                }
+            ],
+        }
+    if filter_type == "local_range_position":
+        return {
+            "filter_set_id": "local-position-gte-05",
+            "label": "local-pos>=0.5",
+            "mode": "single",
+            "filters": [
+                {
+                    "filter_type": "local_range_position",
+                    "enabled": True,
+                    "params": {"lookback_bars": 20, "min_position": 0.5},
+                }
+            ],
+        }
+    if filter_type == "early_fail_proxy_core":
+        return {
+            "filter_set_id": "early-fail-proxy-core",
+            "label": "early-fail-proxy-core",
+            "mode": "stacked",
+            "filters": [
+                {
+                    "filter_type": "pre_entry_momentum",
+                    "enabled": True,
+                    "params": {"lookback_bars": 3, "min_momentum_pct": 0.0},
+                },
+                {
+                    "filter_type": "consecutive_move",
+                    "enabled": True,
+                    "params": {"min_consecutive": 1},
+                },
+                {
+                    "filter_type": "local_range_position",
+                    "enabled": True,
+                    "params": {"lookback_bars": 20, "min_position": 0.5},
+                },
+            ],
+        }
     raise ValueError(f"Unsupported filter_type: {filter_type}")
 
 
@@ -2019,7 +2111,15 @@ def _normalize_signal_filter(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError("signal filter must be an object")
     filter_type = str(value.get("filter_type") or "")
-    if filter_type not in {"higher_timeframe_trend", "atr_percentile", "adx"}:
+    if filter_type not in {
+        "higher_timeframe_trend",
+        "atr_percentile",
+        "adx",
+        "pre_entry_momentum",
+        "consecutive_move",
+        "local_range_position",
+        "entry_context_exclusion",
+    }:
         raise ValueError(f"Unsupported signal filter type: {filter_type}")
     params = value.get("params")
     if params is None:

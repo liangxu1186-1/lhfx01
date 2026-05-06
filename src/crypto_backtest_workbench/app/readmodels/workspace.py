@@ -44,7 +44,7 @@ def build_workspace_snapshot(*, data_dir: Path) -> dict[str, object]:
             "multi_run_equity": build_multi_run_equity_rows(details),
         },
         "analysis": {
-            "runs": [_build_run_workspace(detail) for detail in details],
+            "runs": [_build_run_workspace(detail, data_dir=data_dir) for detail in details],
         },
         "parameter_lab": parameter_lab,
     }
@@ -87,7 +87,7 @@ def build_workspace_run_detail(*, data_dir: Path, run_id: str) -> dict[str, Any]
     run_repository = FileRunRepository(data_dir)
     detail = load_run_detail_view(run_repository, run_id)
     research_note_repository = FileResearchNoteRepository(data_dir)
-    return _build_run_workspace(detail, research_notes=research_note_repository.list_notes(target_type="run", target_id=run_id))
+    return _build_run_workspace(detail, data_dir=data_dir, research_notes=research_note_repository.list_notes(target_type="run", target_id=run_id))
 
 
 def build_workspace_parameter_lab(*, data_dir: Path) -> dict[str, object]:
@@ -174,7 +174,7 @@ def _build_parameter_lab_payload(
     }
 
 
-def _build_run_workspace(detail: Any, *, research_notes: list[Any] | None = None) -> dict[str, Any]:
+def _build_run_workspace(detail: Any, *, data_dir: Path | None = None, research_notes: list[Any] | None = None) -> dict[str, Any]:
     resolved = detail.manifest.resolved_config_json
     return {
         "run_id": detail.run.run_id,
@@ -205,7 +205,7 @@ def _build_run_workspace(detail: Any, *, research_notes: list[Any] | None = None
             "warning_count": len(detail.execution.warnings),
         },
         "equity_rows": build_equity_chart_rows(detail),
-        "trade_rows": build_trade_rows(detail),
+        "trade_rows": build_trade_rows(detail, data_dir=data_dir),
         "warning_rows": build_warning_rows(detail),
     }
 

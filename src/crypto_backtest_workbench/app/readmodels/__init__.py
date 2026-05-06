@@ -39,6 +39,8 @@ from crypto_backtest_workbench.app.readmodels.runs import (
     load_run_detail_view,
 )
 from crypto_backtest_workbench.app.readmodels.trade_attribution import (
+    EarlyFailAttributionBucket,
+    StopLossAttributionBucket,
     TradeAttributionBucket,
     TradeAttributionHypothesis,
     TradeAttributionView,
@@ -74,6 +76,8 @@ __all__ = [
     "ResearchCandidateView",
     "StableCandidateView",
     "TradeFilter",
+    "EarlyFailAttributionBucket",
+    "StopLossAttributionBucket",
     "TradeAttributionBucket",
     "TradeAttributionHypothesis",
     "TradeAttributionView",

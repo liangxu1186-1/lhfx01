@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type CSSProperties } from 'react';
 import { Button, Checkbox, Empty, Pagination, Select, Space, Typography } from 'antd';
 import {
   flexRender,
@@ -26,6 +26,7 @@ interface DataTableProps<T extends object> {
   getRowId?: (row: T) => string;
   selectedRowIds?: string[];
   onSelectedRowIdsChange?: (rowIds: string[]) => void;
+  stickyColumnCount?: number;
 }
 
 export function DataTable<T extends object>({
@@ -40,6 +41,7 @@ export function DataTable<T extends object>({
   getRowId,
   selectedRowIds,
   onSelectedRowIdsChange,
+  stickyColumnCount = 0,
 }: DataTableProps<T>) {
   const [pagination, setPagination] = useState<PaginationState>({
     pageIndex: 0,
@@ -72,6 +74,22 @@ export function DataTable<T extends object>({
   const allSelectableRowIds = selectionEnabled ? data.map((row) => getRowId!(row)) : [];
   const allRowsSelected = selectionEnabled && allSelectableRowIds.length > 0 && allSelectableRowIds.every((rowId) => selectedRowIdSet.has(rowId));
   const someRowsSelected = selectionEnabled && allSelectableRowIds.some((rowId) => selectedRowIdSet.has(rowId));
+  const columnLeftOffsets = columns.reduce<number[]>((offsets, _column, index) => {
+    const previousOffset = index === 0 ? 0 : offsets[index - 1] + Number(columns[index - 1].size ?? columns[index - 1].minSize ?? 120);
+    offsets.push(previousOffset);
+    return offsets;
+  }, []);
+
+  const stickyCellStyle = (index: number): CSSProperties => {
+    if (index >= stickyColumnCount) {
+      return {};
+    }
+    return {
+      position: 'sticky',
+      left: columnLeftOffsets[index],
+      zIndex: 2,
+    };
+  };
 
   if (!data.length) {
     return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无数据" />;
@@ -107,6 +125,7 @@ export function DataTable<T extends object>({
                     style={{
                       width: header.column.columnDef.size,
                       minWidth: header.column.columnDef.minSize,
+                      ...stickyCellStyle(header.index),
                     }}
                   >
                     {header.isPlaceholder ? null : (
@@ -155,12 +174,13 @@ export function DataTable<T extends object>({
                     </div>
                   </td>
                 ) : null}
-                {row.getVisibleCells().map((cell) => (
+                {row.getVisibleCells().map((cell, index) => (
                   <td
                     key={cell.id}
                     style={{
                       width: cell.column.columnDef.size,
                       minWidth: cell.column.columnDef.minSize,
+                      ...stickyCellStyle(index),
                     }}
                   >
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}

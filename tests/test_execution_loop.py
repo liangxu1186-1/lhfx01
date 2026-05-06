@@ -324,6 +324,43 @@ def test_simulate_signals_same_bar_new_position_prefers_stop_when_stop_and_tp_tr
     assert trade.exit_price == 97.0
 
 
+def test_simulate_signals_cooldown_skips_open_after_short_stop_loss() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    candles = [
+        _risk_candle(start, 0, (100.0, 101.0, 99.0, 100.0)),
+        _risk_candle(start, 1, (100.0, 101.0, 96.0, 100.0)),
+        _risk_candle(start, 2, (100.0, 101.0, 96.0, 100.0)),
+        _risk_candle(start, 3, (100.0, 101.0, 99.0, 100.0)),
+        _risk_candle(start, 4, (100.0, 101.0, 96.0, 100.0)),
+    ]
+    signals = [
+        _signal(signal_id="sig-open-1", timestamp=candles[0].timestamp, action=SignalAction.OPEN, side=Side.LONG),
+        _signal(signal_id="sig-open-2", timestamp=candles[1].timestamp, action=SignalAction.OPEN, side=Side.LONG),
+        _signal(signal_id="sig-open-3", timestamp=candles[3].timestamp, action=SignalAction.OPEN, side=Side.LONG),
+    ]
+    for signal in signals:
+        signal.meta_json["risk_spec"] = _risk_spec(atr_value=3.0, stop_mult=1.0, rr=2.0, min_stop_pct=0.0)
+
+    result = simulate_signals(
+        candles=candles,
+        signals=signals,
+        constraints=ExecutionConstraints(
+            initial_cash=1_000.0,
+            leverage=1.0,
+            fee_rate=0.0,
+            qty_by_policy={"fixed_1": 1.0},
+            cooldown_after_consecutive_stop_losses=1,
+            cooldown_bars=2,
+            cooldown_only_short_holding_bars=3,
+        ),
+    )
+
+    assert len(result.trades) == 2
+    assert all(trade.exit_reason == "stop_loss_intrabar" for trade in result.trades)
+    assert all(trade.holding_bars == 0 for trade in result.trades)
+    assert [warning.warning_code for warning in result.warnings] == ["OPEN_SKIPPED_DRAWDOWN_PROTECTION"]
+
+
 def test_simulate_signals_long_stop_loss_intrabar() -> None:
     trade = _run_risk_case(side=Side.LONG, trigger_bar=(100.0, 104.0, 96.0, 101.0), rr=2.0)
     assert trade.exit_reason == "stop_loss_intrabar"
