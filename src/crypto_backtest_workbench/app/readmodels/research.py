@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from crypto_backtest_workbench.app.readmodels.parameters import ParameterLabRow, build_parameter_lab_rows
@@ -22,6 +22,7 @@ MIN_STABLE_TRADE_COUNT = 3
 MAX_SCREENING_GAP = 0.2
 MAX_SCREENING_DRAWDOWN = 0.5
 MIN_SCREENING_PF = 1.05
+MIN_AWARE_DATETIME = datetime.min.replace(tzinfo=UTC)
 
 
 @dataclass(slots=True, frozen=True)
@@ -337,7 +338,7 @@ def build_research_workflow(
         for group_key in stable_group_keys
         if group_key in groups_by_key
     ]
-    research_candidates.sort(key=lambda item: (item.updated_at or datetime.min, item.representative_run_score), reverse=True)
+    research_candidates.sort(key=lambda item: (item.updated_at or MIN_AWARE_DATETIME, item.representative_run_score), reverse=True)
     stable_candidates.sort(key=lambda item: (item.validation_summary.get("score", 0.0), item.stable_candidate_id), reverse=True)
     return ResearchWorkflowView(
         screening_pool={"runs": [run.as_dict() for run in screening_runs]},
@@ -476,7 +477,7 @@ def _build_subjects(rows: list[ParameterLabRow], groups: list[ParameterGroupView
                 latest_run_at=max(row.created_at for row in subject_rows),
             )
         )
-    return sorted(subjects, key=lambda item: (item.latest_run_at or datetime.min), reverse=True)
+    return sorted(subjects, key=lambda item: (item.latest_run_at or MIN_AWARE_DATETIME), reverse=True)
 
 
 def _build_parameter_groups(rows: list[ParameterLabRow]) -> list[ParameterGroupView]:

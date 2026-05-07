@@ -36,10 +36,13 @@ class FilePaperTradingRepository:
         root = self._root()
         if not root.exists():
             return []
-        sessions: list[PaperSession] = []
+        sessions_by_id: dict[str, PaperSession] = {}
         for path in sorted(root.rglob("session.json")):
-            sessions.append(_paper_session_from_json(json.loads(path.read_text(encoding="utf-8"))))
-        return sessions
+            session = _paper_session_from_json(json.loads(path.read_text(encoding="utf-8")))
+            existing = sessions_by_id.get(session.session_id)
+            if existing is None or session.updated_at >= existing.updated_at:
+                sessions_by_id[session.session_id] = session
+        return sorted(sessions_by_id.values(), key=lambda session: session.updated_at, reverse=True)
 
     def save_session(self, session: PaperSession) -> Path:
         directory = self._session_dir(session.session_id)
@@ -67,6 +70,18 @@ class FilePaperTradingRepository:
     def append_warnings(self, session_id: str, warnings: Iterable[StructuredWarning]) -> Path:
         return self._append_csv(session_id, "warnings.csv", warnings)
 
+    def load_orders(self, session_id: str) -> list[dict[str, object]]:
+        return self._load_csv(session_id, "orders.csv")
+
+    def load_fills(self, session_id: str) -> list[dict[str, object]]:
+        return self._load_csv(session_id, "fills.csv")
+
+    def load_trades(self, session_id: str) -> list[dict[str, object]]:
+        return self._load_csv(session_id, "trades.csv")
+
+    def load_warnings(self, session_id: str) -> list[dict[str, object]]:
+        return self._load_csv(session_id, "warnings.csv")
+
     def _append_csv(self, session_id: str, file_name: str, rows: Iterable[object]) -> Path:
         payloads = [json_ready(row) for row in rows]
         path = self._session_dir(session_id) / file_name
@@ -90,6 +105,13 @@ class FilePaperTradingRepository:
                     writer.writerow({key: _csv_cell(payload.get(key)) for key in fieldnames})
         return path
 
+    def _load_csv(self, session_id: str, file_name: str) -> list[dict[str, object]]:
+        path = self._session_artifact_path(session_id, file_name)
+        if path is None or not path.exists():
+            return []
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            return [dict(row) for row in csv.DictReader(handle)]
+
     def _root(self) -> Path:
         return self.base_dir / "paper_trading" / "sessions"
 
@@ -106,6 +128,18 @@ class FilePaperTradingRepository:
             if str(payload.get("session_id") or "") == session_id:
                 return path
         raise FileNotFoundError(f"Paper session not found: {session_id}")
+
+    def _session_artifact_path(self, session_id: str, file_name: str) -> Path | None:
+        candidates = [self._session_dir(session_id)]
+        try:
+            candidates.append(self._find_session_json(session_id).parent)
+        except FileNotFoundError:
+            pass
+        for directory in candidates:
+            path = directory / file_name
+            if path.exists():
+                return path
+        return candidates[0] / file_name
 
 
 def _paper_session_from_json(payload: dict[str, object]) -> PaperSession:

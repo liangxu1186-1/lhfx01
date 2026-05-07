@@ -178,6 +178,39 @@ body {
   color: #101828;
 }
 
+.cbw-paper-table {
+  min-width: 1160px;
+  table-layout: fixed;
+}
+
+.cbw-paper-table th,
+.cbw-paper-table td {
+  vertical-align: middle;
+}
+
+.cbw-paper-session-cell {
+  width: 100%;
+  min-width: 0;
+}
+
+.cbw-paper-session-title,
+.cbw-paper-session-sub {
+  display: block;
+  max-width: 196px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cbw-paper-session-sub {
+  font-size: 12px;
+}
+
+.cbw-paper-record-table {
+  min-width: 920px;
+  table-layout: fixed;
+}
+
 .cbw-research-target {
   max-width: 220px;
   min-width: 0;

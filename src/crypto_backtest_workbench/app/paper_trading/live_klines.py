@@ -8,7 +8,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from crypto_backtest_workbench.domain.models import CanonicalCandle, MarketType, PriceType, now_utc
 from crypto_backtest_workbench.engine.data.canonicalizer import sort_and_deduplicate_candles
@@ -163,6 +163,8 @@ async def stream_binance_usdm_klines(
     *,
     cache: FileLiveKlineCache,
     specs: list[LiveKlineStreamSpec],
+    on_closed_candle: Callable[[LiveKlineStreamSpec, CanonicalCandle], None] | None = None,
+    message_timeout_seconds: float = 45.0,
     reconnect_delay_seconds: float = 5.0,
 ) -> None:
     """Stream Binance USD-M closed klines into the local cache until cancelled."""
@@ -173,7 +175,7 @@ async def stream_binance_usdm_klines(
 
     stream_to_spec = {f"{_binance_stream_symbol(spec.symbol)}@kline_{spec.timeframe}": spec for spec in specs}
     streams = "/".join(stream_to_spec)
-    url = f"wss://fstream.binance.com/stream?streams={streams}"
+    url = f"wss://fstream.binance.com/market/stream?streams={streams}"
     while True:
         try:
             async with aiohttp.ClientSession() as session:
@@ -182,19 +184,34 @@ async def stream_binance_usdm_klines(
                         cache.save_status(
                             spec,
                             {
-                                "status": "connected",
+                                "status": "connecting",
                                 "stream_url": url,
                                 "connected_at": now_utc().isoformat(),
                                 "error": None,
                             },
                         )
-                    async for message in websocket:
+                    while True:
+                        try:
+                            message = await websocket.receive(timeout=message_timeout_seconds)
+                        except TimeoutError:
+                            for spec in specs:
+                                cache.save_status(
+                                    spec,
+                                    {
+                                        "status": "stale",
+                                        "stream_url": url,
+                                        "error": f"no websocket messages within {message_timeout_seconds:g}s",
+                                    },
+                                )
+                            break
                         if message.type == aiohttp.WSMsgType.TEXT:
                             payload = json.loads(message.data)
                             stream = str(payload.get("stream") or "")
                             spec = stream_to_spec.get(stream)
                             if spec is not None:
-                                cache.ingest_binance_message(spec, payload)
+                                candle = cache.ingest_binance_message(spec, payload)
+                                if candle is not None and on_closed_candle is not None:
+                                    on_closed_candle(spec, candle)
                         elif message.type in {aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE}:
                             break
         except asyncio.CancelledError:

@@ -49,6 +49,19 @@ def test_local_market_data_client_merges_dataset_and_live_cache(tmp_path: Path) 
     assert candles[-1].data_source == "binance_ws"
 
 
+def test_closed_kline_callback_runs_after_cache_ingest(tmp_path: Path) -> None:
+    cache = FileLiveKlineCache(tmp_path)
+    spec = _spec()
+    events = []
+
+    candle = cache.ingest_binance_message(spec, _binance_payload(is_closed=True, close="104.0"))
+    if candle is not None:
+        events.append((spec.timeframe, candle.timestamp.isoformat()))
+
+    assert events == [("5m", "2026-05-07T08:00:00+00:00")]
+    assert cache.load_candles(spec)[0].close == 104.0
+
+
 def _spec() -> LiveKlineStreamSpec:
     return LiveKlineStreamSpec(
         exchange="binanceusdm",

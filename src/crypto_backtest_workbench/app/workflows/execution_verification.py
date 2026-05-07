@@ -81,11 +81,8 @@ def run_execution_verification_workflow(
         raise ValueError("source_run_id must point to a research run, not an execution verification run")
 
     strategy_timeframe = str(parent_config.get("timeframe") or "")
-    if strategy_timeframe != "1h":
-        raise ValueError("execution verification currently supports strategy_timeframe=1h")
     execution_timeframe = request.execution_timeframe.strip().lower()
-    if execution_timeframe != "5m":
-        raise ValueError("execution verification currently supports execution_timeframe=5m")
+    _validate_execution_timeframe_pair(strategy_timeframe=strategy_timeframe, execution_timeframe=execution_timeframe)
     if request.execution_snapshot.timeframe.strip().lower() != execution_timeframe:
         raise ValueError("execution snapshot timeframe must match execution_timeframe")
 
@@ -333,6 +330,21 @@ def _validate_execution_coverage(
         raise ValueError(
             "execution dataset does not cover the next executable bar after parent run end "
             f"(parent_end={strategy_end.isoformat()}, execution_end={execution_end.isoformat()})"
+        )
+
+
+def _validate_execution_timeframe_pair(*, strategy_timeframe: str, execution_timeframe: str) -> None:
+    strategy_delta = _timeframe_delta(strategy_timeframe)
+    execution_delta = _timeframe_delta(execution_timeframe)
+    if execution_delta >= strategy_delta:
+        raise ValueError(
+            "execution verification requires execution_timeframe to be lower than strategy_timeframe "
+            f"(strategy_timeframe={strategy_timeframe}, execution_timeframe={execution_timeframe})"
+        )
+    if strategy_delta % execution_delta != timedelta(0):
+        raise ValueError(
+            "execution verification requires strategy_timeframe to be divisible by execution_timeframe "
+            f"(strategy_timeframe={strategy_timeframe}, execution_timeframe={execution_timeframe})"
         )
 
 

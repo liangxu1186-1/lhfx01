@@ -525,6 +525,89 @@ def test_workspace_api_stable_candidate_execution_verification_creates_derived_r
     assert verification_run_id not in parameter_run_ids
 
 
+def test_workspace_api_stable_candidate_execution_verification_supports_15m_to_5m(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-ev-15m", timeframe="15m")
+    _seed_intraday_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-ev-15m-5m", timeframe="5m", bar_count=28)
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        _request_json(
+            server,
+            "/api/runs",
+            payload={
+                "snapshot_id": "snapshot-api-ev-15m",
+                "run_id": "run-api-ev-15m-parent",
+                "strategy_name": "ema_pullback_atr_v2",
+                "trend_fast_period": 2,
+                "trend_slow_period": 5,
+                "atr_entry_tolerance": 1.0,
+                "atr_stop_mult": 1.5,
+                "risk_reward_ratio": 2.0,
+                "cash_allocation_pct": 50.0,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.0,
+                "slippage_bps": 0.0,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+                "validation_split_id": "split-api-ev-15m-parent",
+                "is_start": "2024-01-01T00:00:00+00:00",
+                "is_end": "2024-01-01T00:45:00+00:00",
+                "oos_start": "2024-01-01T00:45:00+00:00",
+                "oos_end": "2024-01-01T01:30:00+00:00",
+            },
+        )
+        research_response = _request_json(
+            server,
+            "/api/research-pool",
+            payload={"source_run_id": "run-api-ev-15m-parent", "note": "进入研究池"},
+            method="POST",
+        )
+        candidate_id = research_response["research_candidate_id"]
+        _request_json(
+            server,
+            "/api/stable-pool",
+            payload={
+                "research_candidate_id": candidate_id,
+                "chosen_run_id": "run-api-ev-15m-parent",
+                "decision_reason": "15m 验证入口",
+            },
+            method="POST",
+        )
+
+        verification_response = _request_json(
+            server,
+            f"/api/stable-candidates/{quote(candidate_id, safe='')}/execution-verification",
+            payload={
+                "source_run_id": "run-api-ev-15m-parent",
+                "execution_timeframe": "5m",
+                "execution_snapshot_id": "snapshot-api-ev-15m-5m",
+            },
+            method="POST",
+        )
+        run_detail = _request_json(server, f"/api/runs/{verification_response['verification_run_id']}")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert verification_response["task_status"] == "success"
+    assert verification_response["strategy_timeframe"] == "15m"
+    assert verification_response["execution_timeframe"] == "5m"
+    manifest = run_detail["run"]["manifest"]["resolved_config_json"]
+    assert manifest["strategy_timeframe"] == "15m"
+    assert manifest["execution_timeframe"] == "5m"
+    assert run_detail["run"]["validation"]["validation_split_id"].endswith(":exec-5m")
+
+
 def test_workspace_api_stable_candidate_execution_verification_rejects_short_execution_dataset(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-ev-short-1h", timeframe="1h")
@@ -1747,9 +1830,10 @@ def _seed_intraday_snapshot(*, data_dir: Path, snapshot_id: str, timeframe: str,
 def _build_candles(*, timeframe: str = "1h") -> list[CanonicalCandle]:
     start = datetime(2024, 1, 1, tzinfo=UTC)
     close_prices = [100.0, 102.0, 101.0, 104.0, 103.0, 106.0]
+    step = timedelta(minutes=15) if timeframe == "15m" else timedelta(hours=1)
     candles: list[CanonicalCandle] = []
     for index, close in enumerate(close_prices):
-        timestamp = start + timedelta(hours=index)
+        timestamp = start + (step * index)
         candles.append(
             CanonicalCandle(
                 timestamp=timestamp,

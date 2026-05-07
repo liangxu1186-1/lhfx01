@@ -51,7 +51,9 @@ import {
   loadOverview,
   loadOverviewEquity,
   loadParameters,
+  loadPaperSession,
   loadPaperSessions,
+  loadPaperSignalSnapshot,
   loadResearchNotes,
   loadRunDetail,
   loadRuns,
@@ -96,7 +98,12 @@ import type {
   RunSummaryView,
   SensitivityRow,
   MultiRunEquityRow,
+  PaperFillView,
+  PaperOrderView,
   PaperSessionView,
+  PaperSignalSnapshotView,
+  PaperTradeView,
+  PaperWarningView,
   WorkspaceParameterLab,
   WorkspaceOverview,
   WorkspaceSource,
@@ -419,6 +426,7 @@ const ALL_EXPERIMENTS = '__all__';
 const ALL_BATCHES = '__all_batches__';
 const SCREENING_VIEW_STATE_STORAGE_KEY = 'cbw.screening.view.v1';
 const RUN_DETAIL_READMODEL_VERSION = 'entry-feature-backfill-20260505-3';
+const PAPER_SESSION_REFRESH_MS = 60_000;
 const makeParameterBatchId = () => `batch-${dayjs().format('YYYYMMDDHHmmssSSS')}`;
 function stableStringHash(value: string): string {
   let hash = 2166136261;
@@ -3387,6 +3395,33 @@ function WorkspaceShell() {
     setPaperSessions(payload.paper_sessions);
   }
 
+  useEffect(() => {
+    if (activeTab !== 'paper') {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      void loadPaperSessions()
+        .then((payload) => {
+          if (cancelled) {
+            return;
+          }
+          applyPayloadMeta(payload);
+          setPaperSessions(payload.paper_sessions);
+          setError(null);
+        })
+        .catch((loadError: unknown) => {
+          if (!cancelled) {
+            setError(loadError instanceof Error ? loadError.message : '模拟盘状态刷新失败');
+          }
+        });
+    }, PAPER_SESSION_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeTab]);
+
   async function handleCreatePaperSession(values: Record<string, unknown>) {
     setPaperSubmitting('create');
     try {
@@ -4594,6 +4629,13 @@ function PaperTradingView({
 }) {
   const selectedStableCandidateId = Form.useWatch('stable_candidate_id', form) as string | undefined;
   const selectedStableCandidate = stableCandidates.find((candidate) => candidate.stable_candidate_id === selectedStableCandidateId);
+  const [recordSession, setRecordSession] = useState<PaperSessionView | null>(null);
+  const [recordLoading, setRecordLoading] = useState(false);
+  const [selectedSnapshotSessionId, setSelectedSnapshotSessionId] = useState<string>('');
+  const [signalSnapshot, setSignalSnapshot] = useState<PaperSignalSnapshotView | null>(null);
+  const [signalSnapshotLoading, setSignalSnapshotLoading] = useState(false);
+  const [signalSnapshotError, setSignalSnapshotError] = useState<string | null>(null);
+  const snapshotSessionId = selectedSnapshotSessionId || sessions[0]?.session_id || '';
   const sourceRunOptions = useMemo(() => {
     const evidenceRunIds = selectedStableCandidate?.evidence_run_ids ?? [];
     const representativeRunId = selectedStableCandidate?.representative_run_id;
@@ -4610,36 +4652,93 @@ function PaperTradingView({
       };
     });
   }, [runs, selectedStableCandidate]);
+  async function openPaperRecords(sessionId: string) {
+    setRecordLoading(true);
+    try {
+      const payload = await loadPaperSession(sessionId);
+      setRecordSession(payload.paper_session);
+    } finally {
+      setRecordLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!sessions.length) {
+      setSelectedSnapshotSessionId('');
+      setSignalSnapshot(null);
+      return;
+    }
+    if (selectedSnapshotSessionId && sessions.some((session) => session.session_id === selectedSnapshotSessionId)) {
+      return;
+    }
+    setSelectedSnapshotSessionId(sessions[0].session_id);
+  }, [selectedSnapshotSessionId, sessions]);
+
+  async function refreshSignalSnapshot(options?: { backfill?: boolean }) {
+    if (!snapshotSessionId) {
+      return;
+    }
+    setSignalSnapshotLoading(true);
+    setSignalSnapshotError(null);
+    try {
+      const payload = await loadPaperSignalSnapshot(snapshotSessionId, options);
+      setSignalSnapshot(payload.paper_signal_snapshot);
+    } catch (loadError: unknown) {
+      setSignalSnapshotError(loadError instanceof Error ? loadError.message : '信号快照加载失败');
+    } finally {
+      setSignalSnapshotLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!snapshotSessionId) {
+      return;
+    }
+    void refreshSignalSnapshot();
+  }, [snapshotSessionId]);
+
   const columns = useMemo<ColumnDef<PaperSessionView>[]>(() => [
     {
       id: 'session',
       header: 'Session',
+      size: 220,
+      minSize: 220,
       accessorFn: (row) => row.session_id,
       cell: ({ row }) => (
-        <Space direction="vertical" size={0}>
-          <Text strong>{row.original.session_id}</Text>
-          <Text type="secondary">{row.original.stable_candidate_id}</Text>
+        <Space direction="vertical" size={2} className="cbw-paper-session-cell">
+          <Tooltip title={row.original.session_id}>
+            <Text strong className="cbw-paper-session-title">{paperSessionLabel(row.original)}</Text>
+          </Tooltip>
+          <Tooltip title={row.original.stable_candidate_id}>
+            <Text type="secondary" className="cbw-paper-session-sub">{paperCandidateLabel(row.original.stable_candidate_id)}</Text>
+          </Tooltip>
         </Space>
       ),
     },
-    { header: '标的', accessorKey: 'symbol' },
+    { header: '标的', accessorKey: 'symbol', size: 130, minSize: 130 },
     {
       id: 'timeframes',
       header: '周期',
+      size: 80,
+      minSize: 80,
       cell: ({ row }) => `${row.original.strategy_timeframe.toUpperCase()} / ${row.original.execution_timeframe.toUpperCase()}`,
     },
     {
       id: 'status',
       header: '状态',
+      size: 90,
+      minSize: 90,
       accessorFn: (row) => row.status,
       cell: ({ row }) => <Tag color={row.original.status === 'active' ? 'green' : 'default'}>{row.original.status}</Tag>,
     },
-    { id: 'equity', header: '权益', accessorFn: (row) => row.account.equity, cell: ({ row }) => formatNumber(row.original.account.equity, 2) },
-    { id: 'cash', header: '可用资金', accessorFn: (row) => row.account.available_cash, cell: ({ row }) => formatNumber(row.original.account.available_cash, 2) },
-    { id: 'unrealized', header: '浮盈亏', accessorFn: (row) => row.account.unrealized_pnl, cell: ({ row }) => formatNumber(row.original.account.unrealized_pnl, 2) },
+    { id: 'equity', header: '权益', size: 110, minSize: 110, accessorFn: (row) => row.account.equity, cell: ({ row }) => formatNumber(row.original.account.equity, 2) },
+    { id: 'cash', header: '可用资金', size: 110, minSize: 110, accessorFn: (row) => row.account.available_cash, cell: ({ row }) => formatNumber(row.original.account.available_cash, 2) },
+    { id: 'unrealized', header: '浮盈亏', size: 100, minSize: 100, accessorFn: (row) => row.account.unrealized_pnl, cell: ({ row }) => formatNumber(row.original.account.unrealized_pnl, 2) },
     {
       id: 'position',
       header: '持仓',
+      size: 130,
+      minSize: 130,
       cell: ({ row }) => {
         const position = row.original.position;
         if (!position) {
@@ -4656,6 +4755,8 @@ function PaperTradingView({
     {
       id: 'checkpoint',
       header: '最新 5m',
+      size: 180,
+      minSize: 180,
       cell: ({ row }) => {
         const executionStream = row.original.live_streams?.find((stream) => stream.timeframe === row.original.execution_timeframe);
         return (
@@ -4667,9 +4768,25 @@ function PaperTradingView({
                 <Tag color={executionStream.status === 'connected' ? 'processing' : executionStream.status === 'error' ? 'red' : 'default'}>
                   WS {executionStream.status}
                 </Tag>
+                {executionStream.auto_tick_status ? (
+                  <Tag color={executionStream.auto_tick_status === 'success' ? 'green' : executionStream.auto_tick_status === 'error' ? 'red' : 'default'}>
+                    auto {executionStream.auto_tick_status}
+                  </Tag>
+                ) : null}
                 <Text type="secondary">
-                  {executionStream.last_closed_bar_time ? formatDateTime(executionStream.last_closed_bar_time) : executionStream.last_message_at ? formatDateTime(executionStream.last_message_at) : '--'}
+                  {executionStream.auto_tick_at
+                    ? `tick ${formatDateTime(executionStream.auto_tick_at)}`
+                    : executionStream.last_closed_bar_time
+                      ? formatDateTime(executionStream.last_closed_bar_time)
+                      : executionStream.last_message_at
+                        ? formatDateTime(executionStream.last_message_at)
+                        : '--'}
                 </Text>
+                {executionStream.auto_tick_error ? (
+                  <Tooltip title={executionStream.auto_tick_error}>
+                    <Text type="danger">error</Text>
+                  </Tooltip>
+                ) : null}
               </Space>
             ) : null}
           </Space>
@@ -4679,16 +4796,26 @@ function PaperTradingView({
     {
       id: 'actions',
       header: '操作',
+      size: 110,
+      minSize: 110,
       enableSorting: false,
       cell: ({ row }) => (
-        <Button
-          size="small"
-          type="primary"
-          loading={submitting === 'tick'}
-          onClick={() => void onTick(row.original.session_id)}
-        >
-          手动 tick
-        </Button>
+        <Space size={8} wrap>
+          <Button
+            size="small"
+            onClick={() => void openPaperRecords(row.original.session_id)}
+          >
+            交易记录
+          </Button>
+          <Button
+            size="small"
+            type="primary"
+            loading={submitting === 'tick'}
+            onClick={() => void onTick(row.original.session_id)}
+          >
+            tick
+          </Button>
+        </Space>
       ),
     },
   ], [onTick, submitting]);
@@ -4696,18 +4823,19 @@ function PaperTradingView({
   const openPositions = sessions.filter((session) => session.position !== null);
 
   return (
-    <Row gutter={[16, 16]}>
-      <Col xs={24} md={8}>
-        <Card><Statistic title="模拟盘 Session" value={sessions.length} /></Card>
-      </Col>
-      <Col xs={24} md={8}>
-        <Card><Statistic title="运行中" value={activeSessions.length} /></Card>
-      </Col>
-      <Col xs={24} md={8}>
-        <Card><Statistic title="持仓中" value={openPositions.length} /></Card>
-      </Col>
+    <>
+      <Row gutter={[16, 16]}>
+        <Col xs={24} md={8}>
+          <Card><Statistic title="模拟盘 Session" value={sessions.length} /></Card>
+        </Col>
+        <Col xs={24} md={8}>
+          <Card><Statistic title="运行中" value={activeSessions.length} /></Card>
+        </Col>
+        <Col xs={24} md={8}>
+          <Card><Statistic title="持仓中" value={openPositions.length} /></Card>
+        </Col>
 
-      <Col xs={24} xl={9}>
+      <Col xs={24} xl={7} xxl={6}>
         <Card title="创建模拟盘" extra={<Tag color="blue">1h 信号 / 5m 执行</Tag>}>
           <Form
             form={form}
@@ -4759,7 +4887,7 @@ function PaperTradingView({
         </Card>
       </Col>
 
-      <Col xs={24} xl={15}>
+      <Col xs={24} xl={17} xxl={18}>
         <Card
           title="模拟盘运行表"
           extra={<Button onClick={() => void onRefresh()}>刷新</Button>}
@@ -4771,13 +4899,244 @@ function PaperTradingView({
               initialPageSize={8}
               pageSizeOptions={[8, 16, 32]}
               initialSorting={[{ id: 'session', desc: true }]}
+              tableClassName="cbw-paper-table"
             />
           ) : (
             <Alert type="info" showIcon message="暂无模拟盘 session" description="创建后会在这里显示权益、持仓和最近 tick 位置。" />
           )}
         </Card>
       </Col>
-    </Row>
+      <Col xs={24}>
+        <PaperSignalSnapshotPanel
+          sessions={sessions}
+          selectedSessionId={snapshotSessionId}
+          snapshot={signalSnapshot}
+          loading={signalSnapshotLoading}
+          error={signalSnapshotError}
+          onSelectSession={setSelectedSnapshotSessionId}
+          onRefresh={() => void refreshSignalSnapshot()}
+          onBackfill={() => void refreshSignalSnapshot({ backfill: true })}
+        />
+      </Col>
+      </Row>
+      <PaperRecordsModal
+        session={recordSession}
+        loading={recordLoading}
+        onClose={() => setRecordSession(null)}
+      />
+    </>
+  );
+}
+
+function paperSessionLabel(session: PaperSessionView): string {
+  const created = session.created_at ? dayjs(session.created_at).format('MM/DD HH:mm') : '';
+  return `${session.strategy_name} · ${session.symbol} · ${created}`;
+}
+
+function paperCandidateLabel(candidateId: string): string {
+  const parts = candidateId.split('|');
+  if (parts.length >= 4) {
+    return `${parts[0]} · ${parts[1]} · ${parts[2]}`;
+  }
+  return candidateId;
+}
+
+function PaperSignalSnapshotPanel({
+  sessions,
+  selectedSessionId,
+  snapshot,
+  loading,
+  error,
+  onSelectSession,
+  onRefresh,
+  onBackfill,
+}: {
+  sessions: PaperSessionView[];
+  selectedSessionId: string;
+  snapshot: PaperSignalSnapshotView | null;
+  loading: boolean;
+  error: string | null;
+  onSelectSession: (sessionId: string) => void;
+  onRefresh: () => void;
+  onBackfill: () => void;
+}) {
+  const triggerColor = snapshot?.trigger.status === 'triggered_on_latest_strategy_bar' ? 'green' : 'blue';
+  const backfillColor = snapshot?.backfill.status === 'success' || snapshot?.backfill.status === 'up_to_date'
+    ? 'green'
+    : snapshot?.backfill.status === 'error'
+      ? 'red'
+      : 'default';
+  return (
+    <Card
+      title="信号快照"
+      extra={(
+        <Space wrap>
+          <Select
+            style={{ minWidth: 280 }}
+            value={selectedSessionId || undefined}
+            placeholder="选择模拟盘"
+            options={sessions.map((session) => ({
+              label: paperSessionLabel(session),
+              value: session.session_id,
+            }))}
+            onChange={onSelectSession}
+          />
+          <Button onClick={onRefresh} loading={loading}>刷新快照</Button>
+          <Button onClick={onBackfill} loading={loading}>补齐缺口</Button>
+        </Space>
+      )}
+    >
+      <Spin spinning={loading}>
+        {error ? <Alert type="error" showIcon message={error} style={{ marginBottom: 16 }} /> : null}
+        {snapshot ? (
+          <Space direction="vertical" size={16} style={{ width: '100%' }}>
+            <Row gutter={[12, 12]}>
+              <Col xs={12} md={6} xl={3}><Statistic title={`EMA${formatCompactPeriod(snapshot.indicators.ema_fast_period)}`} value={snapshot.indicators.ema_fast ?? '--'} precision={2} /></Col>
+              <Col xs={12} md={6} xl={3}><Statistic title={`EMA${formatCompactPeriod(snapshot.indicators.ema_slow_period)}`} value={snapshot.indicators.ema_slow ?? '--'} precision={2} /></Col>
+              <Col xs={12} md={6} xl={3}><Statistic title="EMA21" value={snapshot.indicators.ema21 ?? '--'} precision={2} /></Col>
+              <Col xs={12} md={6} xl={3}><Statistic title="ATR14" value={snapshot.indicators.atr ?? '--'} precision={2} /></Col>
+              <Col xs={12} md={6} xl={3}><Statistic title="触发价" value={snapshot.trigger.trigger_price ?? '--'} precision={2} /></Col>
+              <Col xs={12} md={6} xl={3}><Statistic title="预计成交" value={snapshot.estimate.entry_price ?? '--'} precision={2} /></Col>
+              <Col xs={12} md={6} xl={3}><Statistic title="预计仓位" value={snapshot.estimate.qty ?? '--'} precision={4} /></Col>
+              <Col xs={12} md={6} xl={3}><Statistic title="占用保证金" value={snapshot.estimate.margin ?? '--'} precision={2} /></Col>
+            </Row>
+            <Row gutter={[12, 12]}>
+              <Col xs={24} lg={12}>
+                <Descriptions size="small" column={2} bordered>
+                  <Descriptions.Item label="方向"><Tag color={snapshot.trigger.side === 'long' ? 'green' : snapshot.trigger.side === 'short' ? 'red' : 'default'}>{snapshot.trigger.side ?? '--'}</Tag></Descriptions.Item>
+                  <Descriptions.Item label="状态"><Tag color={triggerColor}>{snapshot.trigger.status}</Tag></Descriptions.Item>
+                  <Descriptions.Item label="距触发">{formatOptionalNumber(snapshot.trigger.distance_to_trigger, 2)}</Descriptions.Item>
+                  <Descriptions.Item label="最新收盘">{formatOptionalNumber(snapshot.trigger.last_close, 2)}</Descriptions.Item>
+                  <Descriptions.Item label="止损">{formatOptionalNumber(snapshot.estimate.stop_loss, 2)}</Descriptions.Item>
+                  <Descriptions.Item label="止盈">{formatOptionalNumber(snapshot.estimate.take_profit, 2)}</Descriptions.Item>
+                </Descriptions>
+              </Col>
+              <Col xs={24} lg={12}>
+                <Descriptions size="small" column={2} bordered>
+                  <Descriptions.Item label="1H 数据">{formatOptionalDateTime(snapshot.data.last_strategy_bar_time)}</Descriptions.Item>
+                  <Descriptions.Item label="执行数据">{formatOptionalDateTime(snapshot.data.last_execution_bar_time)}</Descriptions.Item>
+                  <Descriptions.Item label="执行 bars">{snapshot.data.execution_bar_count}</Descriptions.Item>
+                  <Descriptions.Item label="缺口数">{snapshot.data.execution_gap_count}</Descriptions.Item>
+                  <Descriptions.Item label="补齐状态"><Tag color={backfillColor}>{snapshot.backfill.status}</Tag></Descriptions.Item>
+                  <Descriptions.Item label="补齐 bars">{snapshot.backfill.fetched_bars}</Descriptions.Item>
+                </Descriptions>
+              </Col>
+            </Row>
+            {snapshot.data.execution_gap_count > 0 ? (
+              <Alert
+                type="warning"
+                showIcon
+                message="执行 K 线存在历史缺口"
+                description={`${formatOptionalDateTime(snapshot.data.latest_gap_start)} 到 ${formatOptionalDateTime(snapshot.data.latest_gap_end)}。可点“补齐缺口”做一次限频 REST 补齐。`}
+              />
+            ) : null}
+            {snapshot.backfill.error ? <Alert type="error" showIcon message={snapshot.backfill.error} /> : null}
+          </Space>
+        ) : (
+          <Alert type="info" showIcon message="选择一个模拟盘后查看 EMA / ATR / 触发价 / 预计风控。" />
+        )}
+      </Spin>
+    </Card>
+  );
+}
+
+function formatOptionalNumber(value: number | null | undefined, precision = 2): string {
+  return value === null || value === undefined ? '--' : formatNumber(value, precision);
+}
+
+function formatOptionalDateTime(value: string | null | undefined): string {
+  return value ? formatDateTime(value) : '--';
+}
+
+function formatCompactPeriod(value: number | null | undefined): string {
+  if (value === null || value === undefined) {
+    return '';
+  }
+  return Number.isInteger(value) ? String(value) : formatNumber(value, 0);
+}
+
+function PaperRecordsModal({
+  session,
+  loading,
+  onClose,
+}: {
+  session: PaperSessionView | null;
+  loading: boolean;
+  onClose: () => void;
+}) {
+  const tradeColumns = useMemo<ColumnDef<PaperTradeView>[]>(() => [
+    { header: '开仓', accessorFn: (row) => row.entry_time, cell: ({ row }) => formatDateTime(row.original.entry_time), size: 140, minSize: 140 },
+    { header: '平仓', accessorFn: (row) => row.exit_time ?? '', cell: ({ row }) => row.original.exit_time ? formatDateTime(row.original.exit_time) : '--', size: 140, minSize: 140 },
+    { header: '方向', accessorKey: 'side', size: 70, minSize: 70 },
+    { header: '数量', accessorFn: (row) => Number(row.qty), cell: ({ row }) => formatNumber(Number(row.original.qty), 4), size: 90, minSize: 90 },
+    { header: '开仓价', accessorFn: (row) => Number(row.entry_price), cell: ({ row }) => formatNumber(Number(row.original.entry_price), 2), size: 100, minSize: 100 },
+    { header: '平仓价', accessorFn: (row) => Number(row.exit_price ?? 0), cell: ({ row }) => row.original.exit_price === null ? '--' : formatNumber(Number(row.original.exit_price), 2), size: 100, minSize: 100 },
+    { header: '净盈亏', accessorFn: (row) => Number(row.net_pnl), cell: ({ row }) => <Text type={Number(row.original.net_pnl) >= 0 ? 'success' : 'danger'}>{formatNumber(Number(row.original.net_pnl), 2)}</Text>, size: 100, minSize: 100 },
+    { header: '收益率', accessorFn: (row) => Number(row.return_pct), cell: ({ row }) => formatPct(Number(row.original.return_pct)), size: 90, minSize: 90 },
+    { header: '原因', accessorKey: 'exit_reason', size: 150, minSize: 150 },
+  ], []);
+  const fillColumns = useMemo<ColumnDef<PaperFillView>[]>(() => [
+    { header: '时间', accessorFn: (row) => row.fill_time, cell: ({ row }) => formatDateTime(row.original.fill_time), size: 140, minSize: 140 },
+    { header: '成交价', accessorFn: (row) => Number(row.fill_price), cell: ({ row }) => formatNumber(Number(row.original.fill_price), 2), size: 100, minSize: 100 },
+    { header: '数量', accessorFn: (row) => Number(row.qty), cell: ({ row }) => formatNumber(Number(row.original.qty), 4), size: 90, minSize: 90 },
+    { header: '手续费', accessorFn: (row) => Number(row.fee), cell: ({ row }) => formatNumber(Number(row.original.fee), 2), size: 90, minSize: 90 },
+    { header: '滑点', accessorFn: (row) => Number(row.slippage_cost), cell: ({ row }) => formatNumber(Number(row.original.slippage_cost), 2), size: 90, minSize: 90 },
+    { header: '订单', accessorKey: 'order_id', size: 150, minSize: 150 },
+  ], []);
+  const orderColumns = useMemo<ColumnDef<PaperOrderView>[]>(() => [
+    { header: '时间', accessorFn: (row) => row.request_time, cell: ({ row }) => formatDateTime(row.original.request_time), size: 140, minSize: 140 },
+    { header: '状态', accessorKey: 'status', size: 80, minSize: 80 },
+    { header: '方向', accessorKey: 'side', size: 70, minSize: 70 },
+    { header: '数量', accessorFn: (row) => Number(row.qty), cell: ({ row }) => formatNumber(Number(row.original.qty), 4), size: 90, minSize: 90 },
+    { header: '请求价', accessorFn: (row) => Number(row.request_price ?? 0), cell: ({ row }) => row.original.request_price === null || row.original.request_price === '' ? '--' : formatNumber(Number(row.original.request_price), 2), size: 100, minSize: 100 },
+    { header: '订单ID', accessorKey: 'order_id', size: 150, minSize: 150 },
+  ], []);
+  const warningColumns = useMemo<ColumnDef<PaperWarningView>[]>(() => [
+    { header: '级别', accessorKey: 'severity', size: 80, minSize: 80 },
+    { header: '代码', accessorKey: 'warning_code', size: 140, minSize: 140 },
+    { header: '消息', accessorKey: 'message', size: 360, minSize: 360 },
+  ], []);
+
+  return (
+    <Modal
+      title={session ? `交易记录 · ${paperSessionLabel(session)}` : '交易记录'}
+      open={Boolean(session) || loading}
+      onCancel={onClose}
+      footer={null}
+      width={1080}
+      destroyOnClose
+    >
+      <Spin spinning={loading}>
+        {session ? (
+          <Space direction="vertical" size={16} style={{ width: '100%' }}>
+            <Row gutter={[12, 12]}>
+              <Col xs={12} md={6}><Statistic title="成交" value={session.fills?.length ?? 0} /></Col>
+              <Col xs={12} md={6}><Statistic title="平仓" value={session.trades?.length ?? 0} /></Col>
+              <Col xs={12} md={6}><Statistic title="权益" value={session.account.equity} precision={2} /></Col>
+              <Col xs={12} md={6}><Statistic title="最新 5m" value={session.checkpoint.execution_bar_count} /></Col>
+            </Row>
+            <section>
+              <Title level={5}>平仓交易</Title>
+              <DataTable columns={tradeColumns} data={session.trades ?? []} initialPageSize={6} tableClassName="cbw-paper-record-table" />
+            </section>
+            <section>
+              <Title level={5}>成交明细</Title>
+              <DataTable columns={fillColumns} data={session.fills ?? []} initialPageSize={6} tableClassName="cbw-paper-record-table" />
+            </section>
+            <section>
+              <Title level={5}>订单</Title>
+              <DataTable columns={orderColumns} data={session.orders ?? []} initialPageSize={6} tableClassName="cbw-paper-record-table" />
+            </section>
+            {session.warnings?.length ? (
+              <section>
+                <Title level={5}>警告</Title>
+                <DataTable columns={warningColumns} data={session.warnings} initialPageSize={6} tableClassName="cbw-paper-record-table" />
+              </section>
+            ) : null}
+          </Space>
+        ) : null}
+      </Spin>
+    </Modal>
   );
 }
 

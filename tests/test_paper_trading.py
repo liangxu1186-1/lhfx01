@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import csv
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -12,8 +13,11 @@ from crypto_backtest_workbench.app.paper_trading import (
     tick_paper_session_workflow,
 )
 from crypto_backtest_workbench.app.paper_trading.broker import PaperBroker
+from crypto_backtest_workbench.app.paper_trading.market_data import PaperLocalKlineMarketDataClient
 from crypto_backtest_workbench.app.paper_trading.models import PaperCheckpoint, PaperSession
 from crypto_backtest_workbench.app.paper_trading.repository import FilePaperTradingRepository
+from crypto_backtest_workbench.app.paper_trading.workflows import _aggregate_complete_execution_candles_to_1h
+from crypto_backtest_workbench.app.paper_trading.signal_snapshot import build_paper_signal_snapshot
 from crypto_backtest_workbench.domain.models import (
     BacktestRun,
     CanonicalCandle,
@@ -50,6 +54,27 @@ def test_paper_broker_opens_on_next_execution_bar_and_marks_position() -> None:
     assert session.account.available_cash == 949.5
     assert session.account.used_margin == 50.5
     assert session.account.equity == 1001.0
+
+
+def test_paper_broker_executes_signal_mapped_to_current_incremental_bar() -> None:
+    session = _session()
+    candles = _candles([100.0, 101.0])
+    signal = _signal(
+        timestamp=candles[1].timestamp,
+        meta_json={"execution_signal_timestamp": candles[1].timestamp.isoformat()},
+    )
+
+    result = PaperBroker().execute(
+        session=session,
+        execution_candles=[candles[1]],
+        signals=[signal],
+        constraints=ExecutionConstraints(initial_cash=1_000.0, leverage=2.0, qty_by_policy={"fixed_1": 1.0}),
+    )
+
+    assert len(result.orders) == 1
+    assert len(result.fills) == 1
+    assert result.position is not None
+    assert result.position.trade.entry_time == candles[1].timestamp
 
 
 def test_paper_broker_closes_for_intrabar_stop_loss_before_take_profit() -> None:
@@ -203,20 +228,159 @@ def test_tick_processes_execution_bars_without_new_strategy_bars(tmp_path: Path)
     assert repository.load_session(session.session_id).position is None
 
 
-def _session() -> PaperSession:
+def test_signal_snapshot_aggregates_5m_execution_candles_to_1h(tmp_path: Path) -> None:
+    session = _session(
+        strategy_name="ema_pullback_atr_v2",
+        strategy_params={
+            "trend_fast_period": 2,
+            "trend_slow_period": 13,
+            "entry_ema_period": 21,
+            "atr_period": 14,
+            "atr_entry_tolerance": 1.0,
+            "atr_stop_mult": 2.0,
+            "risk_reward_ratio": 1.5,
+            "min_stop_pct": 0.003,
+            "qty_policy_ref": "risk_pct_of_cash_allocation",
+        },
+        execution_constraints={
+            "initial_cash": 10_000.0,
+            "leverage": 10.0,
+            "fee_rate": 0.0,
+            "min_notional": 0.0,
+            "cash_allocation_pct_by_policy": {"risk_pct_of_cash_allocation": 50.0},
+            "risk_pct_per_trade_by_policy": {"risk_pct_of_cash_allocation": 0.1},
+        },
+    )
+    _write_execution_dataset(tmp_path, session, _candles([100.0 + index for index in range(360)]))
+
+    snapshot = build_paper_signal_snapshot(
+        session=session,
+        data_dir=tmp_path,
+        now=datetime(2024, 1, 2, 7, 0, tzinfo=UTC),
+    )
+
+    assert snapshot["data"]["strategy_bar_count"] == 30
+    assert snapshot["indicators"]["ema_fast_period"] == 2.0
+    assert snapshot["indicators"]["ema_slow_period"] == 13.0
+    assert snapshot["indicators"]["entry_ema_period"] == 21.0
+    assert snapshot["indicators"]["atr"] is not None
+    assert snapshot["estimate"]["entry_price"] is not None
+    assert snapshot["backfill"]["attempted"] is False
+
+
+def test_paper_tick_merges_only_complete_1h_from_execution_candles(tmp_path: Path) -> None:
+    repository = FilePaperTradingRepository(tmp_path)
+    session = _session(strategy_params={"fast_period": 2, "slow_period": 3, "qty_policy_ref": "fixed_1"})
+    repository.save_session(session)
+    execution_candles = _candles([100.0 + index for index in range(24)])
+    _write_execution_dataset(tmp_path, session, execution_candles)
+    client = PaperLocalKlineMarketDataClient(data_dir=tmp_path)
+
+    result = tick_paper_session_workflow(
+        paper_repository=repository,
+        feature_repository=FileFeatureRepository(tmp_path),
+        market_data_client=client,
+        request=TickPaperSessionRequest(
+            session_id=session.session_id,
+            until=datetime(2024, 1, 1, 1, 30, tzinfo=UTC),
+        ),
+    )
+
+    assert result.strategy_bar_count == 1
+    assert result.session.checkpoint.last_strategy_bar_time == datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    assert result.session.checkpoint.last_execution_bar_time == datetime(2024, 1, 1, 1, 25, tzinfo=UTC)
+
+
+def test_aggregate_complete_execution_candles_to_1h_skips_partial_or_gapped_buckets() -> None:
+    candles = _candles([100.0 + index for index in range(24)])
+
+    aggregated = _aggregate_complete_execution_candles_to_1h(
+        candles,
+        source_timeframe="5m",
+        until=datetime(2024, 1, 1, 1, 30, tzinfo=UTC),
+    )
+    gapped = _aggregate_complete_execution_candles_to_1h(
+        [candle for index, candle in enumerate(candles[:12]) if index != 4],
+        source_timeframe="5m",
+        until=datetime(2024, 1, 1, 1, 0, tzinfo=UTC),
+    )
+
+    assert [candle.timestamp for candle in aggregated] == [datetime(2024, 1, 1, 0, 0, tzinfo=UTC)]
+    assert aggregated[0].open == 100.0
+    assert aggregated[0].close == 111.0
+    assert aggregated[0].timeframe == "1h"
+    assert gapped == []
+
+
+def test_signal_snapshot_backfill_targets_latest_internal_gap(tmp_path: Path, monkeypatch) -> None:
+    session = _session()
+    _write_execution_dataset(
+        tmp_path,
+        session,
+        [
+            *_candles([100.0, 101.0]),
+            *[
+                CanonicalCandle(
+                    timestamp=datetime(2024, 1, 1, 1, 0, tzinfo=UTC) + timedelta(minutes=5 * index),
+                    symbol="BTC/USDT:USDT",
+                    exchange="binanceusdm",
+                    market_type=MarketType.LINEAR_USDT_PERPETUAL,
+                    timeframe="5m",
+                    open=110.0 + index,
+                    high=111.0 + index,
+                    low=109.0 + index,
+                    close=110.0 + index,
+                    volume=1.0,
+                    price_type=PriceType.LAST,
+                    data_source="fixture",
+                )
+                for index in range(2)
+            ],
+        ],
+    )
+    captured: dict[str, datetime] = {}
+
+    def fake_fetch(self, request):
+        captured["since"] = request.since
+        captured["until"] = request.until
+        return []
+
+    monkeypatch.setattr(
+        "crypto_backtest_workbench.app.paper_trading.signal_snapshot.BinanceUsdMRestHistoryFetcher.fetch_ohlcv",
+        fake_fetch,
+    )
+
+    snapshot = build_paper_signal_snapshot(
+        session=session,
+        data_dir=tmp_path,
+        allow_backfill=True,
+        now=datetime(2024, 1, 1, 2, 0, tzinfo=UTC),
+    )
+
+    assert captured["since"] == datetime(2024, 1, 1, 0, 10, tzinfo=UTC)
+    assert captured["until"] == datetime(2024, 1, 1, 1, 0, tzinfo=UTC)
+    assert snapshot["backfill"]["status"] == "success"
+
+
+def _session(
+    *,
+    strategy_name: str = "ema_crossover",
+    strategy_params: dict[str, object] | None = None,
+    execution_constraints: dict[str, object] | None = None,
+) -> PaperSession:
     return PaperSession(
         session_id="paper-test-001",
         stable_candidate_id="stable-001",
         source_run_id="run-source-001",
-        strategy_name="ema_crossover",
+        strategy_name=strategy_name,
         symbol="BTC/USDT:USDT",
         exchange="binanceusdm",
         market_type=MarketType.LINEAR_USDT_PERPETUAL.value,
         price_type=PriceType.LAST.value,
         strategy_timeframe="1h",
         execution_timeframe="5m",
-        strategy_params={"qty_policy_ref": "fixed_1"},
-        execution_constraints={"initial_cash": 1_000.0, "leverage": 2.0, "qty_by_policy": {"fixed_1": 1.0}},
+        strategy_params=strategy_params or {"qty_policy_ref": "fixed_1"},
+        execution_constraints=execution_constraints or {"initial_cash": 1_000.0, "leverage": 2.0, "qty_by_policy": {"fixed_1": 1.0}},
         account=AccountSnapshot(
             available_cash=1_000.0,
             used_margin=0.0,
@@ -323,3 +487,57 @@ def _persist_source_run(repository: FileRunRepository) -> None:
     )
     repository.save_run(run)
     repository.save_manifest(manifest)
+
+
+def _write_execution_dataset(tmp_path: Path, session: PaperSession, candles: list[CanonicalCandle]) -> None:
+    dataset_dir = tmp_path / "datasets" / "binanceusdm-BTC_USDT_USDT-5m-fixture"
+    dataset_dir.mkdir(parents=True)
+    (dataset_dir / "snapshot.json").write_text(
+        json.dumps(
+            {
+                "dataset_snapshot_id": "binanceusdm-BTC_USDT_USDT-5m-fixture",
+                "exchange": session.exchange,
+                "market_type": session.market_type,
+                "symbol": session.symbol,
+                "timeframe": session.execution_timeframe,
+                "price_type": session.price_type,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with (dataset_dir / "canonical_candles.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "timestamp",
+                "symbol",
+                "exchange",
+                "market_type",
+                "timeframe",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "price_type",
+                "data_source",
+            ],
+        )
+        writer.writeheader()
+        for candle in candles:
+            writer.writerow(
+                {
+                    "timestamp": candle.timestamp.isoformat(),
+                    "symbol": candle.symbol,
+                    "exchange": candle.exchange,
+                    "market_type": candle.market_type.value,
+                    "timeframe": candle.timeframe,
+                    "open": candle.open,
+                    "high": candle.high,
+                    "low": candle.low,
+                    "close": candle.close,
+                    "volume": candle.volume,
+                    "price_type": candle.price_type.value,
+                    "data_source": candle.data_source,
+                }
+            )

@@ -15,6 +15,7 @@ from crypto_backtest_workbench.app.workflows.execution_verification import (
 )
 from crypto_backtest_workbench.app.workflows.run_backtest import build_strategy
 from crypto_backtest_workbench.domain.models import CanonicalCandle
+from crypto_backtest_workbench.engine.data.canonicalizer import sort_and_deduplicate_candles
 from crypto_backtest_workbench.engine.data.fetchers import HistoryFetcher
 from crypto_backtest_workbench.engine.features import FeaturePipeline
 from crypto_backtest_workbench.engine.portfolio.account import AccountSnapshot
@@ -107,6 +108,20 @@ def tick_paper_session_workflow(
     if strategy_candles is None or execution_candles is None:
         if market_data_client is None:
             raise ValueError("market_data_client is required when candles are not supplied")
+        if execution_candles is None:
+            execution_candles = market_data_client.fetch_closed_candles(
+                exchange=session.exchange,
+                symbol=session.symbol,
+                market_type=session.market_type,
+                price_type=session.price_type,
+                timeframe=session.execution_timeframe,
+                since=_fetch_since(
+                    session.checkpoint.last_execution_bar_time,
+                    session.execution_timeframe,
+                    DEFAULT_PAPER_EXECUTION_LOOKBACK_BARS,
+                ),
+                until=until,
+            )
         if strategy_candles is None:
             strategy_candles = market_data_client.fetch_closed_candles(
                 exchange=session.exchange,
@@ -121,18 +136,10 @@ def tick_paper_session_workflow(
                 ),
                 until=until,
             )
-        if execution_candles is None:
-            execution_candles = market_data_client.fetch_closed_candles(
-                exchange=session.exchange,
-                symbol=session.symbol,
-                market_type=session.market_type,
-                price_type=session.price_type,
-                timeframe=session.execution_timeframe,
-                since=_fetch_since(
-                    session.checkpoint.last_execution_bar_time,
-                    session.execution_timeframe,
-                    DEFAULT_PAPER_EXECUTION_LOOKBACK_BARS,
-                ),
+            strategy_candles = _merge_closed_execution_strategy_candles(
+                session=session,
+                strategy_candles=strategy_candles,
+                execution_candles=execution_candles or [],
                 until=until,
             )
 
@@ -231,6 +238,70 @@ def _fetch_since(last_seen: datetime | None, timeframe: str, bars: int) -> datet
     if last_seen is not None:
         return last_seen - (_timeframe_delta(timeframe) * max(1, bars))
     return datetime.fromtimestamp(0, tz=UTC)
+
+
+def _merge_closed_execution_strategy_candles(
+    *,
+    session: PaperSession,
+    strategy_candles: list[CanonicalCandle],
+    execution_candles: list[CanonicalCandle],
+    until: datetime,
+) -> list[CanonicalCandle]:
+    if session.strategy_timeframe.strip().lower() != "1h":
+        return strategy_candles
+    if session.execution_timeframe.strip().lower() not in {"1m", "5m", "15m"}:
+        return strategy_candles
+    aggregated = _aggregate_complete_execution_candles_to_1h(
+        execution_candles,
+        source_timeframe=session.execution_timeframe,
+        until=until,
+    )
+    if not aggregated:
+        return strategy_candles
+    return sort_and_deduplicate_candles([*strategy_candles, *aggregated])
+
+
+def _aggregate_complete_execution_candles_to_1h(
+    candles: list[CanonicalCandle],
+    *,
+    source_timeframe: str,
+    until: datetime,
+) -> list[CanonicalCandle]:
+    source_delta = _timeframe_delta(source_timeframe)
+    target_delta = timedelta(hours=1)
+    expected_bars = int(target_delta / source_delta)
+    if expected_bars <= 0 or target_delta % source_delta != timedelta(0):
+        return []
+    buckets: dict[datetime, list[CanonicalCandle]] = {}
+    for candle in candles:
+        start = candle.timestamp.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+        buckets.setdefault(start, []).append(candle)
+
+    aggregated: list[CanonicalCandle] = []
+    for start, bucket in sorted(buckets.items()):
+        if start + target_delta > until.astimezone(UTC):
+            continue
+        ordered = sorted(bucket, key=lambda item: item.timestamp)
+        expected_timestamps = {start + (source_delta * index) for index in range(expected_bars)}
+        if {item.timestamp.astimezone(UTC) for item in ordered} != expected_timestamps:
+            continue
+        aggregated.append(
+            CanonicalCandle(
+                timestamp=start,
+                symbol=ordered[0].symbol,
+                exchange=ordered[0].exchange,
+                market_type=ordered[0].market_type,
+                timeframe="1h",
+                open=ordered[0].open,
+                high=max(item.high for item in ordered),
+                low=min(item.low for item in ordered),
+                close=ordered[-1].close,
+                volume=sum(item.volume for item in ordered),
+                price_type=ordered[0].price_type,
+                data_source="aggregated_complete_execution_klines",
+            )
+        )
+    return aggregated
 
 
 def _timeframe_delta(timeframe: str) -> timedelta:

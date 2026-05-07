@@ -131,6 +131,18 @@ export interface PaperSessionsPayload {
   paper_sessions: PaperSessionView[];
 }
 
+export interface PaperSessionPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  paper_session: PaperSessionView;
+}
+
+export interface PaperSignalSnapshotPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  paper_signal_snapshot: PaperSignalSnapshotView;
+}
+
 export interface DatasetSnapshotView {
   created_at: string;
   data_source: string;
@@ -627,6 +639,47 @@ export interface PaperSessionView {
   updated_at: string;
   model_version: string;
   live_streams?: PaperLiveKlineStatusView[];
+  orders?: PaperOrderView[];
+  fills?: PaperFillView[];
+  trades?: PaperTradeView[];
+  warnings?: PaperWarningView[];
+}
+
+export interface PaperOrderView {
+  order_id: string;
+  run_id: string;
+  signal_id: string;
+  symbol: string;
+  side: string;
+  order_type: string;
+  qty: number | string;
+  request_time: string;
+  request_price: number | string | null;
+  status: string;
+  reject_reason_code?: string | null;
+  reject_payload?: Record<string, unknown> | string;
+}
+
+export interface PaperFillView {
+  fill_id: string;
+  run_id: string;
+  order_id: string;
+  trade_id: string | null;
+  fill_time: string;
+  fill_price: number | string;
+  qty: number | string;
+  fee: number | string;
+  slippage_cost: number | string;
+}
+
+export interface PaperWarningView {
+  warning_id?: string;
+  warning_type?: string;
+  warning_code?: string;
+  severity?: string;
+  message?: string;
+  created_at?: string;
+  payload_json?: Record<string, unknown> | string;
 }
 
 export interface PaperLiveKlineStatusView {
@@ -642,6 +695,70 @@ export interface PaperLiveKlineStatusView {
   last_closed_bar_time?: string;
   updated_at?: string;
   error?: string | null;
+  auto_tick_status?: string;
+  auto_tick_at?: string;
+  auto_tick_last_execution_bar_time?: string | null;
+  auto_tick_execution_bar_count?: number;
+  auto_tick_new_execution_bars?: number;
+  auto_tick_order_count?: number;
+  auto_tick_fill_count?: number;
+  auto_tick_closed_trade_count?: number;
+  auto_tick_error?: string | null;
+}
+
+export interface PaperSignalSnapshotView {
+  session_id: string;
+  symbol: string;
+  strategy_timeframe: string;
+  execution_timeframe: string;
+  generated_at: string;
+  data: {
+    source: string;
+    strategy_bar_count: number;
+    execution_bar_count: number;
+    last_strategy_bar_time: string | null;
+    last_execution_bar_time: string | null;
+    execution_gap_count: number;
+    latest_gap_start: string | null;
+    latest_gap_end: string | null;
+  };
+  indicators: {
+    ema_fast_period: number;
+    ema_slow_period: number;
+    entry_ema_period: number;
+    atr_period: number;
+    ema_fast: number | null;
+    ema_slow: number | null;
+    ema21: number | null;
+    atr: number | null;
+  };
+  trigger: {
+    side: string | null;
+    status: string;
+    trigger_price: number | null;
+    distance_to_trigger: number | null;
+    last_close: number | null;
+    previous_high: number | null;
+    previous_low: number | null;
+  };
+  estimate: {
+    entry_price: number | null;
+    stop_loss: number | null;
+    take_profit: number | null;
+    stop_distance: number | null;
+    qty: number | null;
+    notional: number | null;
+    margin: number | null;
+  };
+  backfill: {
+    attempted: boolean;
+    status: string;
+    timeframe: string;
+    requested_since: string | null;
+    requested_until: string | null;
+    fetched_bars: number;
+    error: string | null;
+  };
 }
 
 export interface ResearchWorkflow {

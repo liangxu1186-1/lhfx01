@@ -6,6 +6,8 @@ import type {
   ParameterExperimentDetailPayload,
   OverviewPayload,
   ParameterExperimentIndexPayload,
+  PaperSignalSnapshotPayload,
+  PaperSessionPayload,
   PaperSessionsPayload,
   ParametersPayload,
   ParameterGroupDetailPayload,
@@ -276,6 +278,20 @@ export async function loadResearchNotes(targetTypeOrFilters?: string | ResearchN
 
 export async function loadPaperSessions(): Promise<PaperSessionsPayload> {
   return fetchJson<PaperSessionsPayload>('/api/paper-sessions');
+}
+
+export async function loadPaperSession(sessionId: string): Promise<PaperSessionPayload> {
+  return fetchJson<PaperSessionPayload>(`/api/paper-sessions/${encodeURIComponent(sessionId)}`);
+}
+
+export async function loadPaperSignalSnapshot(sessionId: string, options?: { backfill?: boolean }): Promise<PaperSignalSnapshotPayload> {
+  const params = new URLSearchParams();
+  if (options?.backfill) {
+    params.set('backfill', '1');
+  }
+  return fetchJson<PaperSignalSnapshotPayload>(
+    `/api/paper-sessions/${encodeURIComponent(sessionId)}/signal-snapshot${params.size ? `?${params.toString()}` : ''}`,
+  );
 }
 
 export async function postIngest(payload: Record<string, unknown>): Promise<Record<string, unknown>> {

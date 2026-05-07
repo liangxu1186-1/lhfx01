@@ -74,7 +74,7 @@ class PaperBroker:
                     position = None
 
             due_signals: list[SignalIntent] = []
-            while signal_cursor < len(sorted_signals) and sorted_signals[signal_cursor].timestamp < candle.timestamp:
+            while signal_cursor < len(sorted_signals) and _signal_is_due(sorted_signals[signal_cursor], candle):
                 signal = sorted_signals[signal_cursor]
                 signal_cursor += 1
                 if signal.signal_id in executed_signal_ids:
@@ -133,10 +133,17 @@ def _to_open_position(position: PaperPosition | None) -> _OpenPosition | None:
     )
 
 
+def _signal_is_due(signal: SignalIntent, candle: CanonicalCandle) -> bool:
+    if signal.timestamp < candle.timestamp:
+        return True
+    if signal.timestamp != candle.timestamp:
+        return False
+    return signal.meta_json.get("execution_signal_timestamp") == candle.timestamp.isoformat()
+
+
 def _from_open_position(position: _OpenPosition) -> PaperPosition:
     return PaperPosition(
         trade=position.trade,
         reserved_margin=position.reserved_margin,
         entry_execution_index=position.entry_index,
     )
-

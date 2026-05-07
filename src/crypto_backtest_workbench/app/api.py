@@ -28,6 +28,7 @@ from crypto_backtest_workbench.app.paper_trading.live_klines import (
 )
 from crypto_backtest_workbench.app.paper_trading.market_data import PaperLocalKlineMarketDataClient, PaperMarketDataClient
 from crypto_backtest_workbench.app.paper_trading.models import PaperSession
+from crypto_backtest_workbench.app.paper_trading.signal_snapshot import build_paper_signal_snapshot
 from crypto_backtest_workbench.app.readmodels.parameters import ParameterLabRow, build_parameter_lab_rows
 from crypto_backtest_workbench.app.readmodels import (
     build_parameter_research_workspace,
@@ -191,6 +192,16 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                     HTTPStatus.OK,
                     self._build_workspace_payload(
                         paper_sessions=self._build_paper_session_index(),
+                    ),
+                )
+                return
+            if path.startswith("/api/paper-sessions/") and path.endswith("/signal-snapshot"):
+                session_id = unquote(path.removeprefix("/api/paper-sessions/").removesuffix("/signal-snapshot"))
+                allow_backfill = query.get("backfill", ["0"])[0] in {"1", "true", "yes"}
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        paper_signal_snapshot=self._build_paper_signal_snapshot(session_id, allow_backfill=allow_backfill),
                     ),
                 )
                 return
@@ -613,7 +624,17 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
         repository = FilePaperTradingRepository(self.server.data_dir)
         session = repository.load_session(session_id)
         self._ensure_paper_kline_streams(session)
-        return self._paper_session_payload(session)
+        return self._paper_session_payload(session, include_records=True)
+
+    def _build_paper_signal_snapshot(self, session_id: str, *, allow_backfill: bool = False) -> dict[str, object]:
+        repository = FilePaperTradingRepository(self.server.data_dir)
+        session = repository.load_session(session_id)
+        self._ensure_paper_kline_streams(session)
+        return build_paper_signal_snapshot(
+            session=session,
+            data_dir=self.server.data_dir,
+            allow_backfill=allow_backfill,
+        )
 
     def _handle_create_paper_session(self, payload: dict[str, object]) -> tuple[HTTPStatus, dict[str, object]]:
         repository = FilePaperTradingRepository(self.server.data_dir)
@@ -678,12 +699,18 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
             },
         )
 
-    def _paper_session_payload(self, session: PaperSession) -> dict[str, object]:
+    def _paper_session_payload(self, session: PaperSession, *, include_records: bool = False) -> dict[str, object]:
         payload = json_ready(session)
         payload["live_streams"] = [
             FileLiveKlineCache(self.server.data_dir).load_status(spec)
             for spec in self._paper_kline_specs(session)
         ]
+        if include_records:
+            repository = FilePaperTradingRepository(self.server.data_dir)
+            payload["orders"] = repository.load_orders(session.session_id)
+            payload["fills"] = repository.load_fills(session.session_id)
+            payload["trades"] = repository.load_trades(session.session_id)
+            payload["warnings"] = repository.load_warnings(session.session_id)
         return payload
 
     def _ensure_paper_kline_streams(self, session: PaperSession) -> None:
@@ -2214,7 +2241,81 @@ def _parse_optional_datetime(value: object | None) -> datetime | None:
 
 
 def _run_binance_kline_stream(data_dir: Path, spec: LiveKlineStreamSpec) -> None:
-    asyncio.run(stream_binance_usdm_klines(cache=FileLiveKlineCache(data_dir), specs=[spec]))
+    cache = FileLiveKlineCache(data_dir)
+    asyncio.run(
+        stream_binance_usdm_klines(
+            cache=cache,
+            specs=[spec],
+            on_closed_candle=lambda closed_spec, candle: _auto_tick_paper_sessions_for_closed_candle(
+                data_dir,
+                cache,
+                closed_spec,
+                candle,
+            ),
+        )
+    )
+
+
+def _auto_tick_paper_sessions_for_closed_candle(
+    data_dir: Path,
+    cache: FileLiveKlineCache,
+    spec: LiveKlineStreamSpec,
+    candle: object,
+) -> None:
+    if spec.timeframe != "5m":
+        return
+    repository = FilePaperTradingRepository(data_dir)
+    matched_sessions = [
+        session
+        for session in repository.list_sessions()
+        if session.status == "active"
+        and session.symbol == spec.symbol
+        and _exchange_alias(session.exchange) == _exchange_alias(spec.exchange)
+        and session.market_type == spec.market_type.value
+        and session.price_type == spec.price_type.value
+        and session.execution_timeframe == spec.timeframe
+    ]
+    for session in matched_sessions:
+        try:
+            result = tick_paper_session_workflow(
+                paper_repository=repository,
+                feature_repository=FileFeatureRepository(data_dir),
+                market_data_client=PaperLocalKlineMarketDataClient(
+                    data_dir=data_dir,
+                    live_cache=cache,
+                    allow_rest_fallback=False,
+                ),
+                request=TickPaperSessionRequest(session_id=session.session_id),
+            )
+            cache.save_status(
+                spec,
+                {
+                    "auto_tick_status": "success",
+                    "auto_tick_session_id": session.session_id,
+                    "auto_tick_at": datetime.now(UTC).isoformat(),
+                    "auto_tick_last_execution_bar_time": (
+                        result.session.checkpoint.last_execution_bar_time.isoformat()
+                        if result.session.checkpoint.last_execution_bar_time
+                        else None
+                    ),
+                    "auto_tick_execution_bar_count": result.session.checkpoint.execution_bar_count,
+                    "auto_tick_new_execution_bars": result.execution_bar_count,
+                    "auto_tick_order_count": result.order_count,
+                    "auto_tick_fill_count": result.fill_count,
+                    "auto_tick_closed_trade_count": result.closed_trade_count,
+                    "auto_tick_error": None,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - exercised by live runtime
+            cache.save_status(
+                spec,
+                {
+                    "auto_tick_status": "error",
+                    "auto_tick_session_id": session.session_id,
+                    "auto_tick_at": datetime.now(UTC).isoformat(),
+                    "auto_tick_error": f"{type(exc).__name__}: {exc}",
+                },
+            )
 
 
 def _exchange_alias(exchange: str) -> str:
