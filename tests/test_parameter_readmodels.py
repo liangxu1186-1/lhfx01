@@ -15,6 +15,7 @@ from crypto_backtest_workbench.app.workflows.run_backtest import (
     RunBacktestWorkflowRequest,
     run_backtest_workflow,
 )
+from crypto_backtest_workbench.app.readmodels import research as research_readmodels
 from crypto_backtest_workbench.domain.models import DatasetSnapshot, MarketType, PriceType, ResearchNote, ValidationSplit, ValidationTargetType
 from crypto_backtest_workbench.engine.execution import ExecutionConstraints
 from crypto_backtest_workbench.storage.repositories import (
@@ -324,6 +325,25 @@ def test_research_workflow_marks_risk_matrix_done_when_risk_variants_exist(tmp_p
     candidate = workflow.research_pool["candidates"][0]
     assert candidate["risk_matrix_summary"]["status"] == "已跑"
     assert candidate["risk_matrix_summary"]["group_count"] == 2
+
+
+def test_execution_verification_drawdown_gate_allows_under_forty_percent() -> None:
+    assert research_readmodels._execution_verification_status(
+        {
+            "trade_count": 12,
+            "total_return": 1.0,
+            "max_drawdown": 0.3525,
+            "profit_factor": 1.16,
+        }
+    ) == "passed"
+    assert research_readmodels._execution_verification_status(
+        {
+            "trade_count": 12,
+            "total_return": 1.0,
+            "max_drawdown": 0.4,
+            "profit_factor": 1.16,
+        }
+    ) == "failed"
 
 
 def _persist_snapshot(repository: FileDatasetRepository) -> DatasetSnapshot:

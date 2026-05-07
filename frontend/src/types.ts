@@ -125,6 +125,12 @@ export interface ResearchNotesPayload {
   research_notes: ResearchNote[];
 }
 
+export interface PaperSessionsPayload {
+  generated_at: string;
+  source: WorkspaceSource;
+  paper_sessions: PaperSessionView[];
+}
+
 export interface DatasetSnapshotView {
   created_at: string;
   data_source: string;
@@ -517,6 +523,125 @@ export interface StableCandidateView {
   final_recommendation: string;
   status: string;
   latest_note: ResearchNote | null;
+  execution_verification: ExecutionVerificationView;
+}
+
+export interface ExecutionVerificationView {
+  latest_run_id: string | null;
+  parent_run_id: string | null;
+  status: string;
+  strategy_timeframe: string | null;
+  execution_timeframe: string | null;
+  execution_model_version: string | null;
+  summary: {
+    total_return?: number | null;
+    max_drawdown?: number | null;
+    profit_factor?: number | null;
+    win_rate?: number | null;
+    trade_count?: number | null;
+    final_equity?: number | null;
+    [key: string]: unknown;
+  };
+  validation?: {
+    validation_split_id?: string | null;
+    is_total_return?: number | null;
+    is_max_drawdown?: number | null;
+    is_profit_factor?: number | null;
+    is_win_rate?: number | null;
+    is_trade_count?: number | null;
+    is_final_equity?: number | null;
+    is_analysis_bar_count?: number | null;
+    oos_total_return?: number | null;
+    oos_max_drawdown?: number | null;
+    oos_profit_factor?: number | null;
+    oos_win_rate?: number | null;
+    oos_trade_count?: number | null;
+    oos_final_equity?: number | null;
+    oos_analysis_bar_count?: number | null;
+    [key: string]: unknown;
+  } | null;
+  created_at?: string | null;
+}
+
+export interface PaperAccountView {
+  available_cash: number;
+  used_margin: number;
+  maintenance_margin: number;
+  equity: number;
+  unrealized_pnl: number;
+}
+
+export interface PaperCheckpointView {
+  last_strategy_bar_time: string | null;
+  last_execution_bar_time: string | null;
+  last_signal_time: string | null;
+  execution_bar_count: number;
+}
+
+export interface PaperTradeView {
+  trade_id: string;
+  run_id: string;
+  symbol: string;
+  side: string;
+  entry_time: string;
+  entry_price: number;
+  exit_time: string | null;
+  exit_price: number | null;
+  qty: number;
+  gross_pnl: number;
+  fee: number;
+  net_pnl: number;
+  return_pct: number;
+  holding_bars: number;
+  entry_reason: string;
+  exit_reason: string;
+  planned_stop_loss_price: number | null;
+  planned_take_profit_price: number | null;
+  entry_signal_meta_json: Record<string, unknown>;
+}
+
+export interface PaperPositionView {
+  trade: PaperTradeView;
+  reserved_margin: number;
+  entry_execution_index: number;
+}
+
+export interface PaperSessionView {
+  session_id: string;
+  stable_candidate_id: string;
+  source_run_id: string;
+  strategy_name: string;
+  symbol: string;
+  exchange: string;
+  market_type: string;
+  price_type: string;
+  strategy_timeframe: string;
+  execution_timeframe: string;
+  strategy_params: Record<string, unknown>;
+  execution_constraints: Record<string, unknown>;
+  account: PaperAccountView;
+  checkpoint: PaperCheckpointView;
+  position: PaperPositionView | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  model_version: string;
+  live_streams?: PaperLiveKlineStatusView[];
+}
+
+export interface PaperLiveKlineStatusView {
+  exchange: string;
+  symbol: string;
+  market_type: string;
+  timeframe: string;
+  price_type: string;
+  status: string;
+  stream_url?: string;
+  connected_at?: string;
+  last_message_at?: string;
+  last_closed_bar_time?: string;
+  updated_at?: string;
+  error?: string | null;
 }
 
 export interface ResearchWorkflow {

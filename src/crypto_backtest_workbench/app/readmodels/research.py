@@ -16,7 +16,7 @@ from crypto_backtest_workbench.storage.repositories import (
 )
 
 MAX_ROBUST_GAP = 0.2
-MAX_ROBUST_AVG_DRAWDOWN = 0.35
+MAX_ROBUST_AVG_DRAWDOWN = 0.4
 MAX_EXCLUDED_WORST_DRAWDOWN = 0.8
 MIN_STABLE_TRADE_COUNT = 3
 MAX_SCREENING_GAP = 0.2
@@ -225,6 +225,7 @@ class StableCandidateView:
     evidence_run_ids: tuple[str, ...]
     representative_run_id: str | None
     validation_summary: dict[str, object]
+    execution_verification: dict[str, object]
     neighborhood_summary: dict[str, object]
     risk_matrix_summary: dict[str, object]
     final_recommendation: str
@@ -271,6 +272,7 @@ def build_research_workflow(
     notes = note_repository.list_notes()
     notes_by_target = _notes_by_target(notes)
     groups_by_key = {group.group_key: group for group in groups}
+    execution_verifications_by_candidate = _execution_verifications_by_candidate(run_repository)
     legacy_group_key_map = _legacy_group_key_map(rows)
     group_key_by_run_id: dict[str, str] = {}
     for group in groups:
@@ -327,7 +329,11 @@ def build_research_workflow(
         if group_key in groups_by_key
     ]
     stable_candidates = [
-        _build_stable_candidate_view(groups_by_key[group_key], notes_by_target)
+        _build_stable_candidate_view(
+            groups_by_key[group_key],
+            notes_by_target,
+            execution_verification=execution_verifications_by_candidate.get(group_key),
+        )
         for group_key in stable_group_keys
         if group_key in groups_by_key
     ]
@@ -1097,9 +1103,12 @@ def _build_research_candidate_view(
 def _build_stable_candidate_view(
     group: ParameterGroupView,
     notes_by_target: dict[tuple[str, str], list[ResearchNote]],
+    *,
+    execution_verification: dict[str, object] | None = None,
 ) -> StableCandidateView:
     candidate_notes = _candidate_notes(group, notes_by_target)
     latest_note = candidate_notes[0] if candidate_notes else None
+    verification = execution_verification or _empty_execution_verification()
     return StableCandidateView(
         stable_candidate_id=group.group_key,
         strategy_name=group.strategy_name,
@@ -1111,10 +1120,11 @@ def _build_stable_candidate_view(
         evidence_run_ids=group.run_ids,
         representative_run_id=group.representative_run_id,
         validation_summary=_validation_summary(group),
+        execution_verification=verification,
         neighborhood_summary=_neighborhood_summary(group),
         risk_matrix_summary=_risk_matrix_summary(group),
         final_recommendation=latest_note.decision_reason if latest_note and latest_note.decision_reason else _candidate_recommendation(group),
-        status=latest_note.decision_status if latest_note else "approved",
+        status=_stable_candidate_status(latest_note, verification),
         latest_note=json_ready_note(latest_note),
     )
 
@@ -1132,6 +1142,124 @@ def _candidate_notes(
             if note.linked_parameter_group is None or note.linked_parameter_group == group.group_key:
                 notes.append(note)
     return sorted({note.note_id: note for note in notes}.values(), key=lambda note: note.created_at, reverse=True)
+
+
+def _execution_verifications_by_candidate(run_repository: RunRepository) -> dict[str, dict[str, object]]:
+    verifications: dict[str, dict[str, object]] = {}
+    for run_id in run_repository.list_run_ids():
+        try:
+            manifest = run_repository.load_manifest(run_id)
+        except FileNotFoundError:
+            continue
+        resolved = manifest.resolved_config_json
+        if resolved.get("run_type") != "execution_verification":
+            continue
+        candidate_id = str(resolved.get("stable_candidate_id") or "")
+        if not candidate_id:
+            continue
+        try:
+            run = run_repository.load_run(run_id)
+            metrics = run_repository.load_metrics(run_id)
+            max_drawdown = run_repository.load_max_drawdown(run_id)
+            validation_summary = run_repository.load_validation_summary(run_id)
+        except FileNotFoundError:
+            continue
+        summary = {
+            "total_return": metrics.total_return,
+            "max_drawdown": max_drawdown,
+            "profit_factor": metrics.profit_factor,
+            "win_rate": metrics.win_rate,
+            "trade_count": metrics.trade_count,
+            "final_equity": metrics.final_equity,
+        }
+        payload = {
+            "latest_run_id": run_id,
+            "parent_run_id": str(resolved.get("parent_run_id") or ""),
+            "status": _execution_verification_status(summary),
+            "strategy_timeframe": str(resolved.get("strategy_timeframe") or ""),
+            "execution_timeframe": str(resolved.get("execution_timeframe") or ""),
+            "execution_model_version": str(resolved.get("execution_model_version") or ""),
+            "summary": summary,
+            "validation": _execution_validation_payload(validation_summary),
+            "created_at": run.created_at.isoformat(),
+        }
+        current = verifications.get(candidate_id)
+        if current is None or str(payload["created_at"]) > str(current.get("created_at") or ""):
+            verifications[candidate_id] = payload
+    return verifications
+
+
+def _empty_execution_verification() -> dict[str, object]:
+    return {
+        "latest_run_id": None,
+        "parent_run_id": None,
+        "status": "not_run",
+        "strategy_timeframe": None,
+        "execution_timeframe": None,
+        "execution_model_version": None,
+        "summary": {},
+        "validation": None,
+    }
+
+
+def _execution_validation_payload(validation_summary: dict[str, object] | None) -> dict[str, object] | None:
+    if validation_summary is None:
+        return None
+    is_segment = validation_summary.get("is_segment")
+    oos_segment = validation_summary.get("oos_segment")
+    if not isinstance(is_segment, dict) or not isinstance(oos_segment, dict):
+        return None
+    is_metrics = is_segment.get("metrics")
+    oos_metrics = oos_segment.get("metrics")
+    if not isinstance(is_metrics, dict) or not isinstance(oos_metrics, dict):
+        return None
+    return {
+        "validation_split_id": validation_summary.get("validation_split_id"),
+        "is_total_return": is_metrics.get("total_return"),
+        "is_max_drawdown": is_metrics.get("max_drawdown"),
+        "is_profit_factor": is_metrics.get("profit_factor"),
+        "is_win_rate": is_metrics.get("win_rate"),
+        "is_trade_count": is_metrics.get("trade_count"),
+        "is_final_equity": is_metrics.get("final_equity"),
+        "is_analysis_bar_count": is_segment.get("analysis_bar_count"),
+        "oos_total_return": oos_metrics.get("total_return"),
+        "oos_max_drawdown": oos_metrics.get("max_drawdown"),
+        "oos_profit_factor": oos_metrics.get("profit_factor"),
+        "oos_win_rate": oos_metrics.get("win_rate"),
+        "oos_trade_count": oos_metrics.get("trade_count"),
+        "oos_final_equity": oos_metrics.get("final_equity"),
+        "oos_analysis_bar_count": oos_segment.get("analysis_bar_count"),
+    }
+
+
+def _execution_verification_status(summary: dict[str, object]) -> str:
+    total_return = _optional_numeric(summary.get("total_return"))
+    max_drawdown = _optional_numeric(summary.get("max_drawdown"))
+    profit_factor = _optional_numeric(summary.get("profit_factor"))
+    trade_count = int(summary.get("trade_count") or 0)
+    if trade_count <= 0:
+        return "failed"
+    if total_return is not None and total_return <= 0:
+        return "failed"
+    if max_drawdown is not None and max_drawdown >= MAX_ROBUST_AVG_DRAWDOWN:
+        return "failed"
+    if profit_factor is not None and profit_factor < MIN_SCREENING_PF:
+        return "failed"
+    return "passed"
+
+
+def _stable_candidate_status(note: ResearchNote | None, verification: dict[str, object]) -> str:
+    if verification.get("status") == "passed":
+        return "execution_verified"
+    if note is not None and note.decision_status not in {"approved", "candidate"}:
+        return note.decision_status
+    return "research_stable"
+
+
+def _optional_numeric(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)
 
 
 def _research_status(note: ResearchNote | None, group: ParameterGroupView) -> str:

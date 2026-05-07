@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import contextlib
+import asyncio
 import threading
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
@@ -13,6 +14,20 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from crypto_backtest_workbench.app.batch_scoring import build_batch_recommendations
+from crypto_backtest_workbench.app.paper_trading import (
+    CreatePaperSessionRequest,
+    FilePaperTradingRepository,
+    TickPaperSessionRequest,
+    create_paper_session_workflow,
+    tick_paper_session_workflow,
+)
+from crypto_backtest_workbench.app.paper_trading.live_klines import (
+    FileLiveKlineCache,
+    LiveKlineStreamSpec,
+    stream_binance_usdm_klines,
+)
+from crypto_backtest_workbench.app.paper_trading.market_data import PaperLocalKlineMarketDataClient, PaperMarketDataClient
+from crypto_backtest_workbench.app.paper_trading.models import PaperSession
 from crypto_backtest_workbench.app.readmodels.parameters import ParameterLabRow, build_parameter_lab_rows
 from crypto_backtest_workbench.app.readmodels import (
     build_parameter_research_workspace,
@@ -35,22 +50,29 @@ from crypto_backtest_workbench.app.workflows import (
     ParameterExperimentTaskRequest,
     build_parameter_experiment_batch,
     build_parameter_experiment_task,
+    ExecutionVerificationRequest,
     RunBacktestWorkflowRequest,
     ingest_dataset_workflow,
+    run_execution_verification_workflow,
     run_parameter_experiment_batch_workflow,
     run_parameter_experiment_task_workflow,
     run_backtest_task_workflow,
 )
 from crypto_backtest_workbench.domain.models import (
     DatasetSnapshot,
+    ExperimentBatch,
     MarketType,
+    ParameterExperiment,
     PriceType,
     ResearchNote,
     SearchType,
+    SeedPolicy,
+    TaskStatus,
     ValidationSplit,
     ValidationTargetType,
 )
 from crypto_backtest_workbench.engine.execution import ExecutionConstraints
+from crypto_backtest_workbench.engine.data.fetchers import build_default_history_fetcher
 from crypto_backtest_workbench.jobs import LocalTaskRunner
 from crypto_backtest_workbench.jobs.task_models import TaskRecord
 from crypto_backtest_workbench.storage.repositories import (
@@ -161,6 +183,24 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                     HTTPStatus.OK,
                     self._build_workspace_payload(
                         tasks=self._build_task_index(),
+                    ),
+                )
+                return
+            if path == "/api/paper-sessions":
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        paper_sessions=self._build_paper_session_index(),
+                    ),
+                )
+                return
+            if path.startswith("/api/paper-sessions/"):
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._build_workspace_payload(
+                        paper_session=self._build_paper_session_detail(
+                            unquote(path.removeprefix("/api/paper-sessions/"))
+                        ),
                     ),
                 )
                 return
@@ -365,12 +405,31 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                 status, body = self._handle_create_research_note(payload)
                 self._send_json(status, body)
                 return
+            if path == "/api/paper-sessions":
+                status, body = self._handle_create_paper_session(payload)
+                self._send_json(status, body)
+                return
+            if path.startswith("/api/paper-sessions/") and path.endswith("/tick"):
+                session_id = unquote(path.removeprefix("/api/paper-sessions/").removesuffix("/tick"))
+                status, body = self._handle_tick_paper_session(session_id, payload)
+                self._send_json(status, body)
+                return
             if path == "/api/research-pool":
                 status, body = self._handle_add_to_research_pool(payload)
                 self._send_json(status, body)
                 return
             if path == "/api/stable-pool":
                 status, body = self._handle_add_to_stable_pool(payload)
+                self._send_json(status, body)
+                return
+            if path.startswith("/api/stable-candidates/") and path.endswith("/execution-verification"):
+                candidate_id = unquote(path.removeprefix("/api/stable-candidates/").removesuffix("/execution-verification"))
+                status, body = self._handle_run_stable_candidate_execution_verification(candidate_id, payload)
+                self._send_json(status, body)
+                return
+            if path.startswith("/api/stable-candidates/") and path.endswith("/execution-filter-experiments"):
+                candidate_id = unquote(path.removeprefix("/api/stable-candidates/").removesuffix("/execution-filter-experiments"))
+                status, body = self._handle_run_stable_candidate_execution_filter_experiment(candidate_id, payload)
                 self._send_json(status, body)
                 return
             if path.startswith("/api/research-candidates/") and path.endswith("/risk-matrix"):
@@ -543,6 +602,124 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
                 )
             )
 
+    def _build_paper_session_index(self) -> list[dict[str, object]]:
+        repository = FilePaperTradingRepository(self.server.data_dir)
+        sessions = repository.list_sessions()
+        for session in sessions:
+            self._ensure_paper_kline_streams(session)
+        return [self._paper_session_payload(session) for session in sessions]
+
+    def _build_paper_session_detail(self, session_id: str) -> dict[str, object]:
+        repository = FilePaperTradingRepository(self.server.data_dir)
+        session = repository.load_session(session_id)
+        self._ensure_paper_kline_streams(session)
+        return self._paper_session_payload(session)
+
+    def _handle_create_paper_session(self, payload: dict[str, object]) -> tuple[HTTPStatus, dict[str, object]]:
+        repository = FilePaperTradingRepository(self.server.data_dir)
+        session = create_paper_session_workflow(
+            paper_repository=repository,
+            run_repository=FileRunRepository(self.server.data_dir),
+            request=CreatePaperSessionRequest(
+                session_id=_optional_str(payload.get("session_id")),
+                stable_candidate_id=_require_str(payload, "stable_candidate_id"),
+                source_run_id=_require_str(payload, "source_run_id"),
+                initial_cash=_optional_number(payload.get("initial_cash")),
+                exchange=_optional_str(payload.get("exchange")),
+                symbol=_optional_str(payload.get("symbol")),
+                market_type=_optional_str(payload.get("market_type")),
+                price_type=_optional_str(payload.get("price_type")),
+                strategy_timeframe=_optional_str(payload.get("strategy_timeframe")),
+                execution_timeframe=str(payload.get("execution_timeframe", "5m")),
+            ),
+        )
+        self._ensure_paper_kline_streams(session)
+        return HTTPStatus.CREATED, {"paper_session": self._paper_session_payload(session)}
+
+    def _handle_tick_paper_session(self, session_id: str, payload: dict[str, object]) -> tuple[HTTPStatus, dict[str, object]]:
+        repository = FilePaperTradingRepository(self.server.data_dir)
+        session = repository.load_session(session_id)
+        self._ensure_paper_kline_streams(session)
+        exchange_options = _optional_dict(payload.get("exchange_options")) or {}
+        allow_rest_fallback = bool(payload.get("allow_rest_fallback", False))
+        rest_client = None
+        if allow_rest_fallback:
+            fetcher = build_default_history_fetcher(str(payload.get("exchange") or session.exchange), options=exchange_options)
+            rest_client = PaperMarketDataClient(fetcher)
+        result = tick_paper_session_workflow(
+            paper_repository=repository,
+            feature_repository=FileFeatureRepository(self.server.data_dir),
+            market_data_client=PaperLocalKlineMarketDataClient(
+                data_dir=self.server.data_dir,
+                live_cache=FileLiveKlineCache(self.server.data_dir),
+                rest_client=rest_client,
+                allow_rest_fallback=allow_rest_fallback,
+            ),
+            request=TickPaperSessionRequest(
+                session_id=session_id,
+                until=_parse_optional_datetime(payload.get("until")),
+            ),
+        )
+        return (
+            HTTPStatus.OK,
+            {
+                "paper_session": self._paper_session_payload(result.session),
+                "strategy_bar_count": result.strategy_bar_count,
+                "execution_bar_count": result.execution_bar_count,
+                "new_signal_count": result.new_signal_count,
+                "order_count": result.order_count,
+                "fill_count": result.fill_count,
+                "closed_trade_count": result.closed_trade_count,
+                "warning_count": result.warning_count,
+                "orders": json_ready(result.orders),
+                "fills": json_ready(result.fills),
+                "trades": json_ready(result.trades),
+                "warnings": json_ready(result.warnings),
+            },
+        )
+
+    def _paper_session_payload(self, session: PaperSession) -> dict[str, object]:
+        payload = json_ready(session)
+        payload["live_streams"] = [
+            FileLiveKlineCache(self.server.data_dir).load_status(spec)
+            for spec in self._paper_kline_specs(session)
+        ]
+        return payload
+
+    def _ensure_paper_kline_streams(self, session: PaperSession) -> None:
+        if session.status != "active" or _exchange_alias(session.exchange) != "binanceusdm":
+            return
+        specs = self._paper_kline_specs(session)
+        for spec in specs:
+            key = f"paper-kline:{_exchange_alias(spec.exchange)}:{spec.symbol}:{spec.timeframe}:{spec.price_type.value}"
+            existing = self.server.background_threads.get(key)
+            if existing is not None and existing.is_alive():
+                continue
+            worker = threading.Thread(
+                target=_run_binance_kline_stream,
+                args=(self.server.data_dir, spec),
+                name=key,
+                daemon=True,
+            )
+            self.server.background_threads[key] = worker
+            worker.start()
+
+    def _paper_kline_specs(self, session: PaperSession) -> list[LiveKlineStreamSpec]:
+        timeframes = []
+        for timeframe in (session.strategy_timeframe, session.execution_timeframe):
+            if timeframe and timeframe not in timeframes:
+                timeframes.append(timeframe)
+        return [
+            LiveKlineStreamSpec(
+                exchange=_exchange_alias(session.exchange),
+                symbol=session.symbol,
+                market_type=MarketType(session.market_type),
+                timeframe=timeframe,
+                price_type=PriceType(session.price_type),
+            )
+            for timeframe in timeframes
+        ]
+
     def _build_parameter_experiment_index(self) -> list[dict[str, object]]:
         experiment_repository = FileParameterExperimentRepository(self.server.data_dir)
         payloads: list[dict[str, object]] = []
@@ -625,7 +802,11 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
         run_repository = FileRunRepository(self.server.data_dir)
         run_rows = [
             row.as_dict()
-            for row in build_parameter_lab_rows(run_repository, run_ids=sorted(run_ids))
+            for row in build_parameter_lab_rows(
+                run_repository,
+                run_ids=sorted(run_ids),
+                include_execution_filter_experiments=True,
+            )
         ]
         parameter_groups, recommendations, scoring_rules = build_batch_recommendations(
             run_rows,
@@ -1228,6 +1409,326 @@ class WorkspaceApiHandler(BaseHTTPRequestHandler):
         status, body = self._handle_create_research_note(note_payload)
         return status, {"stable_candidate_id": candidate_id, "chosen_run_id": chosen_run_id, **body}
 
+    def _handle_run_stable_candidate_execution_verification(self, candidate_id: str, payload: dict[str, object]) -> tuple[HTTPStatus, dict[str, object]]:
+        candidate_id = candidate_id.strip()
+        if not candidate_id:
+            raise ValueError("stable_candidate_id must not be empty")
+        source_run_id = _require_str(payload, "source_run_id")
+        execution_timeframe = str(payload.get("execution_timeframe", "5m")).strip().lower()
+        execution_snapshot_id = _require_str(payload, "execution_snapshot_id")
+        group_detail = load_parameter_group_detail(
+            FileRunRepository(self.server.data_dir),
+            group_key=candidate_id,
+            data_dir=self.server.data_dir,
+        )
+        if source_run_id not in {run.run_id for run in group_detail.runs}:
+            raise ValueError("source_run_id must belong to the stable candidate parameter group")
+        execution_snapshot = _load_snapshot(self.server.data_dir, execution_snapshot_id)
+        result = run_execution_verification_workflow(
+            dataset_repository=FileDatasetRepository(self.server.data_dir),
+            feature_repository=FileFeatureRepository(self.server.data_dir),
+            run_repository=FileRunRepository(self.server.data_dir),
+            request=ExecutionVerificationRequest(
+                stable_candidate_id=candidate_id,
+                parent_run_id=source_run_id,
+                execution_snapshot=execution_snapshot,
+                execution_timeframe=execution_timeframe,
+                run_id=_optional_str(payload.get("run_id")),
+            ),
+        )
+        return (
+            HTTPStatus.OK,
+            {
+                "task_id": f"task:{result.run_id}",
+                "task_status": "success",
+                "stable_candidate_id": candidate_id,
+                "parent_run_id": source_run_id,
+                "verification_run_id": result.run_id,
+                "execution_timeframe": result.execution_timeframe,
+                "strategy_timeframe": result.strategy_timeframe,
+                "signal_count": result.signal_count,
+                "order_count": result.order_count,
+                "fill_count": result.fill_count,
+                "warning_count": result.warning_count,
+                "trade_count": result.trade_count,
+                "metrics": result.metrics.as_dict(),
+            },
+        )
+
+    def _handle_run_stable_candidate_execution_filter_experiment(self, candidate_id: str, payload: dict[str, object]) -> tuple[HTTPStatus, dict[str, object]]:
+        candidate_id = candidate_id.strip()
+        if not candidate_id:
+            raise ValueError("stable_candidate_id must not be empty")
+        source_run_id = _require_str(payload, "source_run_id")
+        run_repository = FileRunRepository(self.server.data_dir)
+        source_manifest = run_repository.load_manifest(source_run_id)
+        resolved = source_manifest.resolved_config_json
+        if resolved.get("run_type") != "execution_verification":
+            raise ValueError("source_run_id must point to a 5m execution verification run")
+        if str(resolved.get("stable_candidate_id") or "") != candidate_id:
+            raise ValueError("source_run_id must belong to the stable candidate")
+        parent_run_id = str(resolved.get("parent_run_id") or "")
+        if not parent_run_id:
+            raise ValueError("execution verification run missing parent_run_id")
+        execution_snapshot = _load_snapshot(self.server.data_dir, source_manifest.dataset_snapshot_id)
+        execution_timeframe = str(resolved.get("execution_timeframe") or execution_snapshot.timeframe).strip().lower()
+        signal_filter_sets = _build_signal_filter_sets(payload)
+        batch_id = str(payload.get("batch_id") or f"ev-filter-experiment-{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}")
+        result = self._submit_execution_filter_experiment_batch(
+            batch_id=batch_id,
+            stable_candidate_id=candidate_id,
+            source_run_id=source_run_id,
+            parent_run_id=parent_run_id,
+            execution_snapshot=execution_snapshot,
+            execution_timeframe=execution_timeframe,
+            signal_filter_sets=signal_filter_sets,
+        )
+        body = {
+            "task_id": result["task_id"],
+            "task_status": "pending",
+            "batch_id": batch_id,
+            "source_run_id": source_run_id,
+            "parent_run_id": parent_run_id,
+            "execution_timeframe": execution_timeframe,
+            "planned_experiment_count": 1,
+            "planned_run_count": len(signal_filter_sets),
+            "filter_set_count": len(signal_filter_sets),
+            "filter_sets": list(signal_filter_sets),
+        }
+        return HTTPStatus.ACCEPTED, body
+
+    def _submit_execution_filter_experiment_batch(
+        self,
+        *,
+        batch_id: str,
+        stable_candidate_id: str,
+        source_run_id: str,
+        parent_run_id: str,
+        execution_snapshot: DatasetSnapshot,
+        execution_timeframe: str,
+        signal_filter_sets: tuple[dict[str, object], ...],
+    ) -> dict[str, object]:
+        if not signal_filter_sets:
+            raise ValueError("At least one signal filter set is required")
+        batch_repository = FileExperimentBatchRepository(self.server.data_dir)
+        if batch_id in batch_repository.list_batch_ids():
+            raise FileExistsError(f"Parameter experiment batch already exists: {batch_id}")
+        task = TaskRecord(
+            task_id=f"execution-filter-experiment-batch:{batch_id}",
+            task_kind="execution_filter_experiment_batch",
+        )
+        experiment_id = f"{batch_id}-exp-01-{execution_snapshot.dataset_snapshot_id.split('-')[-1][:8]}"
+        batch = ExperimentBatch(
+            batch_id=batch_id,
+            strategy_name="ema_pullback_atr_v2",
+            dataset_snapshot_ids=(execution_snapshot.dataset_snapshot_id,),
+            validation_split_id=f"execution-filter:{source_run_id}",
+            metric_policy_id="metrics_daily_365_v1",
+            benchmark_policy_version="buy_and_hold_v1",
+            search_type=SearchType.GRID,
+            search_space_json={
+                "run_type": "execution_filter_experiment",
+                "source_run_id": source_run_id,
+                "parent_run_id": parent_run_id,
+                "stable_candidate_id": stable_candidate_id,
+                "execution_timeframe": execution_timeframe,
+                "signal_filter_sets": list(signal_filter_sets),
+                "planned_run_count": len(signal_filter_sets),
+            },
+            base_config_uri="memory://execution-filter-experiments/base-config.json",
+            seed_policy=SeedPolicy.GLOBAL_RANDOM,
+            seed=None,
+            experiment_ids=(experiment_id,),
+        )
+        experiment = ParameterExperiment(
+            experiment_id=experiment_id,
+            strategy_name="ema_pullback_atr_v2",
+            dataset_bundle_id=execution_snapshot.dataset_snapshot_id,
+            validation_split_id=batch.validation_split_id,
+            metric_policy_id=batch.metric_policy_id,
+            benchmark_policy_version=batch.benchmark_policy_version,
+            benchmark_config_uri="memory://execution-filter-experiments/benchmark-config.json",
+            search_type=SearchType.GRID,
+            search_space_json=dict(batch.search_space_json),
+            base_config_uri=batch.base_config_uri,
+            seed_policy=SeedPolicy.GLOBAL_RANDOM,
+            seed=None,
+        )
+        task_repository = FileTaskRepository(self.server.data_dir)
+        experiment_repository = FileParameterExperimentRepository(self.server.data_dir)
+        task_repository.save_task(task)
+        batch_repository.save_batch(batch)
+        experiment_repository.save_experiment(experiment)
+        batch_repository.save_execution_index(
+            batch_id,
+            {
+                "batch_id": batch_id,
+                "task_id": task.task_id,
+                "status": task.status.value,
+                "dataset_snapshot_ids": list(batch.dataset_snapshot_ids),
+                "experiment_ids": list(batch.experiment_ids),
+                "run_ids": [],
+                "child_task_ids": [],
+                "failed_experiment_ids": [],
+                "planned_experiment_count": 1,
+                "planned_run_count": len(signal_filter_sets),
+                "updated_at": task.updated_at.isoformat(),
+            },
+        )
+        experiment_repository.save_execution_index(
+            experiment_id,
+            {
+                "experiment_id": experiment_id,
+                "task_id": task.task_id,
+                "status": task.status.value,
+                "run_ids": [],
+                "child_task_ids": [],
+                "failed_child_task_ids": [],
+                "planned_run_count": len(signal_filter_sets),
+                "updated_at": task.updated_at.isoformat(),
+            },
+        )
+        worker = threading.Thread(
+            target=self._run_execution_filter_experiment_batch_in_background,
+            kwargs={
+                "batch_id": batch_id,
+                "experiment_id": experiment_id,
+                "task_id": task.task_id,
+                "stable_candidate_id": stable_candidate_id,
+                "source_run_id": source_run_id,
+                "parent_run_id": parent_run_id,
+                "execution_snapshot_id": execution_snapshot.dataset_snapshot_id,
+                "execution_timeframe": execution_timeframe,
+                "signal_filter_sets": signal_filter_sets,
+            },
+            daemon=True,
+            name=f"execution-filter-experiment-batch:{batch_id}",
+        )
+        self.server.background_threads[task.task_id] = worker
+        worker.start()
+        return {"task_id": task.task_id}
+
+    def _run_execution_filter_experiment_batch_in_background(
+        self,
+        *,
+        batch_id: str,
+        experiment_id: str,
+        task_id: str,
+        stable_candidate_id: str,
+        source_run_id: str,
+        parent_run_id: str,
+        execution_snapshot_id: str,
+        execution_timeframe: str,
+        signal_filter_sets: tuple[dict[str, object], ...],
+    ) -> None:
+        task_repository = FileTaskRepository(self.server.data_dir)
+        batch_repository = FileExperimentBatchRepository(self.server.data_dir)
+        experiment_repository = FileParameterExperimentRepository(self.server.data_dir)
+        run_repository = FileRunRepository(self.server.data_dir)
+        dataset_repository = FileDatasetRepository(self.server.data_dir)
+        feature_repository = FileFeatureRepository(self.server.data_dir)
+        task = task_repository.load_task(task_id)
+        running_task = TaskRecord(
+            task_id=task.task_id,
+            task_kind=task.task_kind,
+            status=TaskStatus.RUNNING,
+            created_at=task.created_at,
+            updated_at=datetime.now(UTC),
+        )
+        task_repository.save_task(running_task)
+        run_ids: list[str] = []
+        failed_run_ids: list[str] = []
+        snapshot = _load_snapshot(self.server.data_dir, execution_snapshot_id)
+        for index, signal_filter_set in enumerate(signal_filter_sets, start=1):
+            filter_set_id = str(signal_filter_set.get("filter_set_id") or f"filter-{index:02d}")
+            run_id = f"{experiment_id}-run-{index:03d}-{_safe_id_part(filter_set_id)}"
+            try:
+                result = run_execution_verification_workflow(
+                    dataset_repository=dataset_repository,
+                    feature_repository=feature_repository,
+                    run_repository=run_repository,
+                    request=ExecutionVerificationRequest(
+                        stable_candidate_id=stable_candidate_id,
+                        parent_run_id=parent_run_id,
+                        execution_snapshot=snapshot,
+                        execution_timeframe=execution_timeframe,
+                        run_id=run_id,
+                        signal_filter_set=signal_filter_set,
+                        run_type="execution_filter_experiment",
+                        source_run_id=source_run_id,
+                    ),
+                )
+                run_ids.append(result.run_id)
+            except Exception:
+                failed_run_ids.append(run_id)
+            experiment_repository.save_execution_index(
+                experiment_id,
+                {
+                    "experiment_id": experiment_id,
+                    "task_id": running_task.task_id,
+                    "status": TaskStatus.RUNNING.value,
+                    "run_ids": run_ids,
+                    "child_task_ids": [],
+                    "failed_child_task_ids": failed_run_ids,
+                    "planned_run_count": len(signal_filter_sets),
+                    "updated_at": datetime.now(UTC).isoformat(),
+                },
+            )
+            batch_repository.save_execution_index(
+                batch_id,
+                {
+                    "batch_id": batch_id,
+                    "task_id": running_task.task_id,
+                    "status": TaskStatus.RUNNING.value,
+                    "dataset_snapshot_ids": [execution_snapshot_id],
+                    "experiment_ids": [experiment_id],
+                    "run_ids": run_ids,
+                    "child_task_ids": [],
+                    "failed_experiment_ids": [experiment_id] if failed_run_ids else [],
+                    "planned_experiment_count": 1,
+                    "planned_run_count": len(signal_filter_sets),
+                    "updated_at": datetime.now(UTC).isoformat(),
+                },
+            )
+        final_status = TaskStatus.FAILED if failed_run_ids else TaskStatus.SUCCESS
+        final_task = TaskRecord(
+            task_id=running_task.task_id,
+            task_kind=running_task.task_kind,
+            status=final_status,
+            created_at=running_task.created_at,
+            updated_at=datetime.now(UTC),
+        )
+        task_repository.save_task(final_task)
+        experiment_repository.save_execution_index(
+            experiment_id,
+            {
+                "experiment_id": experiment_id,
+                "task_id": final_task.task_id,
+                "status": final_status.value,
+                "run_ids": run_ids,
+                "child_task_ids": [],
+                "failed_child_task_ids": failed_run_ids,
+                "planned_run_count": len(signal_filter_sets),
+                "updated_at": final_task.updated_at.isoformat(),
+            },
+        )
+        batch_repository.save_execution_index(
+            batch_id,
+            {
+                "batch_id": batch_id,
+                "task_id": final_task.task_id,
+                "status": final_status.value,
+                "dataset_snapshot_ids": [execution_snapshot_id],
+                "experiment_ids": [experiment_id],
+                "run_ids": run_ids,
+                "child_task_ids": [],
+                "failed_experiment_ids": [experiment_id] if failed_run_ids else [],
+                "planned_experiment_count": 1,
+                "planned_run_count": len(signal_filter_sets),
+                "updated_at": final_task.updated_at.isoformat(),
+            },
+        )
+
     def _parameter_group_key_for_run(self, run_id: str) -> str:
         run_repository = FileRunRepository(self.server.data_dir)
         research_workspace = build_parameter_research_workspace(run_repository, data_dir=self.server.data_dir)
@@ -1712,6 +2213,14 @@ def _parse_optional_datetime(value: object | None) -> datetime | None:
     return _parse_datetime(str(value))
 
 
+def _run_binance_kline_stream(data_dir: Path, spec: LiveKlineStreamSpec) -> None:
+    asyncio.run(stream_binance_usdm_klines(cache=FileLiveKlineCache(data_dir), specs=[spec]))
+
+
+def _exchange_alias(exchange: str) -> str:
+    return "binanceusdm" if exchange in {"binance", "binanceusdm"} else exchange
+
+
 def _optional_dict(value: object | None) -> dict[str, object] | None:
     if value is None:
         return None
@@ -1939,6 +2448,13 @@ def _optional_str(value: object | None) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _safe_id_part(value: object) -> str:
+    text = str(value).strip().lower()
+    chars = [char if char.isalnum() else "-" for char in text]
+    compact = "-".join(part for part in "".join(chars).split("-") if part)
+    return compact[:48] or "item"
 
 
 def _optional_float(value: object | None) -> float | None:

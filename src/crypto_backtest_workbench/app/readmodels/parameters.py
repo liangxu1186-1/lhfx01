@@ -74,6 +74,7 @@ def build_parameter_lab_rows(
     run_repository: RunRepository,
     *,
     run_ids: list[str] | None = None,
+    include_execution_filter_experiments: bool = False,
 ) -> list[ParameterLabRow]:
     rows: list[ParameterLabRow] = []
     candidate_run_ids = run_ids or run_repository.list_run_ids()
@@ -86,6 +87,11 @@ def build_parameter_lab_rows(
         if summary is None:
             continue
         manifest = run_repository.load_manifest(run_id)
+        run_type = manifest.resolved_config_json.get("run_type")
+        if run_type == "execution_verification":
+            continue
+        if run_type == "execution_filter_experiment" and not include_execution_filter_experiments:
+            continue
         strategy_params = manifest.resolved_config_json.get("strategy_params") or {}
         execution_constraints = manifest.resolved_config_json.get("execution_constraints") or {}
         rows.append(

@@ -6,6 +6,7 @@ import type {
   ParameterExperimentDetailPayload,
   OverviewPayload,
   ParameterExperimentIndexPayload,
+  PaperSessionsPayload,
   ParametersPayload,
   ParameterGroupDetailPayload,
   ParameterResearchPayload,
@@ -273,6 +274,10 @@ export async function loadResearchNotes(targetTypeOrFilters?: string | ResearchN
   }
 }
 
+export async function loadPaperSessions(): Promise<PaperSessionsPayload> {
+  return fetchJson<PaperSessionsPayload>('/api/paper-sessions');
+}
+
 export async function postIngest(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   const response = await fetch(apiUrl('/api/ingest'), {
     method: 'POST',
@@ -352,6 +357,15 @@ export async function postStablePool(payload: Record<string, unknown>): Promise<
   return parseResponse<Record<string, unknown>>(response);
 }
 
+export async function postStableCandidateExecutionVerification(candidateId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl(`/api/stable-candidates/${encodeURIComponent(candidateId)}/execution-verification`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<Record<string, unknown>>(response);
+}
+
 export async function postResearchCandidateRiskMatrix(candidateId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   const response = await fetch(apiUrl(`/api/research-candidates/${encodeURIComponent(candidateId)}/risk-matrix`), {
     method: 'POST',
@@ -363,6 +377,33 @@ export async function postResearchCandidateRiskMatrix(candidateId: string, paylo
 
 export async function postResearchCandidateFilterExperiment(candidateId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   const response = await fetch(apiUrl(`/api/research-candidates/${encodeURIComponent(candidateId)}/filter-experiments`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<Record<string, unknown>>(response);
+}
+
+export async function postStableCandidateExecutionFilterExperiment(candidateId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl(`/api/stable-candidates/${encodeURIComponent(candidateId)}/execution-filter-experiments`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<Record<string, unknown>>(response);
+}
+
+export async function postPaperSession(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl('/api/paper-sessions'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<Record<string, unknown>>(response);
+}
+
+export async function postPaperSessionTick(sessionId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await fetch(apiUrl(`/api/paper-sessions/${encodeURIComponent(sessionId)}/tick`), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),

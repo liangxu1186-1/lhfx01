@@ -410,6 +410,323 @@ def test_workspace_api_research_workflow_promotes_candidates_across_pools(tmp_pa
     assert stable_workflow["research_workflow"]["stable_pool"]["candidates"][0]["evidence_run_ids"] == ["run-api-workflow-001"]
 
 
+def test_workspace_api_stable_candidate_execution_verification_creates_derived_run(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-ev-1h", timeframe="1h")
+    _seed_intraday_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-ev-5m", timeframe="5m", bar_count=80)
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        _request_json(
+            server,
+            "/api/runs",
+            payload={
+                "snapshot_id": "snapshot-api-ev-1h",
+                "run_id": "run-api-ev-parent",
+                "strategy_name": "ema_pullback_atr_v2",
+                "trend_fast_period": 2,
+                "trend_slow_period": 5,
+                "atr_entry_tolerance": 1.0,
+                "atr_stop_mult": 1.5,
+                "risk_reward_ratio": 2.0,
+                "cash_allocation_pct": 50.0,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.0,
+                "slippage_bps": 0.0,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+                "validation_split_id": "split-api-ev-parent",
+                "is_start": "2024-01-01T00:00:00+00:00",
+                "is_end": "2024-01-01T03:00:00+00:00",
+                "oos_start": "2024-01-01T03:00:00+00:00",
+                "oos_end": "2024-01-01T06:00:00+00:00",
+            },
+        )
+        research_response = _request_json(
+            server,
+            "/api/research-pool",
+            payload={"source_run_id": "run-api-ev-parent", "note": "进入研究池"},
+            method="POST",
+        )
+        candidate_id = research_response["research_candidate_id"]
+        _request_json(
+            server,
+            "/api/stable-pool",
+            payload={
+                "research_candidate_id": candidate_id,
+                "chosen_run_id": "run-api-ev-parent",
+                "decision_reason": "稳定池验证入口",
+            },
+            method="POST",
+        )
+
+        verification_response = _request_json(
+            server,
+            f"/api/stable-candidates/{quote(candidate_id, safe='')}/execution-verification",
+            payload={
+                "source_run_id": "run-api-ev-parent",
+                "execution_timeframe": "5m",
+                "execution_snapshot_id": "snapshot-api-ev-5m",
+            },
+            method="POST",
+        )
+        verification_run_id = verification_response["verification_run_id"]
+        run_detail = _request_json(server, f"/api/runs/{verification_run_id}")
+        workflow = _request_json(server, "/api/research-workflow")
+        parameter_lab = _request_json(server, "/api/parameters")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert verification_response["task_status"] == "success"
+    assert verification_response["parent_run_id"] == "run-api-ev-parent"
+    assert verification_response["stable_candidate_id"] == candidate_id
+    assert verification_response["execution_timeframe"] == "5m"
+    assert verification_run_id.startswith("ev-run-api-ev-parent-exec5m-")
+
+    manifest = run_detail["run"]["manifest"]["resolved_config_json"]
+    assert manifest["run_type"] == "execution_verification"
+    assert manifest["parent_run_id"] == "run-api-ev-parent"
+    assert manifest["stable_candidate_id"] == candidate_id
+    assert manifest["strategy_timeframe"] == "1h"
+    assert manifest["execution_timeframe"] == "5m"
+    assert manifest["execution_model_version"] == "intrabar-v1"
+    assert run_detail["run"]["validation"] is not None
+    validation_summary = run_detail["run"]["validation"]
+    assert validation_summary["validation_split_id"].endswith(":exec-5m")
+    assert validation_summary["is_segment"]["analysis_bar_count"] > 0
+    assert validation_summary["oos_segment"]["analysis_bar_count"] > 0
+
+    stable_candidate = workflow["research_workflow"]["stable_pool"]["candidates"][0]
+    assert stable_candidate["stable_candidate_id"] == candidate_id
+    assert stable_candidate["status"] in {"execution_verified", "research_stable"}
+    assert stable_candidate["execution_verification"]["latest_run_id"] == verification_run_id
+    assert stable_candidate["execution_verification"]["parent_run_id"] == "run-api-ev-parent"
+    execution_validation = stable_candidate["execution_verification"]["validation"]
+    assert execution_validation["validation_split_id"].endswith(":exec-5m")
+    assert execution_validation["is_total_return"] is not None
+    assert execution_validation["oos_total_return"] is not None
+    assert execution_validation["is_analysis_bar_count"] > 0
+    assert execution_validation["oos_analysis_bar_count"] > 0
+    assert execution_validation["is_trade_count"] >= 0
+    assert execution_validation["oos_trade_count"] >= 0
+
+    parameter_run_ids = {row["run_id"] for row in parameter_lab["parameter_lab"]["rows"]}
+    assert "run-api-ev-parent" in parameter_run_ids
+    assert verification_run_id not in parameter_run_ids
+
+
+def test_workspace_api_stable_candidate_execution_verification_rejects_short_execution_dataset(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-ev-short-1h", timeframe="1h")
+    _seed_intraday_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-ev-short-5m", timeframe="5m", bar_count=61)
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        _request_json(
+            server,
+            "/api/runs",
+            payload={
+                "snapshot_id": "snapshot-api-ev-short-1h",
+                "run_id": "run-api-ev-short-parent",
+                "strategy_name": "ema_pullback_atr_v2",
+                "trend_fast_period": 2,
+                "trend_slow_period": 5,
+                "atr_entry_tolerance": 1.0,
+                "atr_stop_mult": 1.5,
+                "risk_reward_ratio": 2.0,
+                "cash_allocation_pct": 50.0,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.0,
+                "slippage_bps": 0.0,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+            },
+        )
+        research_response = _request_json(
+            server,
+            "/api/research-pool",
+            payload={"source_run_id": "run-api-ev-short-parent", "note": "进入研究池"},
+            method="POST",
+        )
+        candidate_id = research_response["research_candidate_id"]
+        _request_json(
+            server,
+            "/api/stable-pool",
+            payload={
+                "research_candidate_id": candidate_id,
+                "chosen_run_id": "run-api-ev-short-parent",
+                "decision_reason": "验证覆盖不足报错",
+            },
+            method="POST",
+        )
+        error_response = _request_error_json(
+            server,
+            f"/api/stable-candidates/{quote(candidate_id, safe='')}/execution-verification",
+            payload={
+                "source_run_id": "run-api-ev-short-parent",
+                "execution_timeframe": "5m",
+                "execution_snapshot_id": "snapshot-api-ev-short-5m",
+            },
+            method="POST",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert error_response["status"] == 400
+    message = error_response["body"]["error"]["message"]
+    assert "execution dataset does not cover the next executable bar after parent run end" in message
+    assert "parent_end=2024-01-01T05:00:00+00:00" in message
+    assert "execution_end=2024-01-01T05:00:00+00:00" in message
+
+
+def test_workspace_api_stable_candidate_execution_filter_experiment_uses_5m_verification_run(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-ev-filter-1h", timeframe="1h")
+    _seed_intraday_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-ev-filter-5m", timeframe="5m", bar_count=80)
+    server = api.create_api_server(
+        host="127.0.0.1",
+        port=0,
+        repository_root=tmp_path,
+        data_dir=data_dir,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    try:
+        _request_json(
+            server,
+            "/api/runs",
+            payload={
+                "snapshot_id": "snapshot-api-ev-filter-1h",
+                "run_id": "run-api-ev-filter-parent",
+                "strategy_name": "ema_pullback_atr_v2",
+                "trend_fast_period": 2,
+                "trend_slow_period": 5,
+                "atr_entry_tolerance": 1.0,
+                "atr_stop_mult": 1.5,
+                "risk_reward_ratio": 2.0,
+                "cash_allocation_pct": 50.0,
+                "initial_cash": 10000.0,
+                "leverage": 1.0,
+                "fee_rate": 0.0,
+                "slippage_bps": 0.0,
+                "min_notional": 0.0,
+                "benchmark": "buy_and_hold",
+                "validation_split_id": "split-api-ev-filter-parent",
+                "is_start": "2024-01-01T00:00:00+00:00",
+                "is_end": "2024-01-01T03:00:00+00:00",
+                "oos_start": "2024-01-01T03:00:00+00:00",
+                "oos_end": "2024-01-01T06:00:00+00:00",
+            },
+        )
+        research_response = _request_json(
+            server,
+            "/api/research-pool",
+            payload={"source_run_id": "run-api-ev-filter-parent", "note": "进入研究池"},
+            method="POST",
+        )
+        candidate_id = research_response["research_candidate_id"]
+        _request_json(
+            server,
+            "/api/stable-pool",
+            payload={
+                "research_candidate_id": candidate_id,
+                "chosen_run_id": "run-api-ev-filter-parent",
+                "decision_reason": "稳定池验证入口",
+            },
+            method="POST",
+        )
+        verification_response = _request_json(
+            server,
+            f"/api/stable-candidates/{quote(candidate_id, safe='')}/execution-verification",
+            payload={
+                "source_run_id": "run-api-ev-filter-parent",
+                "execution_timeframe": "5m",
+                "execution_snapshot_id": "snapshot-api-ev-filter-5m",
+            },
+            method="POST",
+        )
+        verification_run_id = verification_response["verification_run_id"]
+
+        filter_response = _request_json(
+            server,
+            f"/api/stable-candidates/{quote(candidate_id, safe='')}/execution-filter-experiments",
+            payload={
+                "source_run_id": verification_run_id,
+                "batch_id": "ev-filter-experiment-api-001",
+                "signal_filter_sets": [
+                    {
+                        "filter_set_id": "exclude-chop-08",
+                        "label": "排除震荡>=0.8",
+                        "mode": "single",
+                        "filters": [
+                            {
+                                "filter_type": "entry_context_exclusion",
+                                "enabled": True,
+                                "params": {"conditions": [{"field": "range_chop_score_20", "min": 0.8}]},
+                            }
+                        ],
+                    }
+                ],
+            },
+            method="POST",
+        )
+        deadline = time.time() + 5
+        batch_detail = None
+        while time.time() < deadline:
+            batch_detail = _request_json(server, "/api/parameter-experiment-batches/ev-filter-experiment-api-001")
+            execution = batch_detail["parameter_experiment_batch"]["execution"]
+            if execution.get("status") in {"success", "failed"}:
+                break
+            time.sleep(0.05)
+        run_detail = None
+        if batch_detail is not None:
+            run_ids = batch_detail["parameter_experiment_batch"]["execution"].get("run_ids", [])
+            if run_ids:
+                run_detail = _request_json(server, f"/api/runs/{run_ids[0]}")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert filter_response["task_status"] == "pending"
+    assert filter_response["batch_id"] == "ev-filter-experiment-api-001"
+    assert filter_response["source_run_id"] == verification_run_id
+    assert filter_response["filter_set_count"] == 1
+    assert filter_response["planned_run_count"] == 1
+    assert batch_detail is not None
+    execution = batch_detail["parameter_experiment_batch"]["execution"]
+    assert execution["status"] == "success"
+    run_ids = execution["run_ids"]
+    assert len(run_ids) == 1
+    assert run_detail is not None
+    manifest = run_detail["run"]["manifest"]["resolved_config_json"]
+    assert manifest["run_type"] == "execution_filter_experiment"
+    assert manifest["source_run_id"] == verification_run_id
+    assert manifest["execution_verification"]["parent_run_id"] == "run-api-ev-filter-parent"
+    assert manifest["strategy_params"]["signal_filters"][0]["filter_type"] == "entry_context_exclusion"
+
+
 def test_workspace_api_research_candidate_risk_matrix_uses_full_representative_run_params(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _seed_snapshot(data_dir=data_dir, snapshot_id="snapshot-api-risk-matrix-001")
@@ -1363,6 +1680,50 @@ def _wait_for_task_status(
 def _seed_snapshot(*, data_dir: Path, snapshot_id: str, timeframe: str = "1h") -> None:
     dataset_repository = FileDatasetRepository(data_dir)
     candles = _build_candles(timeframe=timeframe)
+    snapshot = DatasetSnapshot(
+        dataset_snapshot_id=snapshot_id,
+        source="binanceusdm",
+        exchange="binanceusdm",
+        market_type=MarketType.LINEAR_USDT_PERPETUAL,
+        symbol="BTC/USDT:USDT",
+        timeframe=timeframe,
+        time_range_start=candles[0].timestamp,
+        time_range_end=candles[-1].timestamp,
+        row_count=len(candles),
+        schema_version="v1",
+        feature_version="pending",
+        storage_uri=f"datasets/{snapshot_id}",
+        data_source="fixture",
+        price_type=PriceType.LAST,
+    )
+    dataset_repository.save_snapshot(snapshot)
+    dataset_repository.save_candles(snapshot_id, candles)
+
+
+def _seed_intraday_snapshot(*, data_dir: Path, snapshot_id: str, timeframe: str, bar_count: int) -> None:
+    dataset_repository = FileDatasetRepository(data_dir)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    step = timedelta(minutes=5) if timeframe == "5m" else timedelta(minutes=1)
+    candles: list[CanonicalCandle] = []
+    for index in range(bar_count):
+        close = 100.0 + (index * 0.1)
+        timestamp = start + (step * index)
+        candles.append(
+            CanonicalCandle(
+                timestamp=timestamp,
+                symbol="BTC/USDT:USDT",
+                exchange="binanceusdm",
+                market_type=MarketType.LINEAR_USDT_PERPETUAL,
+                timeframe=timeframe,
+                open=close - 0.05,
+                high=close + 0.2,
+                low=close - 0.2,
+                close=close,
+                volume=10.0 + index,
+                price_type=PriceType.LAST,
+                data_source="fixture",
+            )
+        )
     snapshot = DatasetSnapshot(
         dataset_snapshot_id=snapshot_id,
         source="binanceusdm",

@@ -51,17 +51,22 @@ import {
   loadOverview,
   loadOverviewEquity,
   loadParameters,
+  loadPaperSessions,
   loadResearchNotes,
   loadRunDetail,
   loadRuns,
   postIngest,
   postParameterExperimentBatch,
+  postPaperSession,
+  postPaperSessionTick,
   postResearchCandidateFilterExperiment,
   postResearchCandidateRiskMatrix,
   postResearchNote,
   postResearchPool,
   postRun,
   postRunEma,
+  postStableCandidateExecutionVerification,
+  postStableCandidateExecutionFilterExperiment,
   postStablePool,
 } from './lib/api';
 import { formatDateRange, formatDateTime, formatNumber, formatPct, shortRunId } from './lib/format';
@@ -91,6 +96,7 @@ import type {
   RunSummaryView,
   SensitivityRow,
   MultiRunEquityRow,
+  PaperSessionView,
   WorkspaceParameterLab,
   WorkspaceOverview,
   WorkspaceSource,
@@ -99,7 +105,7 @@ import type {
 const { Header, Content } = Layout;
 const { Title, Paragraph, Text } = Typography;
 
-type TabId = 'execution' | 'overview' | 'analysis' | 'parameters';
+type TabId = 'execution' | 'overview' | 'analysis' | 'parameters' | 'paper';
 
 interface UrlState {
   tab: TabId;
@@ -406,6 +412,7 @@ const TAB_OPTIONS = [
   { label: '运行总览', value: 'overview' },
   { label: '单次分析', value: 'analysis' },
   { label: '参数实验', value: 'parameters' },
+  { label: '模拟盘', value: 'paper' },
 ] satisfies Array<{ label: string; value: TabId }>;
 
 const ALL_EXPERIMENTS = '__all__';
@@ -599,6 +606,26 @@ function decisionStatusText(value: string | null | undefined): string {
 
 function decisionStatusColor(value: string | null | undefined): string {
   return value ? (DECISION_STATUS_COLOR[value] ?? 'blue') : 'blue';
+}
+
+function executionVerificationStatusText(value: string | null | undefined): string {
+  if (value === 'passed') {
+    return '已验证';
+  }
+  if (value === 'failed') {
+    return '未通过';
+  }
+  return '待验证';
+}
+
+function executionVerificationStatusColor(value: string | null | undefined): string {
+  if (value === 'passed') {
+    return 'green';
+  }
+  if (value === 'failed') {
+    return 'red';
+  }
+  return 'default';
 }
 
 function targetTypeText(value: string): string {
@@ -2656,6 +2683,7 @@ function WorkspaceShell() {
   const [researchWorkflow, setResearchWorkflow] = useState<ResearchWorkflow | null>(null);
   const [parameterExperiments, setParameterExperiments] = useState<ParameterExperimentSummary[]>([]);
   const [parameterExperimentBatches, setParameterExperimentBatches] = useState<ParameterExperimentBatchSummary[]>([]);
+  const [paperSessions, setPaperSessions] = useState<PaperSessionView[]>([]);
   const [researchNotes, setResearchNotes] = useState<ResearchNote[]>([]);
   const [selectedBatchId, setSelectedBatchId] = useState(ALL_BATCHES);
   const [selectedBatchDetail, setSelectedBatchDetail] = useState<ParameterExperimentBatchDetail | null>(null);
@@ -2691,10 +2719,12 @@ function WorkspaceShell() {
   const [deletingBatchId, setDeletingBatchId] = useState<string | null>(null);
   const [deletingResearchNoteId, setDeletingResearchNoteId] = useState<string | null>(null);
   const [savingResearchNote, setSavingResearchNote] = useState(false);
+  const [paperSubmitting, setPaperSubmitting] = useState<'create' | 'tick' | null>(null);
   const attemptedParameterResultRefreshKeysRef = useRef<Set<string>>(new Set());
   const [ingestForm] = Form.useForm();
   const [runForm] = Form.useForm();
   const [experimentForm] = Form.useForm();
+  const [paperForm] = Form.useForm();
   const deferredOverviewQuery = useDeferredValue(overviewQuery);
   const deferredParameterQuery = useDeferredValue(parameterQuery);
 
@@ -2713,6 +2743,7 @@ function WorkspaceShell() {
     setParameterResearch(null);
     setResearchWorkflow(null);
     setParameterExperimentBatches([]);
+    setPaperSessions([]);
     setSelectedBatchId(ALL_BATCHES);
     setSelectedBatchDetail(null);
     setParameterExperiments([]);
@@ -2820,12 +2851,21 @@ function WorkspaceShell() {
       setSelectedRun(null);
       return;
     }
+    if (!selectedRunId) {
+      const runIds = new Set(runs.map((entry) => entry.run_id));
+      const comparedRunId = compareRunIds.find((runId) => runIds.has(runId));
+      setSelectedRunId(comparedRunId ?? runs[0].run_id);
+      return;
+    }
     if (!runs.some((entry) => entry.run_id === selectedRunId)) {
+      if (activeTab === 'analysis') {
+        return;
+      }
       const runIds = new Set(runs.map((entry) => entry.run_id));
       const comparedRunId = compareRunIds.find((runId) => runIds.has(runId));
       setSelectedRunId(comparedRunId ?? runs[0].run_id);
     }
-  }, [compareRunIds, runs, selectedRunId]);
+  }, [activeTab, compareRunIds, runs, selectedRunId]);
 
   useEffect(() => {
     if (!runs.length) {
@@ -2942,6 +2982,17 @@ function WorkspaceShell() {
           setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
           setError(null);
         }
+
+        if (activeTab === 'paper' && !paperSessions.length) {
+          setSectionLoading(true);
+          const payload = await loadPaperSessions();
+          if (cancelled) {
+            return;
+          }
+          applyPayloadMeta(payload);
+          setPaperSessions(payload.paper_sessions);
+          setError(null);
+        }
       } catch (loadError: unknown) {
         if (!cancelled) {
           setError(loadError instanceof Error ? loadError.message : '工作台加载失败');
@@ -2957,7 +3008,7 @@ function WorkspaceShell() {
     return () => {
       cancelled = true;
     };
-  }, [activeTab, overview, parameterExperimentBatches.length, parameterResearch, parameterExperiments.length, selectedRunId, RUN_DETAIL_READMODEL_VERSION]);
+  }, [activeTab, overview, paperSessions.length, parameterExperimentBatches.length, parameterResearch, parameterExperiments.length, selectedRunId, RUN_DETAIL_READMODEL_VERSION]);
 
   useEffect(() => {
     if (activeTab !== 'overview' || overview === null) {
@@ -3327,6 +3378,48 @@ function WorkspaceShell() {
       message.error(text);
     } finally {
       setSubmitting(null);
+    }
+  }
+
+  async function refreshPaperSessions() {
+    const payload = await loadPaperSessions();
+    applyPayloadMeta(payload);
+    setPaperSessions(payload.paper_sessions);
+  }
+
+  async function handleCreatePaperSession(values: Record<string, unknown>) {
+    setPaperSubmitting('create');
+    try {
+      const result = await postPaperSession(values);
+      const session = result.paper_session as { session_id?: string } | undefined;
+      const sessionId = String(session?.session_id ?? '');
+      setLastActionResult(`模拟盘已创建：${sessionId}`);
+      message.success(`模拟盘已创建：${sessionId}`);
+      await refreshPaperSessions();
+    } catch (submitError: unknown) {
+      const text = submitError instanceof Error ? submitError.message : '模拟盘创建失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setPaperSubmitting(null);
+    }
+  }
+
+  async function handleTickPaperSession(sessionId: string) {
+    setPaperSubmitting('tick');
+    try {
+      const result = await postPaperSessionTick(sessionId, {});
+      const fillCount = Number(result.fill_count ?? 0);
+      const tradeCount = Number(result.closed_trade_count ?? 0);
+      setLastActionResult(`模拟盘 tick 完成：成交 ${fillCount}，平仓 ${tradeCount}`);
+      message.success(`模拟盘 tick 完成：成交 ${fillCount}，平仓 ${tradeCount}`);
+      await refreshPaperSessions();
+    } catch (submitError: unknown) {
+      const text = submitError instanceof Error ? submitError.message : '模拟盘 tick 失败';
+      setLastActionResult(text);
+      message.error(text);
+    } finally {
+      setPaperSubmitting(null);
     }
   }
 
@@ -3824,9 +3917,7 @@ function WorkspaceShell() {
         },
       }));
       if (finalStatus === 'success') {
-        setFilterResults(null);
-        setFilterResultsCandidateId(candidate.candidate_id);
-        message.success(`过滤器实验已完成：${createdBatchId}，正在打开过滤结果对比`);
+        message.success(`过滤器实验已完成：${createdBatchId}`);
       } else if (finalStatus === 'failed') {
         message.error(`过滤器实验失败：${createdBatchId}`);
       } else {
@@ -3836,6 +3927,100 @@ function WorkspaceShell() {
       const text = submitError instanceof Error ? submitError.message : '过滤器实验提交失败';
       setLastActionResult(text);
       message.error(text);
+    } finally {
+      setFilterExperimentCandidateId(null);
+    }
+  }
+
+  async function handleRunExecutionFilterExperiment(candidate: StableCandidateView): Promise<string | null> {
+    const sourceRunId = candidate.execution_verification.latest_run_id;
+    if (!sourceRunId) {
+      message.warning('需要先跑 5m 执行验证');
+      return null;
+    }
+    setFilterExperimentCandidateId(candidate.stable_candidate_id);
+    try {
+      const result = await postStableCandidateExecutionFilterExperiment(candidate.stable_candidate_id, {
+        source_run_id: sourceRunId,
+        signal_filter_sets: EARLY_FAIL_PROXY_SIGNAL_FILTER_SETS,
+      });
+      const createdBatchId = String(result.batch_id ?? '');
+      const plannedRunCount = Number(result.planned_run_count ?? 0);
+      setFilterExperimentProgressByCandidateId((current) => ({
+        ...current,
+        [candidate.stable_candidate_id]: {
+          batchId: createdBatchId,
+          status: 'pending',
+          runCount: 0,
+          plannedRunCount,
+        },
+      }));
+      const summaryText = `5m过滤实验已提交：${createdBatchId}${plannedRunCount ? `（${plannedRunCount} 个 run）` : ''}，完成后会自动刷新`;
+      setLastActionResult(summaryText);
+      message.success(summaryText);
+      let latestBatch: ParameterExperimentBatchSummary | undefined;
+      const deadline = Date.now() + 180_000;
+      while (Date.now() < deadline) {
+        const batchPayload = await loadParameterExperimentBatches();
+        applyPayloadMeta(batchPayload);
+        setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
+        latestBatch = batchPayload.parameter_experiment_batches.find((batch) => batch.batch_id === createdBatchId);
+        if (latestBatch) {
+          setFilterExperimentProgressByCandidateId((current) => ({
+            ...current,
+            [candidate.stable_candidate_id]: {
+              batchId: createdBatchId,
+              status: latestBatch?.status ?? 'pending',
+              runCount: Number(latestBatch?.run_count ?? 0),
+              plannedRunCount: Number(latestBatch?.planned_run_count ?? plannedRunCount),
+            },
+          }));
+          if (latestBatch.status === 'success' || latestBatch.status === 'failed') {
+            break;
+          }
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 1500));
+      }
+      const [batchPayload, experimentsPayload, parameterPayload] = await Promise.all([
+        loadParameterExperimentBatches(),
+        loadParameterExperiments(),
+        loadParameters(),
+      ]);
+      applyPayloadMeta(batchPayload);
+      setParameterExperimentBatches(batchPayload.parameter_experiment_batches);
+      setParameterExperiments(experimentsPayload.parameter_experiments);
+      setParameterLab(parameterPayload.parameter_lab);
+      setSelectedBatchId(createdBatchId || ALL_BATCHES);
+      setSelectedBatchDetail(null);
+      setSelectedExperimentId(ALL_EXPERIMENTS);
+      setSelectedExperimentDetail(null);
+      setActiveTab('parameters');
+      setError(null);
+      await refreshResearchWorkflow();
+      latestBatch = batchPayload.parameter_experiment_batches.find((batch) => batch.batch_id === createdBatchId) ?? latestBatch;
+      const finalStatus = latestBatch?.status ?? 'unknown';
+      setFilterExperimentProgressByCandidateId((current) => ({
+        ...current,
+        [candidate.stable_candidate_id]: {
+          batchId: createdBatchId,
+          status: finalStatus,
+          runCount: Number(latestBatch?.run_count ?? 0),
+          plannedRunCount: Number(latestBatch?.planned_run_count ?? plannedRunCount),
+        },
+      }));
+      if (finalStatus === 'success') {
+        message.success(`5m过滤实验已完成：${createdBatchId}`);
+      } else if (finalStatus === 'failed') {
+        message.error(`5m过滤实验失败：${createdBatchId}`);
+      } else {
+        message.info(`5m过滤实验仍在后台运行：${createdBatchId}，稍后刷新会更新状态`);
+      }
+      return createdBatchId || null;
+    } catch (submitError: unknown) {
+      const text = submitError instanceof Error ? submitError.message : '5m过滤实验提交失败';
+      setLastActionResult(text);
+      message.error(text);
+      return null;
     } finally {
       setFilterExperimentCandidateId(null);
     }
@@ -4313,6 +4498,7 @@ function WorkspaceShell() {
               onRunDrawdownProtectionExperiment={handleParameterRowDrawdownProtectionExperiment}
               onRunRiskMatrix={handleRunRiskMatrix}
               onRunFilterExperiment={handleRunFilterExperiment}
+              onRunExecutionFilterExperiment={handleRunExecutionFilterExperiment}
               drawdownProtectionRunId={drawdownProtectionRunId}
               drawdownProtectionCandidateId={drawdownProtectionCandidateId}
               drawdownProtectionProgressByCandidateId={drawdownProtectionProgressByCandidateId}
@@ -4327,6 +4513,7 @@ function WorkspaceShell() {
                 return parameterPayload.parameter_lab.rows;
               }}
               onOpenRun={(runId) => {
+                setSelectedRun(null);
                 setSelectedRunId(runId);
                 setActiveTab('analysis');
               }}
@@ -4337,6 +4524,7 @@ function WorkspaceShell() {
               savingResearchNote={savingResearchNote}
               onResearchWorkflowOptimisticChange={(updater) => setResearchWorkflow((current) => updater(current))}
               onRefreshResearchWorkflow={refreshResearchWorkflow}
+              onRefreshShell={refreshShell}
               onRefreshExperiments={async () => {
                 const [experimentPayload, batchPayload, researchPayload, workflowPayload] = await Promise.all([
                   loadParameterExperiments(),
@@ -4367,9 +4555,229 @@ function WorkspaceShell() {
               }}
             />
           )}
+          {activeTab === 'paper' && (
+            <PaperTradingView
+              sessions={paperSessions}
+              stableCandidates={researchWorkflow?.stable_pool.candidates ?? []}
+              runs={runs}
+              form={paperForm}
+              submitting={paperSubmitting}
+              onCreate={handleCreatePaperSession}
+              onTick={handleTickPaperSession}
+              onRefresh={refreshPaperSessions}
+            />
+          )}
         </Spin>
       </Content>
     </Layout>
+  );
+}
+
+function PaperTradingView({
+  sessions,
+  stableCandidates,
+  runs,
+  form,
+  submitting,
+  onCreate,
+  onTick,
+  onRefresh,
+}: {
+  sessions: PaperSessionView[];
+  stableCandidates: StableCandidateView[];
+  runs: RunSummaryView[];
+  form: ReturnType<typeof Form.useForm>[0];
+  submitting: 'create' | 'tick' | null;
+  onCreate: (values: Record<string, unknown>) => Promise<void>;
+  onTick: (sessionId: string) => Promise<void>;
+  onRefresh: () => Promise<void>;
+}) {
+  const selectedStableCandidateId = Form.useWatch('stable_candidate_id', form) as string | undefined;
+  const selectedStableCandidate = stableCandidates.find((candidate) => candidate.stable_candidate_id === selectedStableCandidateId);
+  const sourceRunOptions = useMemo(() => {
+    const evidenceRunIds = selectedStableCandidate?.evidence_run_ids ?? [];
+    const representativeRunId = selectedStableCandidate?.representative_run_id;
+    const orderedRunIds = [
+      ...(representativeRunId ? [representativeRunId] : []),
+      ...evidenceRunIds.filter((runId) => runId !== representativeRunId),
+    ];
+    const candidateRunIds = orderedRunIds.length ? orderedRunIds : runs.map((run) => run.run_id);
+    return candidateRunIds.map((runId) => {
+      const run = runs.find((entry) => entry.run_id === runId);
+      return {
+        label: `${shortRunId(runId)} · ${run?.symbol ?? selectedStableCandidate?.symbol ?? '未知标的'} · ${(run?.timeframe ?? selectedStableCandidate?.timeframe ?? '').toUpperCase()}`,
+        value: runId,
+      };
+    });
+  }, [runs, selectedStableCandidate]);
+  const columns = useMemo<ColumnDef<PaperSessionView>[]>(() => [
+    {
+      id: 'session',
+      header: 'Session',
+      accessorFn: (row) => row.session_id,
+      cell: ({ row }) => (
+        <Space direction="vertical" size={0}>
+          <Text strong>{row.original.session_id}</Text>
+          <Text type="secondary">{row.original.stable_candidate_id}</Text>
+        </Space>
+      ),
+    },
+    { header: '标的', accessorKey: 'symbol' },
+    {
+      id: 'timeframes',
+      header: '周期',
+      cell: ({ row }) => `${row.original.strategy_timeframe.toUpperCase()} / ${row.original.execution_timeframe.toUpperCase()}`,
+    },
+    {
+      id: 'status',
+      header: '状态',
+      accessorFn: (row) => row.status,
+      cell: ({ row }) => <Tag color={row.original.status === 'active' ? 'green' : 'default'}>{row.original.status}</Tag>,
+    },
+    { id: 'equity', header: '权益', accessorFn: (row) => row.account.equity, cell: ({ row }) => formatNumber(row.original.account.equity, 2) },
+    { id: 'cash', header: '可用资金', accessorFn: (row) => row.account.available_cash, cell: ({ row }) => formatNumber(row.original.account.available_cash, 2) },
+    { id: 'unrealized', header: '浮盈亏', accessorFn: (row) => row.account.unrealized_pnl, cell: ({ row }) => formatNumber(row.original.account.unrealized_pnl, 2) },
+    {
+      id: 'position',
+      header: '持仓',
+      cell: ({ row }) => {
+        const position = row.original.position;
+        if (!position) {
+          return <Text type="secondary">空仓</Text>;
+        }
+        return (
+          <Space direction="vertical" size={0}>
+            <Text>{position.trade.side.toUpperCase()} · qty {formatNumber(position.trade.qty, 4)}</Text>
+            <Text type="secondary">入场 {formatNumber(position.trade.entry_price, 2)}</Text>
+          </Space>
+        );
+      },
+    },
+    {
+      id: 'checkpoint',
+      header: '最新 5m',
+      cell: ({ row }) => {
+        const executionStream = row.original.live_streams?.find((stream) => stream.timeframe === row.original.execution_timeframe);
+        return (
+          <Space direction="vertical" size={0}>
+            <Text>{row.original.checkpoint.last_execution_bar_time ? formatDateTime(row.original.checkpoint.last_execution_bar_time) : '--'}</Text>
+            <Text type="secondary">bars {row.original.checkpoint.execution_bar_count}</Text>
+            {executionStream ? (
+              <Space size={4} wrap>
+                <Tag color={executionStream.status === 'connected' ? 'processing' : executionStream.status === 'error' ? 'red' : 'default'}>
+                  WS {executionStream.status}
+                </Tag>
+                <Text type="secondary">
+                  {executionStream.last_closed_bar_time ? formatDateTime(executionStream.last_closed_bar_time) : executionStream.last_message_at ? formatDateTime(executionStream.last_message_at) : '--'}
+                </Text>
+              </Space>
+            ) : null}
+          </Space>
+        );
+      },
+    },
+    {
+      id: 'actions',
+      header: '操作',
+      enableSorting: false,
+      cell: ({ row }) => (
+        <Button
+          size="small"
+          type="primary"
+          loading={submitting === 'tick'}
+          onClick={() => void onTick(row.original.session_id)}
+        >
+          手动 tick
+        </Button>
+      ),
+    },
+  ], [onTick, submitting]);
+  const activeSessions = sessions.filter((session) => session.status === 'active');
+  const openPositions = sessions.filter((session) => session.position !== null);
+
+  return (
+    <Row gutter={[16, 16]}>
+      <Col xs={24} md={8}>
+        <Card><Statistic title="模拟盘 Session" value={sessions.length} /></Card>
+      </Col>
+      <Col xs={24} md={8}>
+        <Card><Statistic title="运行中" value={activeSessions.length} /></Card>
+      </Col>
+      <Col xs={24} md={8}>
+        <Card><Statistic title="持仓中" value={openPositions.length} /></Card>
+      </Col>
+
+      <Col xs={24} xl={9}>
+        <Card title="创建模拟盘" extra={<Tag color="blue">1h 信号 / 5m 执行</Tag>}>
+          <Form
+            form={form}
+            layout="vertical"
+            initialValues={{
+              stable_candidate_id: stableCandidates[0]?.stable_candidate_id,
+              source_run_id: stableCandidates[0]?.representative_run_id,
+              initial_cash: 10000,
+              execution_timeframe: '5m',
+            }}
+            onFinish={(values) => void onCreate(values as Record<string, unknown>)}
+          >
+            <Form.Item name="stable_candidate_id" label="稳定候选" rules={[{ required: true }]}>
+              <Select
+                showSearch
+                optionFilterProp="label"
+                options={stableCandidates.map((candidate) => ({
+                  label: `${candidate.symbol} · ${candidate.timeframe.toUpperCase()} · ${candidate.stable_candidate_id}`,
+                  value: candidate.stable_candidate_id,
+                }))}
+                onChange={(value) => {
+                  const candidate = stableCandidates.find((entry) => entry.stable_candidate_id === value);
+                  form.setFieldValue('source_run_id', candidate?.representative_run_id ?? candidate?.evidence_run_ids[0]);
+                }}
+              />
+            </Form.Item>
+            <Form.Item name="source_run_id" label="代表 Run" rules={[{ required: true }]}>
+              <Select showSearch optionFilterProp="label" options={sourceRunOptions} />
+            </Form.Item>
+            <Row gutter={12}>
+              <Col span={12}>
+                <Form.Item name="initial_cash" label="初始资金">
+                  <InputNumber min={0} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
+                <Form.Item name="execution_timeframe" label="执行周期" rules={[{ required: true }]}>
+                  <Select options={[{ label: '5m', value: '5m' }]} />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Button type="primary" htmlType="submit" loading={submitting === 'create'} disabled={!stableCandidates.length}>
+              创建模拟盘
+            </Button>
+          </Form>
+          {!stableCandidates.length ? (
+            <Alert style={{ marginTop: 16 }} type="info" showIcon message="稳定池还没有候选" description="先在参数实验页把候选加入稳定池，再创建模拟盘。" />
+          ) : null}
+        </Card>
+      </Col>
+
+      <Col xs={24} xl={15}>
+        <Card
+          title="模拟盘运行表"
+          extra={<Button onClick={() => void onRefresh()}>刷新</Button>}
+        >
+          {sessions.length ? (
+            <DataTable
+              columns={columns}
+              data={sessions}
+              initialPageSize={8}
+              pageSizeOptions={[8, 16, 32]}
+              initialSorting={[{ id: 'session', desc: true }]}
+            />
+          ) : (
+            <Alert type="info" showIcon message="暂无模拟盘 session" description="创建后会在这里显示权益、持仓和最近 tick 位置。" />
+          )}
+        </Card>
+      </Col>
+    </Row>
   );
 }
 
@@ -5167,7 +5575,11 @@ function AnalysisView({
   const [tradeReasonQuery, setTradeReasonQuery] = useState('');
   const [freshSelectedRun, setFreshSelectedRun] = useState<RunAnalysisView | null>(null);
   const [researchNoteForm] = Form.useForm();
-  const selectedRun = freshSelectedRun?.run_id === selectedRunId ? freshSelectedRun : shellSelectedRun;
+  const selectedRun = freshSelectedRun?.run_id === selectedRunId
+    ? freshSelectedRun
+    : shellSelectedRun?.run_id === selectedRunId
+      ? shellSelectedRun
+      : null;
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -5582,6 +5994,10 @@ function AnalysisView({
 
   const strategyParams = selectedRun.manifest.resolved_config_json.strategy_params as Record<string, unknown> | undefined;
   const executionConstraints = selectedRun.manifest.resolved_config_json.execution_constraints as Record<string, unknown> | undefined;
+  const runType = String(selectedRun.manifest.resolved_config_json.run_type ?? '');
+  const parentRunId = String(selectedRun.manifest.resolved_config_json.parent_run_id ?? '');
+  const strategyTimeframe = String(selectedRun.manifest.resolved_config_json.strategy_timeframe ?? '');
+  const executionTimeframe = String(selectedRun.manifest.resolved_config_json.execution_timeframe ?? '');
   const validationSummary = selectedRun.validation;
   const latestResearchNote = researchNotes[0] ?? null;
   const aggregatedLabels = Array.from(new Set(researchNotes.flatMap((note) => note.labels ?? [])));
@@ -5805,6 +6221,10 @@ function AnalysisView({
           <Descriptions column={1} size="small">
             <Descriptions.Item label="标的 / 周期">{`${selectedRun.symbol} · ${selectedRun.timeframe.toUpperCase()}`}</Descriptions.Item>
             <Descriptions.Item label="数据快照">{selectedRun.dataset_snapshot_id}</Descriptions.Item>
+            {runType ? <Descriptions.Item label="Run 类型">{runType}</Descriptions.Item> : null}
+            {parentRunId ? <Descriptions.Item label="父 Run">{parentRunId}</Descriptions.Item> : null}
+            {strategyTimeframe ? <Descriptions.Item label="信号周期">{strategyTimeframe.toUpperCase()}</Descriptions.Item> : null}
+            {executionTimeframe ? <Descriptions.Item label="执行周期">{executionTimeframe.toUpperCase()}</Descriptions.Item> : null}
             <Descriptions.Item label="策略版本">{selectedRun.manifest.strategy_version}</Descriptions.Item>
             <Descriptions.Item label="执行策略">
               {formatAnalysisFieldValue('execution_policy_id', selectedRun.manifest.execution_policy_id)}
@@ -6143,6 +6563,7 @@ function ParametersView({
   onRunDrawdownProtectionExperiment,
   onRunRiskMatrix,
   onRunFilterExperiment,
+  onRunExecutionFilterExperiment,
   drawdownProtectionRunId,
   drawdownProtectionCandidateId,
   drawdownProtectionProgressByCandidateId,
@@ -6159,6 +6580,7 @@ function ParametersView({
   savingResearchNote,
   onResearchWorkflowOptimisticChange,
   onRefreshResearchWorkflow,
+  onRefreshShell,
   onRefreshExperiments,
 }: {
   datasets: DatasetSnapshotView[];
@@ -6193,6 +6615,7 @@ function ParametersView({
   onRunDrawdownProtectionExperiment: (rowOrRunId: ParameterLabRow | string, progressKey?: string) => Promise<void>;
   onRunRiskMatrix: (candidate: ResearchCandidateView) => Promise<void>;
   onRunFilterExperiment: (candidate: ResearchCandidateView, profile?: FilterExperimentProfile) => Promise<void>;
+  onRunExecutionFilterExperiment: (candidate: StableCandidateView) => Promise<string | null>;
   drawdownProtectionRunId: string | null;
   drawdownProtectionCandidateId: string | null;
   drawdownProtectionProgressByCandidateId: Record<string, FilterExperimentProgress>;
@@ -6209,6 +6632,7 @@ function ParametersView({
   savingResearchNote: boolean;
   onResearchWorkflowOptimisticChange: (updater: (current: ResearchWorkflow | null) => ResearchWorkflow | null) => void;
   onRefreshResearchWorkflow: () => Promise<void>;
+  onRefreshShell: () => Promise<void>;
   onRefreshExperiments: () => Promise<void>;
   }) {
   const { message } = AntdApp.useApp();
@@ -6257,6 +6681,7 @@ function ParametersView({
   const [selectedParameterGroupDetail, setSelectedParameterGroupDetail] = useState<ParameterGroupDetail | null>(null);
   const [parameterGroupDetailLoading, setParameterGroupDetailLoading] = useState(false);
   const [riskCompareGroupKey, setRiskCompareGroupKey] = useState<string | null>(null);
+  const [executionVerificationCandidateId, setExecutionVerificationCandidateId] = useState<string | null>(null);
   const [filterResultsCandidateId, setFilterResultsCandidateId] = useState<string | null>(null);
   const [filterResults, setFilterResults] = useState<ResearchCandidateFilterResults | null>(null);
   const [filterResultsLoading, setFilterResultsLoading] = useState(false);
@@ -7120,6 +7545,37 @@ function ParametersView({
     message.success('已加入稳定池');
   }
 
+  async function runStableCandidateExecutionVerification(candidate: StableCandidateView) {
+    const parentRunId = candidate.representative_run_id ?? candidate.evidence_run_ids[0] ?? '';
+    if (!parentRunId) {
+      message.error('稳定组合缺少代表 Run，不能发起执行验证');
+      return;
+    }
+    const executionSnapshot = [...datasets]
+      .filter((snapshot) => snapshot.symbol === candidate.symbol && snapshot.timeframe === '5m')
+      .sort((left, right) => right.time_range_end.localeCompare(left.time_range_end))[0];
+    if (!executionSnapshot) {
+      message.error(`请先导入 ${candidate.symbol} 的 5m 数据集，再运行执行验证`);
+      return;
+    }
+    setExecutionVerificationCandidateId(candidate.stable_candidate_id);
+    try {
+      const result = await postStableCandidateExecutionVerification(candidate.stable_candidate_id, {
+        source_run_id: parentRunId,
+        execution_timeframe: '5m',
+        execution_snapshot_id: executionSnapshot.dataset_snapshot_id,
+      });
+      const verificationRunId = String(result.verification_run_id ?? '');
+      await onRefreshShell();
+      await onRefreshResearchWorkflow();
+      message.success(verificationRunId ? `执行验证已完成：${verificationRunId}` : '执行验证已完成');
+    } catch (submitError: unknown) {
+      message.error(submitError instanceof Error ? submitError.message : '执行验证失败');
+    } finally {
+      setExecutionVerificationCandidateId(null);
+    }
+  }
+
   const filteredBatchParameterGroups = useMemo(() => {
     const groups = (selectedBatchDetail?.parameter_groups ?? []).filter((group) => matchesBatchGroupFilters(group));
     const sortedGroups = [...groups].sort((left, right) => right.score - left.score);
@@ -7817,6 +8273,55 @@ function ParametersView({
     { id: 'avg_profit_factor', header: 'PF', size: 72, minSize: 68, accessorFn: (row) => Number(row.validation_summary.avg_profit_factor ?? Number.NEGATIVE_INFINITY), cell: ({ row }) => formatNumber(Number(row.original.validation_summary.avg_profit_factor ?? NaN), 2) },
     { id: 'neighborhood', header: '邻域结论', size: 130, minSize: 112, accessorFn: (row) => String(row.neighborhood_summary.verdict ?? ''), cell: ({ row }) => String(row.original.neighborhood_summary.verdict ?? '--') },
     {
+      id: 'execution_verification',
+      header: '执行验证',
+      size: 190,
+      minSize: 170,
+      accessorFn: (row) => row.execution_verification.status,
+      cell: ({ row }) => {
+        const verification = row.original.execution_verification;
+        const summary = verification.summary ?? {};
+        const validation = verification.validation ?? null;
+        const latestRunId = verification.latest_run_id;
+        return (
+          <Space direction="vertical" size={4}>
+            <Space size={4} wrap>
+              <Tag color={executionVerificationStatusColor(verification.status)}>
+                {executionVerificationStatusText(verification.status)}
+              </Tag>
+              {verification.execution_timeframe ? <Tag>{verification.execution_timeframe}</Tag> : null}
+            </Space>
+            {latestRunId ? (
+              <Space direction="vertical" size={0}>
+                <Text type="secondary">
+                  5m {formatPct(Number(summary.total_return ?? NaN))} / DD {formatPct(Number(summary.max_drawdown ?? NaN))}
+                </Text>
+                {validation ? (
+                  <Text type="secondary">
+                    IS {formatPct(Number(validation.is_total_return ?? NaN))} / OOS {formatPct(Number(validation.oos_total_return ?? NaN))}
+                  </Text>
+                ) : null}
+              </Space>
+            ) : (
+              <Text type="secondary">需要 5m 数据</Text>
+            )}
+            <Space size={4} wrap>
+              <Button
+                size="small"
+                loading={executionVerificationCandidateId === row.original.stable_candidate_id}
+                onClick={() => void runStableCandidateExecutionVerification(row.original)}
+              >
+                跑 5m
+              </Button>
+              <Button size="small" disabled={!latestRunId} onClick={() => latestRunId ? onOpenRun(latestRunId) : undefined}>
+                5m研究
+              </Button>
+            </Space>
+          </Space>
+        );
+      },
+    },
+    {
       id: 'filter_experiment',
       header: '过滤实验',
       size: 190,
@@ -7825,6 +8330,7 @@ function ParametersView({
       cell: ({ row }) => {
         const progress = filterExperimentProgressByCandidateId[row.original.stable_candidate_id];
         const running = Boolean(progress && progress.status !== 'success' && progress.status !== 'failed');
+        const latestExecutionRunId = row.original.execution_verification.latest_run_id;
         const candidateLike = {
           candidate_id: row.original.stable_candidate_id,
           source_run_ids: row.original.evidence_run_ids,
@@ -7845,13 +8351,21 @@ function ParametersView({
         } as ResearchCandidateView;
         return (
           <Space size={[4, 4]} wrap>
-            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '固定当前稳定组合，只跑早败代理阈值扫描：MOM3 与局部位置'}>
+            <Tooltip title={progress ? `${progress.batchId} ${progress.runCount}/${progress.plannedRunCount || '--'}` : '基于最新 5m 执行验证 run，重放 1h 信号过滤后再映射到 5m 执行'}>
               <Button
                 size="small"
                 loading={filterExperimentCandidateId === row.original.stable_candidate_id || running}
-                disabled={running || row.original.strategy_name !== 'ema_pullback_atr_v2'}
-                onClick={() => void onRunFilterExperiment(candidateLike, 'early_fail_proxy')}
-              >早败</Button>
+                disabled={running || !latestExecutionRunId || row.original.strategy_name !== 'ema_pullback_atr_v2'}
+                onClick={() => {
+                  void onRunExecutionFilterExperiment(row.original).then((batchId) => {
+                    if (!batchId) {
+                      return;
+                    }
+                    setSelectedBatchId(batchId);
+                    setWorkspaceMode('batch');
+                  });
+                }}
+              >5m过滤</Button>
             </Tooltip>
             <Tooltip title="固定当前稳定组合，只跑通用过滤：HTF、ATR 分位、ADX">
               <Button
@@ -7929,7 +8443,7 @@ function ParametersView({
           </Space>
       ),
     },
-  ], [addRunToCompare, drawdownProtectionCandidateId, drawdownProtectionProgressByCandidateId, drawdownProtectionRunId, filterExperimentCandidateId, filterExperimentProgressByCandidateId, latestDrawdownProtectionBatchForKey, onOpenRun, onRunDrawdownProtectionExperiment, onRunFilterExperiment, rowsByRunId, setSelectedBatchId]);
+  ], [addRunToCompare, drawdownProtectionCandidateId, drawdownProtectionProgressByCandidateId, drawdownProtectionRunId, executionVerificationCandidateId, filterExperimentCandidateId, filterExperimentProgressByCandidateId, latestDrawdownProtectionBatchForKey, onOpenRun, onRunDrawdownProtectionExperiment, onRunExecutionFilterExperiment, onRunFilterExperiment, rowsByRunId, runStableCandidateExecutionVerification, setSelectedBatchId]);
   const filterResultGroupColumns = useMemo<ColumnDef<FilterResultGroup>[]>(() => [
     {
       id: 'filter_summary',
@@ -10288,7 +10802,7 @@ function ParametersView({
                 <Row gutter={[12, 12]}>
                   <Col xs={12} md={6}><Card size="small"><Statistic title="稳定组合" value={filteredStablePoolCandidates.length} suffix={`/ ${stablePoolCandidates.length}`} /></Card></Col>
                   <Col xs={12} md={6}><Card size="small"><Statistic title="证据 Run" value={filteredStablePoolCandidates.reduce((total, candidate) => total + candidate.evidence_run_ids.length, 0)} /></Card></Col>
-                  <Col xs={12} md={6}><Card size="small"><Statistic title="平均 OOS" value={formatPct(averageNullable(filteredStablePoolCandidates.map((candidate) => Number(candidate.validation_summary.avg_oos_total_return ?? NaN)).filter((value) => Number.isFinite(value))))} /></Card></Col>
+                  <Col xs={12} md={6}><Card size="small"><Statistic title="执行已验证" value={filteredStablePoolCandidates.filter((candidate) => candidate.execution_verification.status === 'passed').length} /></Card></Col>
                   <Col xs={12} md={6}><Card size="small"><Statistic title="平均评分" value={formatNumber(averageNullable(filteredStablePoolCandidates.map((candidate) => Number(candidate.validation_summary.score ?? NaN)).filter((value) => Number.isFinite(value))), 1)} /></Card></Col>
                 </Row>
                 <Card size="small" title="稳定池">

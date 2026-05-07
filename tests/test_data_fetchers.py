@@ -74,10 +74,19 @@ class FailingHistoryFetcher:
 
 
 class FakeResponse:
-    def __init__(self, payload: object) -> None:
+    def __init__(self, payload: object, *, status_code: int = 200, headers: dict[str, str] | None = None) -> None:
         self._payload = payload
+        self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            import requests
+
+            response = requests.Response()
+            response.status_code = self.status_code
+            response.url = "https://fapi.binance.com/fapi/v1/klines"
+            raise requests.HTTPError(f"{self.status_code} error", response=response)
         return None
 
     def json(self):
@@ -93,7 +102,10 @@ class FakeSession:
         self.calls.append({"url": url, "params": dict(params), "timeout": timeout})
         if not self.payloads:
             return FakeResponse([])
-        return FakeResponse(self.payloads.pop(0))
+        payload = self.payloads.pop(0)
+        if isinstance(payload, FakeResponse):
+            return payload
+        return FakeResponse(payload)
 
 
 class FakeDatasetRepository:
@@ -269,6 +281,72 @@ def test_binance_rest_history_fetcher_paginates_without_ccxt() -> None:
     ]
     assert session.calls[0]["params"]["symbol"] == "BTCUSDT"
     assert session.calls[1]["params"]["startTime"] == _ms(2024, 1, 1, 2)
+
+
+def test_binance_rest_history_fetcher_retries_after_rate_limit() -> None:
+    session = FakeSession(
+        payloads=[
+            FakeResponse([], status_code=429, headers={"Retry-After": "0"}),
+            [
+                _raw_row(_ms(2024, 1, 1, 0), 100.0),
+            ],
+        ]
+    )
+    sleeps: list[float] = []
+    fetcher = BinanceUsdMRestHistoryFetcher(
+        session=session,
+        max_rate_limit_retries=2,
+        retry_backoff_seconds=0.25,
+        sleep_fn=sleeps.append,
+    )
+    request = HistoryFetchRequest(
+        exchange="binanceusdm",
+        symbol="BTC/USDT:USDT",
+        timeframe="1h",
+        market_type=MarketType.LINEAR_USDT_PERPETUAL,
+        since=_dt(2024, 1, 1, 0),
+        until=_dt(2024, 1, 1, 1),
+        limit=1000,
+    )
+
+    rows = fetcher.fetch_ohlcv(request)
+
+    assert [row.timestamp_ms for row in rows] == [_ms(2024, 1, 1, 0)]
+    assert len(session.calls) == 2
+    assert sleeps == [0.25]
+
+
+def test_binance_rest_history_fetcher_retries_after_temporary_ban() -> None:
+    session = FakeSession(
+        payloads=[
+            FakeResponse([], status_code=418, headers={"Retry-After": "0"}),
+            [
+                _raw_row(_ms(2024, 1, 1, 0), 100.0),
+            ],
+        ]
+    )
+    sleeps: list[float] = []
+    fetcher = BinanceUsdMRestHistoryFetcher(
+        session=session,
+        max_rate_limit_retries=2,
+        retry_backoff_seconds=0.25,
+        sleep_fn=sleeps.append,
+    )
+    request = HistoryFetchRequest(
+        exchange="binanceusdm",
+        symbol="BTC/USDT:USDT",
+        timeframe="1h",
+        market_type=MarketType.LINEAR_USDT_PERPETUAL,
+        since=_dt(2024, 1, 1, 0),
+        until=_dt(2024, 1, 1, 1),
+        limit=1000,
+    )
+
+    rows = fetcher.fetch_ohlcv(request)
+
+    assert [row.timestamp_ms for row in rows] == [_ms(2024, 1, 1, 0)]
+    assert len(session.calls) == 2
+    assert sleeps == [0.25]
 
 
 def test_dataset_ingestion_uses_current_time_when_until_is_missing(tmp_path) -> None:
