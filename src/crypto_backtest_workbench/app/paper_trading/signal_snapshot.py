@@ -9,9 +9,13 @@ from math import floor
 from crypto_backtest_workbench.app.paper_trading.live_klines import FileLiveKlineCache, LiveKlineStreamSpec
 from crypto_backtest_workbench.app.paper_trading.market_data import PaperLocalKlineMarketDataClient
 from crypto_backtest_workbench.app.paper_trading.models import PaperSession
+from crypto_backtest_workbench.app.paper_trading.timeframe_aggregation import (
+    merge_complete_execution_strategy_candles,
+    timeframe_delta,
+)
 from crypto_backtest_workbench.app.workflows.execution_verification import _execution_constraints_from_config
 from crypto_backtest_workbench.domain.models import CanonicalCandle, MarketType, PriceType, Side
-from crypto_backtest_workbench.engine.data.canonicalizer import ohlcv_rows_to_canonical_candles, sort_and_deduplicate_candles
+from crypto_backtest_workbench.engine.data.canonicalizer import ohlcv_rows_to_canonical_candles
 from crypto_backtest_workbench.engine.data.fetchers import (
     BinanceUsdMRestHistoryFetcher,
     HistoryFetchRequest,
@@ -117,7 +121,7 @@ def _load_execution_candles(*, session: PaperSession, local_client: PaperLocalKl
         market_type=session.market_type,
         price_type=session.price_type,
         timeframe=session.execution_timeframe,
-        since=now - (_timeframe_delta(session.execution_timeframe) * DEFAULT_EXECUTION_LOOKBACK_BARS),
+        since=now - (timeframe_delta(session.execution_timeframe) * DEFAULT_EXECUTION_LOOKBACK_BARS),
         until=now,
         limit=DEFAULT_EXECUTION_LOOKBACK_BARS,
     )
@@ -136,42 +140,18 @@ def _load_strategy_candles(
         market_type=session.market_type,
         price_type=session.price_type,
         timeframe=session.strategy_timeframe,
-        since=now - (_timeframe_delta(session.strategy_timeframe) * DEFAULT_STRATEGY_LOOKBACK_BARS),
+        since=now - (timeframe_delta(session.strategy_timeframe) * DEFAULT_STRATEGY_LOOKBACK_BARS),
         until=now,
         limit=DEFAULT_STRATEGY_LOOKBACK_BARS,
     )
-    if session.strategy_timeframe == "1h" and session.execution_timeframe in {"1m", "5m", "15m"}:
-        strategy_candles = sort_and_deduplicate_candles([*strategy_candles, *_aggregate_to_1h(execution_candles)])
+    strategy_candles = merge_complete_execution_strategy_candles(
+        strategy_candles=strategy_candles,
+        execution_candles=execution_candles,
+        source_timeframe=session.execution_timeframe,
+        target_timeframe=session.strategy_timeframe,
+        until=now,
+    )
     return strategy_candles[-DEFAULT_STRATEGY_LOOKBACK_BARS:]
-
-
-def _aggregate_to_1h(candles: list[CanonicalCandle]) -> list[CanonicalCandle]:
-    buckets: dict[datetime, list[CanonicalCandle]] = {}
-    for candle in candles:
-        start = candle.timestamp.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
-        buckets.setdefault(start, []).append(candle)
-    aggregated: list[CanonicalCandle] = []
-    for start, bucket in sorted(buckets.items()):
-        ordered = sorted(bucket, key=lambda item: item.timestamp)
-        if not ordered:
-            continue
-        aggregated.append(
-            CanonicalCandle(
-                timestamp=start,
-                symbol=ordered[0].symbol,
-                exchange=ordered[0].exchange,
-                market_type=ordered[0].market_type,
-                timeframe="1h",
-                open=ordered[0].open,
-                high=max(item.high for item in ordered),
-                low=min(item.low for item in ordered),
-                close=ordered[-1].close,
-                volume=sum(item.volume for item in ordered),
-                price_type=ordered[0].price_type,
-                data_source="aggregated_execution_klines",
-            )
-        )
-    return aggregated
 
 
 def _compute_strategy_indicators(candles: list[CanonicalCandle], params: dict[str, object]) -> dict[str, float | None]:
@@ -320,11 +300,11 @@ def _backfill_execution_gap(
         return BackfillStatus(attempted=True, status="unsupported_timeframe", timeframe=session.execution_timeframe)
     if not existing:
         return BackfillStatus(attempted=True, status="skipped_no_local_anchor", timeframe=session.execution_timeframe)
-    timeframe_delta = _timeframe_delta(session.execution_timeframe)
-    since, until = _latest_missing_range(existing, timeframe_delta, now)
+    execution_delta = timeframe_delta(session.execution_timeframe)
+    since, until = _latest_missing_range(existing, execution_delta, now)
     if since >= until:
         return BackfillStatus(attempted=True, status="up_to_date", timeframe=session.execution_timeframe, requested_since=since, requested_until=until)
-    max_until = min(until, since + (timeframe_delta * MAX_BACKFILL_BARS))
+    max_until = min(until, since + (execution_delta * MAX_BACKFILL_BARS))
     try:
         fetcher = BinanceUsdMRestHistoryFetcher(request_pause_seconds=1.0, retry_backoff_seconds=10.0, max_rate_limit_retries=1)
         rows = fetcher.fetch_ohlcv(
@@ -371,7 +351,7 @@ def _backfill_execution_gap(
 def _gap_status(candles: list[CanonicalCandle], timeframe: str) -> dict[str, object]:
     if len(candles) < 2:
         return {"gap_count": 0, "latest_gap_start": None, "latest_gap_end": None}
-    expected_delta = _timeframe_delta(timeframe)
+    expected_delta = timeframe_delta(timeframe)
     gaps: list[tuple[datetime, datetime]] = []
     for left, right in zip(candles, candles[1:]):
         if right.timestamp - left.timestamp > expected_delta:
@@ -400,17 +380,6 @@ def _live_spec(session: PaperSession, timeframe: str) -> LiveKlineStreamSpec:
         timeframe=timeframe,
         price_type=PriceType(session.price_type),
     )
-
-
-def _timeframe_delta(timeframe: str) -> timedelta:
-    normalized = timeframe.strip().lower()
-    if normalized.endswith("m"):
-        return timedelta(minutes=int(normalized[:-1]))
-    if normalized.endswith("h"):
-        return timedelta(hours=int(normalized[:-1]))
-    if normalized.endswith("d"):
-        return timedelta(days=int(normalized[:-1]))
-    raise ValueError(f"unsupported timeframe: {timeframe}")
 
 
 def _floor_time(value: datetime, delta: timedelta) -> datetime:

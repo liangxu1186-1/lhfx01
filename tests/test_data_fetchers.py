@@ -283,6 +283,44 @@ def test_binance_rest_history_fetcher_paginates_without_ccxt() -> None:
     assert session.calls[1]["params"]["startTime"] == _ms(2024, 1, 1, 2)
 
 
+def test_binance_rest_history_fetcher_pauses_between_full_pages() -> None:
+    session = FakeSession(
+        payloads=[
+            [
+                _raw_row(_ms(2024, 1, 1, 0), 100.0),
+                _raw_row(_ms(2024, 1, 1, 1), 101.0),
+            ],
+            [
+                _raw_row(_ms(2024, 1, 1, 2), 102.0),
+            ],
+        ]
+    )
+    sleeps: list[float] = []
+    fetcher = BinanceUsdMRestHistoryFetcher(
+        session=session,
+        request_pause_seconds=0.75,
+        sleep_fn=sleeps.append,
+    )
+    request = HistoryFetchRequest(
+        exchange="binanceusdm",
+        symbol="BTC/USDT:USDT",
+        timeframe="1h",
+        market_type=MarketType.LINEAR_USDT_PERPETUAL,
+        since=_dt(2024, 1, 1, 0),
+        until=_dt(2024, 1, 1, 3),
+        limit=2,
+    )
+
+    rows = fetcher.fetch_ohlcv(request)
+
+    assert [row.timestamp_ms for row in rows] == [
+        _ms(2024, 1, 1, 0),
+        _ms(2024, 1, 1, 1),
+        _ms(2024, 1, 1, 2),
+    ]
+    assert sleeps == [0.75]
+
+
 def test_binance_rest_history_fetcher_retries_after_rate_limit() -> None:
     session = FakeSession(
         payloads=[

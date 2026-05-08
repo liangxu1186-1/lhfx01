@@ -16,7 +16,7 @@ from crypto_backtest_workbench.app.paper_trading.broker import PaperBroker
 from crypto_backtest_workbench.app.paper_trading.market_data import PaperLocalKlineMarketDataClient
 from crypto_backtest_workbench.app.paper_trading.models import PaperCheckpoint, PaperSession
 from crypto_backtest_workbench.app.paper_trading.repository import FilePaperTradingRepository
-from crypto_backtest_workbench.app.paper_trading.workflows import _aggregate_complete_execution_candles_to_1h
+from crypto_backtest_workbench.app.paper_trading.workflows import _aggregate_complete_execution_candles
 from crypto_backtest_workbench.app.paper_trading.signal_snapshot import build_paper_signal_snapshot
 from crypto_backtest_workbench.domain.models import (
     BacktestRun,
@@ -268,6 +268,45 @@ def test_signal_snapshot_aggregates_5m_execution_candles_to_1h(tmp_path: Path) -
     assert snapshot["backfill"]["attempted"] is False
 
 
+def test_signal_snapshot_aggregates_5m_execution_candles_to_15m(tmp_path: Path) -> None:
+    session = _session(
+        strategy_name="ema_pullback_atr_v2",
+        strategy_params={
+            "trend_fast_period": 2,
+            "trend_slow_period": 13,
+            "entry_ema_period": 21,
+            "atr_period": 14,
+            "atr_entry_tolerance": 1.0,
+            "atr_stop_mult": 2.0,
+            "risk_reward_ratio": 1.5,
+            "min_stop_pct": 0.003,
+            "qty_policy_ref": "risk_pct_of_cash_allocation",
+        },
+        execution_constraints={
+            "initial_cash": 10_000.0,
+            "leverage": 10.0,
+            "fee_rate": 0.0,
+            "min_notional": 0.0,
+            "cash_allocation_pct_by_policy": {"risk_pct_of_cash_allocation": 50.0},
+            "risk_pct_per_trade_by_policy": {"risk_pct_of_cash_allocation": 0.1},
+        },
+        strategy_timeframe="15m",
+    )
+    _write_execution_dataset(tmp_path, session, _candles([100.0 + index for index in range(360)]))
+
+    snapshot = build_paper_signal_snapshot(
+        session=session,
+        data_dir=tmp_path,
+        now=datetime(2024, 1, 2, 7, 0, tzinfo=UTC),
+    )
+
+    assert snapshot["strategy_timeframe"] == "15m"
+    assert snapshot["data"]["strategy_bar_count"] == 120
+    assert snapshot["data"]["last_strategy_bar_time"] == "2024-01-02T05:45:00+00:00"
+    assert snapshot["indicators"]["atr"] is not None
+    assert snapshot["estimate"]["entry_price"] is not None
+
+
 def test_paper_tick_merges_only_complete_1h_from_execution_candles(tmp_path: Path) -> None:
     repository = FilePaperTradingRepository(tmp_path)
     session = _session(strategy_params={"fast_period": 2, "slow_period": 3, "qty_policy_ref": "fixed_1"})
@@ -291,17 +330,51 @@ def test_paper_tick_merges_only_complete_1h_from_execution_candles(tmp_path: Pat
     assert result.session.checkpoint.last_execution_bar_time == datetime(2024, 1, 1, 1, 25, tzinfo=UTC)
 
 
-def test_aggregate_complete_execution_candles_to_1h_skips_partial_or_gapped_buckets() -> None:
+def test_paper_tick_merges_only_complete_15m_from_execution_candles(tmp_path: Path) -> None:
+    repository = FilePaperTradingRepository(tmp_path)
+    session = _session(
+        strategy_params={"fast_period": 2, "slow_period": 3, "qty_policy_ref": "fixed_1"},
+        strategy_timeframe="15m",
+    )
+    repository.save_session(session)
+    execution_candles = _candles([100.0 + index for index in range(7)])
+    _write_execution_dataset(tmp_path, session, execution_candles)
+    client = PaperLocalKlineMarketDataClient(data_dir=tmp_path)
+
+    result = tick_paper_session_workflow(
+        paper_repository=repository,
+        feature_repository=FileFeatureRepository(tmp_path),
+        market_data_client=client,
+        request=TickPaperSessionRequest(
+            session_id=session.session_id,
+            until=datetime(2024, 1, 1, 0, 35, tzinfo=UTC),
+        ),
+    )
+
+    assert result.strategy_bar_count == 2
+    assert result.session.checkpoint.last_strategy_bar_time == datetime(2024, 1, 1, 0, 15, tzinfo=UTC)
+    assert result.session.checkpoint.last_execution_bar_time == datetime(2024, 1, 1, 0, 30, tzinfo=UTC)
+
+
+def test_aggregate_complete_execution_candles_skips_partial_or_gapped_buckets() -> None:
     candles = _candles([100.0 + index for index in range(24)])
 
-    aggregated = _aggregate_complete_execution_candles_to_1h(
+    aggregated = _aggregate_complete_execution_candles(
         candles,
         source_timeframe="5m",
+        target_timeframe="1h",
         until=datetime(2024, 1, 1, 1, 30, tzinfo=UTC),
     )
-    gapped = _aggregate_complete_execution_candles_to_1h(
+    fifteen_minute = _aggregate_complete_execution_candles(
+        candles[:7],
+        source_timeframe="5m",
+        target_timeframe="15m",
+        until=datetime(2024, 1, 1, 0, 35, tzinfo=UTC),
+    )
+    gapped = _aggregate_complete_execution_candles(
         [candle for index, candle in enumerate(candles[:12]) if index != 4],
         source_timeframe="5m",
+        target_timeframe="1h",
         until=datetime(2024, 1, 1, 1, 0, tzinfo=UTC),
     )
 
@@ -309,6 +382,12 @@ def test_aggregate_complete_execution_candles_to_1h_skips_partial_or_gapped_buck
     assert aggregated[0].open == 100.0
     assert aggregated[0].close == 111.0
     assert aggregated[0].timeframe == "1h"
+    assert [candle.timestamp for candle in fifteen_minute] == [
+        datetime(2024, 1, 1, 0, 0, tzinfo=UTC),
+        datetime(2024, 1, 1, 0, 15, tzinfo=UTC),
+    ]
+    assert fifteen_minute[1].close == 105.0
+    assert fifteen_minute[1].timeframe == "15m"
     assert gapped == []
 
 
@@ -367,6 +446,8 @@ def _session(
     strategy_name: str = "ema_crossover",
     strategy_params: dict[str, object] | None = None,
     execution_constraints: dict[str, object] | None = None,
+    strategy_timeframe: str = "1h",
+    execution_timeframe: str = "5m",
 ) -> PaperSession:
     return PaperSession(
         session_id="paper-test-001",
@@ -377,8 +458,8 @@ def _session(
         exchange="binanceusdm",
         market_type=MarketType.LINEAR_USDT_PERPETUAL.value,
         price_type=PriceType.LAST.value,
-        strategy_timeframe="1h",
-        execution_timeframe="5m",
+        strategy_timeframe=strategy_timeframe,
+        execution_timeframe=execution_timeframe,
         strategy_params=strategy_params or {"qty_policy_ref": "fixed_1"},
         execution_constraints=execution_constraints or {"initial_cash": 1_000.0, "leverage": 2.0, "qty_by_policy": {"fixed_1": 1.0}},
         account=AccountSnapshot(

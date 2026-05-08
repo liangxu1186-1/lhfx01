@@ -5013,7 +5013,7 @@ function PaperSignalSnapshotPanel({
               </Col>
               <Col xs={24} lg={12}>
                 <Descriptions size="small" column={2} bordered>
-                  <Descriptions.Item label="1H 数据">{formatOptionalDateTime(snapshot.data.last_strategy_bar_time)}</Descriptions.Item>
+                  <Descriptions.Item label={`${snapshot.strategy_timeframe.toUpperCase()} 数据`}>{formatOptionalDateTime(snapshot.data.last_strategy_bar_time)}</Descriptions.Item>
                   <Descriptions.Item label="执行数据">{formatOptionalDateTime(snapshot.data.last_execution_bar_time)}</Descriptions.Item>
                   <Descriptions.Item label="执行 bars">{snapshot.data.execution_bar_count}</Descriptions.Item>
                   <Descriptions.Item label="缺口数">{snapshot.data.execution_gap_count}</Descriptions.Item>
@@ -5064,6 +5064,7 @@ function PaperRecordsModal({
   loading: boolean;
   onClose: () => void;
 }) {
+  const activeTrade = session?.position?.trade ?? null;
   const tradeColumns = useMemo<ColumnDef<PaperTradeView>[]>(() => [
     { header: '开仓', accessorFn: (row) => row.entry_time, cell: ({ row }) => formatDateTime(row.original.entry_time), size: 140, minSize: 140 },
     { header: '平仓', accessorFn: (row) => row.exit_time ?? '', cell: ({ row }) => row.original.exit_time ? formatDateTime(row.original.exit_time) : '--', size: 140, minSize: 140 },
@@ -5071,6 +5072,8 @@ function PaperRecordsModal({
     { header: '数量', accessorFn: (row) => Number(row.qty), cell: ({ row }) => formatNumber(Number(row.original.qty), 4), size: 90, minSize: 90 },
     { header: '开仓价', accessorFn: (row) => Number(row.entry_price), cell: ({ row }) => formatNumber(Number(row.original.entry_price), 2), size: 100, minSize: 100 },
     { header: '平仓价', accessorFn: (row) => Number(row.exit_price ?? 0), cell: ({ row }) => row.original.exit_price === null ? '--' : formatNumber(Number(row.original.exit_price), 2), size: 100, minSize: 100 },
+    { header: '止损', accessorFn: (row) => Number(row.planned_stop_loss_price ?? 0), cell: ({ row }) => row.original.planned_stop_loss_price === null ? '--' : formatNumber(Number(row.original.planned_stop_loss_price), 2), size: 100, minSize: 100 },
+    { header: '止盈', accessorFn: (row) => Number(row.planned_take_profit_price ?? 0), cell: ({ row }) => row.original.planned_take_profit_price === null ? '--' : formatNumber(Number(row.original.planned_take_profit_price), 2), size: 100, minSize: 100 },
     { header: '净盈亏', accessorFn: (row) => Number(row.net_pnl), cell: ({ row }) => <Text type={Number(row.original.net_pnl) >= 0 ? 'success' : 'danger'}>{formatNumber(Number(row.original.net_pnl), 2)}</Text>, size: 100, minSize: 100 },
     { header: '收益率', accessorFn: (row) => Number(row.return_pct), cell: ({ row }) => formatPct(Number(row.original.return_pct)), size: 90, minSize: 90 },
     { header: '原因', accessorKey: 'exit_reason', size: 150, minSize: 150 },
@@ -5115,6 +5118,22 @@ function PaperRecordsModal({
               <Col xs={12} md={6}><Statistic title="权益" value={session.account.equity} precision={2} /></Col>
               <Col xs={12} md={6}><Statistic title="最新 5m" value={session.checkpoint.execution_bar_count} /></Col>
             </Row>
+            {activeTrade ? (
+              <Row gutter={[12, 12]}>
+                <Col xs={12} md={6}>
+                  <Statistic title="当前持仓" value={activeTrade.side} />
+                </Col>
+                <Col xs={12} md={6}>
+                  <Statistic title="开仓价" value={activeTrade.entry_price} precision={2} />
+                </Col>
+                <Col xs={12} md={6}>
+                  <Statistic title="止损" value={activeTrade.planned_stop_loss_price ?? '--'} precision={2} />
+                </Col>
+                <Col xs={12} md={6}>
+                  <Statistic title="止盈" value={activeTrade.planned_take_profit_price ?? '--'} precision={2} />
+                </Col>
+              </Row>
+            ) : null}
             <section>
               <Title level={5}>平仓交易</Title>
               <DataTable columns={tradeColumns} data={session.trades ?? []} initialPageSize={6} tableClassName="cbw-paper-record-table" />

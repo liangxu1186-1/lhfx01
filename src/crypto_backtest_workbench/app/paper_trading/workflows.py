@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from crypto_backtest_workbench.app.paper_trading.broker import PaperBroker
 from crypto_backtest_workbench.app.paper_trading.market_data import PaperMarketDataClient
 from crypto_backtest_workbench.app.paper_trading.models import PaperSession, PaperTickResult
 from crypto_backtest_workbench.app.paper_trading.repository import FilePaperTradingRepository
+from crypto_backtest_workbench.app.paper_trading.timeframe_aggregation import (
+    aggregate_complete_execution_candles,
+    merge_complete_execution_strategy_candles,
+    timeframe_delta,
+)
 from crypto_backtest_workbench.app.workflows.execution_verification import (
     _execution_constraints_from_config,
     _map_signals_to_execution_timeline,
 )
 from crypto_backtest_workbench.app.workflows.run_backtest import build_strategy
 from crypto_backtest_workbench.domain.models import CanonicalCandle
-from crypto_backtest_workbench.engine.data.canonicalizer import sort_and_deduplicate_candles
 from crypto_backtest_workbench.engine.data.fetchers import HistoryFetcher
 from crypto_backtest_workbench.engine.features import FeaturePipeline
 from crypto_backtest_workbench.engine.portfolio.account import AccountSnapshot
@@ -236,7 +240,7 @@ def _new_or_all_candles(candles: list[CanonicalCandle], *, after: datetime | Non
 
 def _fetch_since(last_seen: datetime | None, timeframe: str, bars: int) -> datetime:
     if last_seen is not None:
-        return last_seen - (_timeframe_delta(timeframe) * max(1, bars))
+        return last_seen - (timeframe_delta(timeframe) * max(1, bars))
     return datetime.fromtimestamp(0, tz=UTC)
 
 
@@ -247,72 +251,28 @@ def _merge_closed_execution_strategy_candles(
     execution_candles: list[CanonicalCandle],
     until: datetime,
 ) -> list[CanonicalCandle]:
-    if session.strategy_timeframe.strip().lower() != "1h":
-        return strategy_candles
-    if session.execution_timeframe.strip().lower() not in {"1m", "5m", "15m"}:
-        return strategy_candles
-    aggregated = _aggregate_complete_execution_candles_to_1h(
-        execution_candles,
+    return merge_complete_execution_strategy_candles(
+        strategy_candles=strategy_candles,
+        execution_candles=execution_candles,
         source_timeframe=session.execution_timeframe,
+        target_timeframe=session.strategy_timeframe,
         until=until,
     )
-    if not aggregated:
-        return strategy_candles
-    return sort_and_deduplicate_candles([*strategy_candles, *aggregated])
 
 
-def _aggregate_complete_execution_candles_to_1h(
+def _aggregate_complete_execution_candles(
     candles: list[CanonicalCandle],
     *,
     source_timeframe: str,
+    target_timeframe: str,
     until: datetime,
 ) -> list[CanonicalCandle]:
-    source_delta = _timeframe_delta(source_timeframe)
-    target_delta = timedelta(hours=1)
-    expected_bars = int(target_delta / source_delta)
-    if expected_bars <= 0 or target_delta % source_delta != timedelta(0):
-        return []
-    buckets: dict[datetime, list[CanonicalCandle]] = {}
-    for candle in candles:
-        start = candle.timestamp.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
-        buckets.setdefault(start, []).append(candle)
-
-    aggregated: list[CanonicalCandle] = []
-    for start, bucket in sorted(buckets.items()):
-        if start + target_delta > until.astimezone(UTC):
-            continue
-        ordered = sorted(bucket, key=lambda item: item.timestamp)
-        expected_timestamps = {start + (source_delta * index) for index in range(expected_bars)}
-        if {item.timestamp.astimezone(UTC) for item in ordered} != expected_timestamps:
-            continue
-        aggregated.append(
-            CanonicalCandle(
-                timestamp=start,
-                symbol=ordered[0].symbol,
-                exchange=ordered[0].exchange,
-                market_type=ordered[0].market_type,
-                timeframe="1h",
-                open=ordered[0].open,
-                high=max(item.high for item in ordered),
-                low=min(item.low for item in ordered),
-                close=ordered[-1].close,
-                volume=sum(item.volume for item in ordered),
-                price_type=ordered[0].price_type,
-                data_source="aggregated_complete_execution_klines",
-            )
-        )
-    return aggregated
-
-
-def _timeframe_delta(timeframe: str) -> timedelta:
-    normalized = timeframe.strip().lower()
-    if normalized.endswith("m"):
-        return timedelta(minutes=int(normalized[:-1]))
-    if normalized.endswith("h"):
-        return timedelta(hours=int(normalized[:-1]))
-    if normalized.endswith("d"):
-        return timedelta(days=int(normalized[:-1]))
-    raise ValueError(f"unsupported timeframe: {timeframe}")
+    return aggregate_complete_execution_candles(
+        candles,
+        source_timeframe=source_timeframe,
+        target_timeframe=target_timeframe,
+        until=until,
+    )
 
 
 def _build_paper_session_id(stable_candidate_id: str, source_run_id: str) -> str:
